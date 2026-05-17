@@ -1,0 +1,14 @@
+{
+  "server": {
+    "port": 8080,
+    "host": "0.0.0.0",
+    "gpu_layers": 99,
+    "context_size": 131072,
+    "batch_size": 256,
+    "threads": -1
+  },
+  "ui": {
+    "theme": "default",
+    "auto_scroll": true
+  }
+}
