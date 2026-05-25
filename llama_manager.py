@@ -10,7 +10,7 @@ from tkinter import ttk, scrolledtext, filedialog, messagebox
 import subprocess
 import threading
 import os
-import sys
+import gc
 import time
 import psutil
 from pathlib import Path
@@ -20,6 +20,8 @@ from tkinterdnd2 import TkinterDnD
 
 from subtitle_tab import SubtitleTranslationTab
 from config_manager import ConfigManager
+from server_controller import ServerController
+from model_registry import ModelRegistry
 
 class LlamaManager:
     def __init__(self, root):
@@ -35,21 +37,20 @@ class LlamaManager:
 
         # 配置管理
         self.config_manager = ConfigManager(str(Path(__file__).parent / "config.json"))
-
-        # 服務器進程
-        self.server_process = None
-        self.server_running = False
-        self.log_buffer = []
-
-        # 加載配置
         self.config_manager.load()
+
+        # ServerController — deep module managing subprocess lifecycle
+        self.server = ServerController(self.server_exe, self._on_server_log)
+
+        # ModelRegistry — deep module managing model discovery
+        self.models = ModelRegistry(self.hip_dir, self.config_manager)
+
+        # 資源監控
+        self.monitor_thread = None
+        self.monitor_running = False
 
         # 創建 UI
         self.create_ui()
-
-        # 啟動監控線程
-        self.monitor_thread = None
-        self.monitor_running = False
 
         # 自動掃描模型
         self.scan_models()
@@ -60,57 +61,20 @@ class LlamaManager:
             self.log("WARNING", f"目錄不存在: {self.hip_dir}")
             return
 
-        gguf_files = list(self.hip_dir.glob("*.gguf"))
-        existing_paths = {str(gguf_file) for gguf_file in gguf_files}
+        models_list, added_count, removed_count = self.models.scan()
 
-        # 獲取當前模型列表
-        current_models = self.config_manager.get("models", {}).get("models", [])
-        models_to_keep = []
-        removed_count = 0
-        added_count = 0
+        if removed_count > 0:
+            self.log("INFO", f"移除 {removed_count} 個不存在的模型")
+        for m in models_list[-added_count:] if added_count > 0 else []:
+            self.log("SUCCESS", f"發現新模型: {m['name']} ({m['size']})")
 
-        # 檢查現有模型是否還存在
-        for model in current_models:
-            model_path = model.get("path", "")
-            if model_path and Path(model_path).exists():
-                models_to_keep.append(model)
-            else:
-                removed_count += 1
-                self.log("INFO", f"移除不存在的模型: {model.get('name', 'Unknown')}")
-
-        # 添加新發現的模型
-        for gguf_file in gguf_files:
-            if str(gguf_file) not in {m.get("path", "") for m in current_models}:
-                size_gb = gguf_file.stat().st_size / (1024**3)
-                model_info = {
-                    "name": gguf_file.stem,
-                    "path": str(gguf_file),
-                    "size": f"{size_gb:.2f}GB",
-                    "format": self.detect_format(gguf_file.name)
-                }
-                models_to_keep.append(model_info)
-                added_count += 1
-                self.log("SUCCESS", f"發現新模型: {model_info['name']} ({model_info['size']})")
-
-        # 更新模型列表
-        self.config_manager.set("models", {"models": models_to_keep})
         self.refresh_model_list()
 
-        # 顯示掃描結果
-        total_count = len(models_to_keep)
+        total_count = len(models_list)
         if removed_count > 0 or added_count > 0:
             self.log("INFO", f"掃描完成: 共 {total_count} 個模型 (+{added_count}, -{removed_count})")
         else:
             self.log("INFO", f"掃描完成: 共 {total_count} 個模型 (無變更)")
-
-    def detect_format(self, filename):
-        """從文件名檢測量化格式"""
-        formats = ["Q4_K_M", "Q4_K_S", "Q5_K_M", "Q5_K_S", "Q8_0",
-                  "IQ4_NL", "IQ4_XS", "Q3_K_M", "Q2_K"]
-        for fmt in formats:
-            if fmt.lower() in filename.lower():
-                return fmt
-        return "Unknown"
 
     def create_ui(self):
         """Create main interface with tabbed layout."""
@@ -322,8 +286,8 @@ class LlamaManager:
 
     def refresh_model_list(self):
         """刷新模型列表"""
-        models = self.config_manager.get("models", {}).get("models", [])
-        model_names = [m.get("name", "Unknown") for m in models]
+        model_list = self.models.list_models()
+        model_names = [m.get("name", "Unknown") for m in model_list]
         self.model_combo['values'] = model_names
 
         if model_names and not self.model_var.get():
@@ -333,9 +297,7 @@ class LlamaManager:
     def on_model_select(self, event):
         """模型選擇事件處理"""
         model_name = self.model_var.get()
-        models = self.config_manager.get("models", {}).get("models", [])
-
-        for model in models:
+        for model in self.models.list_models():
             if model.get("name") == model_name:
                 info = f"大小: {model.get('size', 'N/A')} | 格式: {model.get('format', 'N/A')}"
                 self.model_info_label.config(text=info)
@@ -352,21 +314,8 @@ class LlamaManager:
         )
 
         if file_path:
-            gguf_file = Path(file_path)
-            size_gb = gguf_file.stat().st_size / (1024**3)
-
-            model_info = {
-                "name": gguf_file.stem,
-                "path": str(gguf_file),
-                "size": f"{size_gb:.2f}GB",
-                "format": self.detect_format(gguf_file.name)
-            }
-
-            models_data = self.config_manager.get("models", {}).get("models", [])
-            models_data.append(model_info)
-            self.config_manager.set("models", {"models": models_data})
+            model_info = self.models.add_model(file_path)
             self.refresh_model_list()
-
             self.log("SUCCESS", f"已添加模型: {model_info['name']}")
 
     def start_server(self):
@@ -375,32 +324,17 @@ class LlamaManager:
             messagebox.showerror("錯誤", "請先選擇一個模型！")
             return
 
-        if self.server_running:
+        if self.server.running:
             messagebox.showwarning("警告", "服務器已在運行中！")
             return
 
         # 獲取模型路徑
         model_name = self.model_var.get()
-        model_path = None
-        for model in self.config_manager.get("models", {}).get("models", []):
-            if model.get("name") == model_name:
-                model_path = model.get("path")
-                break
+        model_path = self.models.get_model_path(model_name)
 
         if not model_path or not Path(model_path).exists():
             messagebox.showerror("錯誤", f"找不到模型文件: {model_path}")
             return
-
-        # 構建命令
-        cmd = [
-            str(self.server_exe),
-            "-m", model_path,
-            "--port", str(self.port_var.get()),
-            "--host", self.config_manager.get("server.host", "0.0.0.0"),
-            "-ngl", str(self.gpu_layers_var.get()),
-            "-c", str(self.context_var.get()),
-            "-b", str(self.batch_var.get())
-        ]
 
         # 保存配置
         self.config_manager.set("server.port", self.port_var.get())
@@ -411,32 +345,19 @@ class LlamaManager:
         # 啟動服務器
         try:
             self.log("INFO", f"啟動服務器: {model_name}")
-            self.log("INFO", f"命令: {' '.join(cmd)}")
 
-            # 創建環境變量以設置編碼
-            env = os.environ.copy()
-            env['PYTHONIOENCODING'] = 'utf-8'
-
-            self.server_process = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
-                universal_newlines=True,
-                encoding='utf-8',
-                errors='replace',  # 替換無法解碼的字節
-                env=env
+            self.server.start(
+                model_path=model_path,
+                port=self.port_var.get(),
+                host=self.config_manager.get("server.host", "0.0.0.0"),
+                gpu_layers=self.gpu_layers_var.get(),
+                context_size=self.context_var.get(),
+                batch_size=self.batch_var.get()
             )
 
-            self.server_running = True
             self.start_button.config(state="disabled")
             self.stop_button.config(state="normal")
             self.status_label.config(text="● 運行中", foreground="green")
-
-            # 啟動日誌監控線程
-            self.log_thread = threading.Thread(target=self.monitor_server_logs, daemon=True)
-            self.log_thread.start()
 
             # 啟動資源監控
             self.start_resource_monitor()
@@ -449,21 +370,11 @@ class LlamaManager:
 
     def stop_server(self):
         """停止服務器"""
-        if not self.server_running:
+        if not self.server.running:
             return
 
         try:
-            if self.server_process:
-                self.server_process.terminate()
-
-                # 等待進程結束
-                try:
-                    self.server_process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    self.server_process.kill()
-                    self.server_process.wait()
-
-            self.server_running = False
+            self.server.stop()
             self.start_button.config(state="normal")
             self.stop_button.config(state="disabled")
             self.status_label.config(text="● 未運行", foreground="black")
@@ -480,7 +391,6 @@ class LlamaManager:
             self.log("INFO", "正在釋放系統內存...")
 
             # 強制垃圾回收
-            import gc
             gc.collect()
 
             # 終止所有 llama 相關進程
@@ -492,9 +402,9 @@ class LlamaManager:
                         proc_name = proc_info['name'].lower()
                         # 檢查是否是 llama 相關進程
                         if 'llama' in proc_name or proc_name.endswith('.exe'):
-                            # 檢查是否是我們的進程
-                            if self.server_process and proc_info['pid'] == self.server_process.pid:
-                                continue  # 跳過當前服務器進程
+                            # 跳過當前服務器進程
+                            if self.server.running and self.server._process and proc_info['pid'] == self.server._process.pid:
+                                continue
 
                             # 終止孤立進程
                             proc.terminate()
@@ -532,36 +442,9 @@ class LlamaManager:
             self.log("ERROR", f"釋放內存失敗: {str(e)}")
             messagebox.showerror("錯誤", f"釋放內存失敗:\n{str(e)}")
 
-    def monitor_server_logs(self):
-        """監控服務器日誌"""
-        if not self.server_process:
-            return
-
-        try:
-            for line in iter(self.server_process.stdout.readline, ''):
-                if not line:
-                    break
-
-                line = line.strip()
-                if line:
-                    self.log("INFO", line)
-
-        except Exception as e:
-            if self.server_running:
-                self.log("ERROR", f"日誌監控錯誤: {str(e)}")
-
-        # 服務器進程結束
-        self.root.after(0, self.on_server_stopped)
-
-    def on_server_stopped(self):
-        """服務器停止回調"""
-        if self.server_running:
-            self.server_running = False
-            self.start_button.config(state="normal")
-            self.stop_button.config(state="disabled")
-            self.status_label.config(text="● 未運行", foreground="black")
-            self.stop_resource_monitor()
-            self.log("WARNING", "服務器進程已意外停止")
+    def _on_server_log(self, line: str):
+        """Callback from ServerController for each server stdout line."""
+        self.log("INFO", line)
 
     def start_resource_monitor(self):
         """啟動資源監控"""
@@ -588,10 +471,10 @@ class LlamaManager:
                 vram_status = "N/A"
                 process_info = ""
 
-                if self.server_process and self.server_running:
+                if self.server.running and self.server._process:
                     try:
                         # 獲取進程信息
-                        proc = psutil.Process(self.server_process.pid)
+                        proc = psutil.Process(self.server._process.pid)
                         cpu_percent = proc.cpu_percent(interval=0.1)
                         mem_info = proc.memory_info()
                         proc_mem_mb = mem_info.rss / (1024**2)

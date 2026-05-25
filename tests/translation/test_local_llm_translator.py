@@ -73,7 +73,7 @@ class TestTranslatorInitialization:
 class TestSingleTextTranslation:
     """Test single text translation functionality."""
 
-    @patch('translation.local_llm_translator.OpenAI')
+    @patch('translation.openai_client.OpenAI')
     def test_translate_single_text(self, mock_openai):
         """Test translating a single text string."""
         # Setup mock
@@ -103,7 +103,7 @@ class TestSingleTextTranslation:
         assert call_args.kwargs['model'] == 'llama-3.2-3b-instruct'
         assert 'messages' in call_args.kwargs
 
-    @patch('translation.local_llm_translator.OpenAI')
+    @patch('translation.openai_client.OpenAI')
     def test_translate_single_text_with_context(self, mock_openai):
         """Test translating with context information."""
         mock_client = MagicMock()
@@ -136,7 +136,7 @@ class TestSingleTextTranslation:
 class TestBatchTextTranslation:
     """Test batch text translation functionality."""
 
-    @patch('translation.local_llm_translator.OpenAI')
+    @patch('translation.openai_client.OpenAI')
     def test_translate_batch_text(self, mock_openai):
         """Test translating a list of texts."""
         mock_client = MagicMock()
@@ -165,7 +165,7 @@ class TestBatchTextTranslation:
         # Verify API was called twice
         assert mock_client.chat.completions.create.call_count == 2
 
-    @patch('translation.local_llm_translator.OpenAI')
+    @patch('translation.openai_client.OpenAI')
     def test_translate_batch_empty_list(self, mock_openai):
         """Test translating an empty list returns empty result."""
         config = {
@@ -184,7 +184,7 @@ class TestBatchTextTranslation:
 class TestSRTFormatTranslation:
     """Test SRT subtitle format translation."""
 
-    @patch('translation.local_llm_translator.OpenAI')
+    @patch('translation.openai_client.OpenAI')
     def test_translate_srt_format(self, mock_openai):
         """Test translating SRT subtitle list while preserving timestamps."""
         mock_client = MagicMock()
@@ -220,7 +220,7 @@ class TestSRTFormatTranslation:
         assert 'Bonjour' in result[0]['text']
         assert 'tout à l\'heure' in result[1]['text']
 
-    @patch('translation.local_llm_translator.OpenAI')
+    @patch('translation.openai_client.OpenAI')
     def test_translate_srt_empty_list(self, mock_openai):
         """Test translating empty SRT list."""
         config = {
@@ -238,7 +238,7 @@ class TestSRTFormatTranslation:
 class TestAPIErrorRetry:
     """Test error handling and retry mechanism."""
 
-    @patch('translation.local_llm_translator.OpenAI')
+    @patch('translation.openai_client.OpenAI')
     def test_api_error_retry_success_after_retries(self, mock_openai):
         """Test that translator retries on API errors and eventually succeeds."""
         mock_client = MagicMock()
@@ -264,7 +264,7 @@ class TestAPIErrorRetry:
         # Verify it retried
         assert mock_client.chat.completions.create.call_count == 3
 
-    @patch('translation.local_llm_translator.OpenAI')
+    @patch('translation.openai_client.OpenAI')
     def test_api_error_retry_max_retries_exceeded(self, mock_openai):
         """Test that translator gives up after max retries."""
         mock_client = MagicMock()
@@ -286,7 +286,7 @@ class TestAPIErrorRetry:
         # Verify it retried multiple times (typically 3-5 retries)
         assert mock_client.chat.completions.create.call_count >= 2
 
-    @patch('translation.local_llm_translator.OpenAI')
+    @patch('translation.openai_client.OpenAI')
     def test_rate_limit_retry(self, mock_openai):
         """Test retry on rate limit errors."""
         from openai import RateLimitError
@@ -316,7 +316,7 @@ class TestAPIErrorRetry:
 class TestPromptGeneration:
     """Test prompt generation for translation."""
 
-    @patch('translation.local_llm_translator.OpenAI')
+    @patch('translation.openai_client.OpenAI')
     def test_prompt_includes_system_message(self, mock_openai):
         """Test that prompt includes system message."""
         mock_client = MagicMock()
@@ -341,7 +341,7 @@ class TestPromptGeneration:
         # System prompt is now in Chinese: "翻译" (translate)
         assert '翻译' in messages[0]['content'] or 'translate' in messages[0]['content'].lower() or 'translation' in messages[0]['content'].lower()
 
-    @patch('translation.local_llm_translator.OpenAI')
+    @patch('translation.openai_client.OpenAI')
     def test_prompt_includes_user_text(self, mock_openai):
         """Test that prompt includes the text to translate."""
         mock_client = MagicMock()
@@ -366,7 +366,7 @@ class TestPromptGeneration:
         assert len(user_messages) > 0
         assert 'Hello world' in user_messages[0]['content']
 
-    @patch('translation.local_llm_translator.OpenAI')
+    @patch('translation.openai_client.OpenAI')
     def test_prompt_includes_target_language(self, mock_openai):
         """Test that prompt includes target language."""
         mock_client = MagicMock()
@@ -390,7 +390,7 @@ class TestPromptGeneration:
         messages_str = str(messages).lower()
         assert 'french' in messages_str
 
-    @patch('translation.local_llm_translator.OpenAI')
+    @patch('translation.openai_client.OpenAI')
     def test_prompt_includes_context_when_provided(self, mock_openai):
         """Test that prompt includes context when provided."""
         mock_client = MagicMock()
@@ -421,7 +421,7 @@ class TestPromptGeneration:
 class TestTemperatureSetting:
     """Test temperature parameter settings."""
 
-    @patch('translation.local_llm_translator.OpenAI')
+    @patch('translation.openai_client.OpenAI')
     def test_temperature_passed_to_api(self, mock_openai):
         """Test that temperature parameter is passed to API."""
         mock_client = MagicMock()
@@ -443,7 +443,7 @@ class TestTemperatureSetting:
         assert 'temperature' in call_args.kwargs
         assert call_args.kwargs['temperature'] == 0.8
 
-    @patch('translation.local_llm_translator.OpenAI')
+    @patch('translation.openai_client.OpenAI')
     def test_different_temperature_values(self, mock_openai):
         """Test different temperature values."""
         mock_client = MagicMock()
@@ -468,7 +468,7 @@ class TestTemperatureSetting:
             call_args = mock_client.chat.completions.create.call_args
             assert call_args.kwargs['temperature'] == temp
 
-    @patch('translation.local_llm_translator.OpenAI')
+    @patch('translation.openai_client.OpenAI')
     def test_temperature_bounds_checking(self, mock_openai):
         """Test that temperature is properly bounded."""
         mock_client = MagicMock()
@@ -494,7 +494,7 @@ class TestTemperatureSetting:
 class TestMaxTokensSetting:
     """Test max_tokens parameter settings."""
 
-    @patch('translation.local_llm_translator.OpenAI')
+    @patch('translation.openai_client.OpenAI')
     def test_max_tokens_passed_to_api(self, mock_openai):
         """Test that max_tokens parameter is passed to API."""
         mock_client = MagicMock()
@@ -516,7 +516,7 @@ class TestMaxTokensSetting:
         assert 'max_tokens' in call_args.kwargs
         assert call_args.kwargs['max_tokens'] == 1500
 
-    @patch('translation.local_llm_translator.OpenAI')
+    @patch('translation.openai_client.OpenAI')
     def test_different_max_tokens_values(self, mock_openai):
         """Test different max_tokens values."""
         mock_client = MagicMock()
@@ -545,7 +545,7 @@ class TestMaxTokensSetting:
 class TestAPIURLConfiguration:
     """Test API URL configuration."""
 
-    @patch('translation.local_llm_translator.OpenAI')
+    @patch('translation.openai_client.OpenAI')
     def test_custom_api_url(self, mock_openai):
         """Test that custom API URL is used."""
         mock_client = MagicMock()
@@ -569,7 +569,7 @@ class TestAPIURLConfiguration:
         assert 'base_url' in call_args.kwargs
         assert call_args.kwargs['base_url'] == custom_url
 
-    @patch('translation.local_llm_translator.OpenAI')
+    @patch('translation.openai_client.OpenAI')
     def test_default_localhost_url(self, mock_openai):
         """Test default localhost:8080 URL when not specified."""
         mock_client = MagicMock()
@@ -591,7 +591,7 @@ class TestAPIURLConfiguration:
         assert 'base_url' in call_args.kwargs
         assert 'localhost:8080' in call_args.kwargs['base_url'] or '127.0.0.1:8080' in call_args.kwargs['base_url']
 
-    @patch('translation.local_llm_translator.OpenAI')
+    @patch('translation.openai_client.OpenAI')
     def test_https_url(self, mock_openai):
         """Test HTTPS URL configuration."""
         mock_client = MagicMock()
@@ -615,7 +615,7 @@ class TestAPIURLConfiguration:
 class TestEmptyInputHandling:
     """Test handling of empty inputs."""
 
-    @patch('translation.local_llm_translator.OpenAI')
+    @patch('translation.openai_client.OpenAI')
     def test_empty_string_translation(self, mock_openai):
         """Test translating an empty string."""
         config = {
@@ -631,7 +631,7 @@ class TestEmptyInputHandling:
         # API should not be called for empty input
         mock_openai.assert_not_called()
 
-    @patch('translation.local_llm_translator.OpenAI')
+    @patch('translation.openai_client.OpenAI')
     def test_whitespace_only_translation(self, mock_openai):
         """Test translating whitespace-only text."""
         config = {
@@ -646,7 +646,7 @@ class TestEmptyInputHandling:
         assert result.strip() == '' or result == '   \n\t  '
         # API might or might not be called depending on implementation
 
-    @patch('translation.local_llm_translator.OpenAI')
+    @patch('translation.openai_client.OpenAI')
     def test_none_target_language(self, mock_openai):
         """Test handling of None target language."""
         config = {
@@ -663,7 +663,7 @@ class TestEmptyInputHandling:
 class TestModelConfiguration:
     """Test model configuration."""
 
-    @patch('translation.local_llm_translator.OpenAI')
+    @patch('translation.openai_client.OpenAI')
     def test_model_passed_to_api(self, mock_openai):
         """Test that model parameter is passed to API."""
         mock_client = MagicMock()
@@ -683,7 +683,7 @@ class TestModelConfiguration:
         call_args = mock_client.chat.completions.create.call_args
         assert call_args.kwargs['model'] == 'llama-3.2-3b-instruct'
 
-    @patch('translation.local_llm_translator.OpenAI')
+    @patch('translation.openai_client.OpenAI')
     def test_different_model_names(self, mock_openai):
         """Test different model names."""
         mock_client = MagicMock()
@@ -716,7 +716,7 @@ class TestModelConfiguration:
 class TestResponseParsing:
     """Test response parsing and handling."""
 
-    @patch('translation.local_llm_translator.OpenAI')
+    @patch('translation.openai_client.OpenAI')
     def test_response_with_no_choices(self, mock_openai):
         """Test handling of response with no choices."""
         mock_client = MagicMock()
@@ -734,7 +734,7 @@ class TestResponseParsing:
         with pytest.raises((ValueError, RuntimeError)):
             translator.translate('Hello', target_language='French')
 
-    @patch('translation.local_llm_translator.OpenAI')
+    @patch('translation.openai_client.OpenAI')
     def test_response_with_empty_content(self, mock_openai):
         """Test handling of response with empty content."""
         mock_client = MagicMock()
@@ -754,7 +754,7 @@ class TestResponseParsing:
         # Should return empty string or handle gracefully
         assert result == ''
 
-    @patch('translation.local_llm_translator.OpenAI')
+    @patch('translation.openai_client.OpenAI')
     def test_response_with_none_content(self, mock_openai):
         """Test handling of response with None content."""
         mock_client = MagicMock()
@@ -777,7 +777,7 @@ class TestResponseParsing:
 class TestSpecialCases:
     """Test special cases and edge cases."""
 
-    @patch('translation.local_llm_translator.OpenAI')
+    @patch('translation.openai_client.OpenAI')
     def test_very_long_text(self, mock_openai):
         """Test translating very long text."""
         mock_client = MagicMock()
@@ -799,7 +799,7 @@ class TestSpecialCases:
         # Verify the request was made
         mock_client.chat.completions.create.assert_called_once()
 
-    @patch('translation.local_llm_translator.OpenAI')
+    @patch('translation.openai_client.OpenAI')
     def test_special_characters(self, mock_openai):
         """Test translating text with special characters."""
         mock_client = MagicMock()
@@ -820,7 +820,7 @@ class TestSpecialCases:
         assert 'Translated' in result
         mock_client.chat.completions.create.assert_called_once()
 
-    @patch('translation.local_llm_translator.OpenAI')
+    @patch('translation.openai_client.OpenAI')
     def test_unicode_text(self, mock_openai):
         """Test translating text with unicode characters."""
         mock_client = MagicMock()

@@ -14,7 +14,7 @@ import logging
 import re
 import time
 from pathlib import Path
-from typing import Callable, List, Dict, Optional
+from typing import Callable, List, Dict, Optional, TYPE_CHECKING
 
 import httpx
 from openai import OpenAI, LengthFinishReasonError, RateLimitError
@@ -26,6 +26,10 @@ from tenacity import (
     before_sleep_log,
     RetryError
 )
+
+# Import LLMClient port for type checking
+if TYPE_CHECKING:
+    from translation.llm_client import LLMClient
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -67,7 +71,7 @@ class LocalLLMTranslator:
     - Proxy support via httpx
     """
 
-    def __init__(self, config: dict):
+    def __init__(self, config: dict, client: Optional['LLMClient'] = None):
         """
         Initialize the Local-LLM translator.
 
@@ -79,9 +83,14 @@ class LocalLLMTranslator:
                 - temperature: Sampling temperature 0-2 (default: 0.3)
                 - api_key: API key if required (default: empty string)
                 - proxy: Proxy URL for HTTP client (default: None)
+            client: Optional LLMClient instance for dependency injection.
+                    If not provided, an OpenAIClient will be created from config.
+
+        Raises:
+            ValueError: If 'model' is not in config and client is not provided
         """
         # Validate required config
-        if 'model' not in config:
+        if 'model' not in config and client is None:
             raise ValueError("Configuration must include 'model' parameter")
 
         # Store config for later use
@@ -110,12 +119,37 @@ class LocalLLMTranslator:
         if not isinstance(self.max_tokens, int) or self.max_tokens <= 0:
             self.max_tokens = DEFAULT_MAX_TOKENS
 
-        # Initialize OpenAI client (will be created lazily)
-        self._client = None
+        # Store injected client or create OpenAIClient lazily
+        self._injected_client = client
+        self._openai_client = None  # OpenAIClient instance (will be created lazily if needed)
+        self._client = None  # Legacy OpenAI client (for backward compatibility)
+
+    def _get_llm_client(self) -> 'LLMClient':
+        """
+        Get the LLM client (injected or created from config).
+
+        Returns:
+            LLMClient instance (either injected or OpenAIClient created from config)
+        """
+        if self._injected_client is not None:
+            return self._injected_client
+
+        # Create OpenAIClient from config
+        if self._openai_client is None:
+            from translation.openai_client import OpenAIClient
+            self._openai_client = OpenAIClient(
+                api_url=self.api_url,
+                model=self._api_model,
+                api_key=self.api_key,
+                proxy=self.proxy,
+                timeout=180.0
+            )
+
+        return self._openai_client
 
     def _get_client(self) -> OpenAI:
         """
-        Get or create the OpenAI client.
+        Get or create the OpenAI client (legacy method for backward compatibility).
 
         Returns:
             OpenAI client instance configured with the API URL, timeout, and optional proxy
@@ -267,14 +301,9 @@ class LocalLLMTranslator:
             {'role': 'user', 'content': user_content}
         ]
 
-    @retry(
-        stop=stop_after_attempt(RETRY_NUMS),
-        wait=wait_exponential(multiplier=1, min=RETRY_DELAY, max=10),
-        before_sleep=before_sleep_log(logger, logging.WARNING)
-    )
     def _call_api(self, messages: List[Dict[str, str]]) -> str:
         """
-        Call the OpenAI-compatible API with retry logic.
+        Call the LLM API via the client port with retry logic.
 
         Args:
             messages: List of message dictionaries
@@ -286,45 +315,37 @@ class LocalLLMTranslator:
             RuntimeError: If the API call fails or returns invalid response
             LengthFinishReasonError: If the response was truncated due to length
         """
-        client = self._get_client()
+        # Use the LLMClient port (injected or created)
+        client = self._get_llm_client()
 
         try:
-            response = client.chat.completions.create(
+            response = client.complete(
+                messages=messages,
                 model=self._api_model,
                 max_tokens=self.max_tokens,
-                temperature=self.temperature,
-                frequency_penalty=0,
-                messages=messages
+                temperature=self.temperature
             )
 
             logger.debug(f'[LocalLLM] Response: {response}')
 
+        except RetryError as e:
+            # Tenacity wraps exceptions in RetryError
+            if e.last_attempt.exception():
+                logger.error(f'[LocalLLM] API call failed after retries: {e.last_attempt.exception()}')
+                raise e.last_attempt.exception()
+            raise
         except Exception as e:
             logger.error(f'[LocalLLM] API call failed: {e}')
             raise
 
-        # Validate response
-        if isinstance(response, str):
-            raise RuntimeError(f'Invalid response type: {response}')
+        # Validate response - response should be a string
+        if not isinstance(response, str):
+            raise RuntimeError(f'Invalid response type: {type(response)}')
 
-        if not hasattr(response, 'choices') or not response.choices:
-            raise RuntimeError(f'Invalid response - no choices: {response}')
-
-        if response.choices[0].finish_reason == 'length':
-            raise LengthFinishReasonError(completion=response)
-
-        content = response.choices[0].message.content
-
-        if content is None:
-            raise RuntimeError(
-                f"[LocalLLM] None content - finish_reason: "
-                f"{response.choices[0].finish_reason}"
-            )
-
-        if not content or not content.strip():
+        if not response or not response.strip():
             return ''
 
-        return content.strip()
+        return response.strip()
 
     @staticmethod
     def _parse_yaml_result(raw: str) -> List[Dict[str, str]]:

@@ -7,10 +7,41 @@ from tkinter import ttk, scrolledtext, filedialog, messagebox
 import threading
 from datetime import datetime
 from pathlib import Path
+from typing import Callable, Dict, List, Optional
 
 from tkinterdnd2 import DND_FILES
 
-from subtitle_logic import SubtitleTranslationLogic
+from utils.srt_parser import parse_srt_from_file, generate_srt_from_list
+from translation.local_llm_translator import LocalLLMTranslator
+
+
+# Supported file extensions
+SUPPORTED_EXTENSIONS = {'.srt', '.txt'}
+
+# Hardcoded common languages
+TARGET_LANGUAGES = {
+    'zh-cn': 'Simplified Chinese',
+    'zh-tw': 'Traditional Chinese',
+    'en': 'English',
+    'ja': 'Japanese',
+    'ko': 'Korean',
+    'es': 'Spanish',
+    'fr': 'French',
+    'de': 'German',
+    'pt': 'Portuguese',
+    'ru': 'Russian',
+    'ar': 'Arabic',
+    'hi': 'Hindi',
+    'th': 'Thai',
+    'vi': 'Vietnamese',
+    'it': 'Italian',
+    'nl': 'Dutch',
+}
+
+SOURCE_LANGUAGES = {
+    'auto': 'Auto Detect',
+    **TARGET_LANGUAGES,
+}
 
 
 class SubtitleTranslationTab(ttk.Frame):
@@ -20,26 +51,24 @@ class SubtitleTranslationTab(ttk.Frame):
         super().__init__(parent)
         self._get_config = get_config_callback
         self._get_model = get_model_callback
-        self._logic: SubtitleTranslationLogic = None
+        self._translator: Optional[LocalLLMTranslator] = None
         self._file_list: list = []
         self._translating = False
         self._stop_requested = False
 
-        self._init_logic()
+        self._init_translator()
         self._create_ui()
 
-    def _init_logic(self):
-        """Initialize the business logic with current config."""
+    def _init_translator(self):
+        """Initialize the translator with current config."""
         config = self._get_config()
         model = self._get_model()
         config['model'] = model
-        self._logic = SubtitleTranslationLogic(config)
-        self._logic.set_progress_callback(self._on_progress)
-        self._logic.set_log_callback(self._on_log)
+        self._translator = LocalLLMTranslator(config)
 
     def refresh_model(self):
         """Refresh from current server model."""
-        self._init_logic()
+        self._init_translator()
         self._update_model_display()
 
     # --- UI Creation ---
@@ -220,13 +249,13 @@ class SubtitleTranslationTab(ttk.Frame):
     # --- Language population ---
 
     def _populate_languages(self):
-        langs = self._logic.get_source_languages()
+        langs = SOURCE_LANGUAGES
         codes = list(langs.keys())
         names = [f"{code} - {langs[code]}" for code in codes]
         self._source_combo['values'] = names
         self._source_combo.current(0)
 
-        langs = self._logic.get_target_languages()
+        langs = TARGET_LANGUAGES
         codes = list(langs.keys())
         names = [f"{code} - {langs[code]}" for code in codes]
         self._target_combo['values'] = names
@@ -255,7 +284,7 @@ class SubtitleTranslationTab(ttk.Frame):
             filetypes=[("Subtitle files", "*.srt;*.txt"),
                        ("All files", "*.*")])
         for f in files:
-            if f not in self._file_list and self._logic.is_supported_file(f):
+            if f not in self._file_list and self._is_supported_file(f):
                 self._file_list.append(f)
                 self._file_listbox.insert(tk.END, Path(f).name)
         self._log("INFO", f"Added {len(files)} file(s)")
@@ -276,7 +305,7 @@ class SubtitleTranslationTab(ttk.Frame):
             if not path:
                 continue
             # On Windows, paths may have surrounding braces removed
-            if path not in self._file_list and self._logic.is_supported_file(path):
+            if path not in self._file_list and self._is_supported_file(path):
                 self._file_list.append(path)
                 self._file_listbox.insert(tk.END, Path(path).name)
                 added += 1
@@ -317,13 +346,13 @@ class SubtitleTranslationTab(ttk.Frame):
         self._progress_var.set(0)
         self._clear_log()
 
-        # Update logic config
+        # Update translator config
         config = self._get_config()
         config['model'] = self._get_model()
         config['batch_size'] = self._batch_var.get()
         config['temperature'] = self._temp_var.get()
         config['max_tokens'] = self._tokens_var.get()
-        self._logic.update_config(config)
+        self._translator = LocalLLMTranslator(config)
 
         thread = threading.Thread(target=self._run_translation, daemon=True)
         thread.start()
@@ -343,8 +372,7 @@ class SubtitleTranslationTab(ttk.Frame):
                 break
 
             try:
-                self._logic.translate_file(filepath, target_lang,
-                                            replace_original=replace)
+                self._translate_file(filepath, target_lang, replace_original=replace)
             except Exception as e:
                 self._log("ERROR", f"Failed: {Path(filepath).name} - {e}")
 
@@ -385,9 +413,69 @@ class SubtitleTranslationTab(ttk.Frame):
 
     # --- Callbacks from logic ---
 
-    def _on_progress(self, file_name, current, total, status):
-        self.winfo_toplevel().after(0, lambda: self._progress_label.config(
-            text=f"{status}: {file_name} ({current}/{total})"))
-
     def _on_log(self, level, message):
         self._log(level, message)
+
+    # --- Helper methods (absorbed from SubtitleTranslationLogic) ---
+
+    def _is_supported_file(self, filepath: str) -> bool:
+        """Check if file has supported extension."""
+        ext = Path(filepath).suffix.lower()
+        return ext in SUPPORTED_EXTENSIONS
+
+    def _get_output_path(self, input_path: str, target_lang: str,
+                         replace_original: bool = False) -> str:
+        """Generate output path for translated file."""
+        if replace_original:
+            return input_path
+        p = Path(input_path)
+        stem = p.stem
+        lang_name = TARGET_LANGUAGES.get(target_lang, target_lang)
+        return str(p.parent / f"{stem}_{lang_name}{p.suffix}")
+
+    def _translate_file(self, input_path: str, target_lang: str,
+                        output_path: Optional[str] = None,
+                        replace_original: bool = False):
+        """Translate a single SRT or TXT file."""
+        filepath = Path(input_path)
+        ext = filepath.suffix.lower()
+
+        if output_path is None:
+            output_path = self._get_output_path(input_path, target_lang,
+                                               replace_original)
+
+        self._log("INFO", f"Translating: {filepath.name}")
+        self._on_progress(filepath.name, 0, 1, "starting")
+
+        if ext == '.srt':
+            subtitles = parse_srt_from_file(str(filepath))
+            total_lines = len(subtitles)
+            self._log("INFO", f"Parsed {total_lines} subtitle lines, "
+                              f"translating line by line...")
+
+            def file_progress(current, total, status):
+                self._on_progress(filepath.name, current, total, status)
+
+            def log_callback(level, message):
+                self._log(level, message)
+
+            translated = self._translator.translate_srt(
+                subtitles, target_lang,
+                progress_callback=file_progress,
+                log_callback=log_callback
+            )
+            srt_content = generate_srt_from_list(translated)
+            Path(output_path).write_text(srt_content, encoding='utf-8')
+        elif ext == '.txt':
+            text = filepath.read_text(encoding='utf-8')
+            self._log("INFO", f"Text file, {len(text)} chars")
+            translated = self._translator.translate(text, target_lang)
+            Path(output_path).write_text(translated, encoding='utf-8')
+
+        self._on_progress(filepath.name, 1, 1, "completed")
+        self._log("SUCCESS", f"Saved: {output_path}")
+
+    def _on_progress(self, file_name, current, total, status):
+        """Handle progress updates from translator."""
+        self.winfo_toplevel().after(0, lambda: self._progress_label.config(
+            text=f"{status}: {file_name} ({current}/{total})"))
