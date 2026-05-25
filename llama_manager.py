@@ -9,13 +9,17 @@ import tkinter as tk
 from tkinter import ttk, scrolledtext, filedialog, messagebox
 import subprocess
 import threading
-import json
 import os
 import sys
 import time
 import psutil
 from pathlib import Path
 from datetime import datetime
+
+from tkinterdnd2 import TkinterDnD
+
+from subtitle_tab import SubtitleTranslationTab
+from config_manager import ConfigManager
 
 class LlamaManager:
     def __init__(self, root):
@@ -29,9 +33,8 @@ class LlamaManager:
         self.hip_dir = self.base_dir / "llama-hip"
         self.server_exe = self.hip_dir / "llama-server.exe"
 
-        # 配置文件
-        self.config_file = Path(__file__).parent / "config.json"
-        self.models_file = Path(__file__).parent / "models.json"
+        # 配置管理
+        self.config_manager = ConfigManager(str(Path(__file__).parent / "config.json"))
 
         # 服務器進程
         self.server_process = None
@@ -39,8 +42,7 @@ class LlamaManager:
         self.log_buffer = []
 
         # 加載配置
-        self.config = self.load_config()
-        self.models = self.load_models()
+        self.config_manager.load()
 
         # 創建 UI
         self.create_ui()
@@ -52,59 +54,6 @@ class LlamaManager:
         # 自動掃描模型
         self.scan_models()
 
-    def load_config(self):
-        """加載配置文件"""
-        default_config = {
-            "server": {
-                "port": 8080,
-                "host": "0.0.0.0",
-                "gpu_layers": 99,
-                "context_size": 4096,
-                "batch_size": 512,
-                "threads": -1
-            },
-            "ui": {
-                "theme": "default",
-                "auto_scroll": True
-            }
-        }
-
-        if self.config_file.exists():
-            try:
-                with open(self.config_file, 'r', encoding='utf-8') as f:
-                    return json.load(f)
-            except Exception as e:
-                print(f"Error loading config: {e}")
-
-        return default_config
-
-    def save_config(self):
-        """保存配置文件"""
-        try:
-            with open(self.config_file, 'w', encoding='utf-8') as f:
-                json.dump(self.config, f, indent=2, ensure_ascii=False)
-        except Exception as e:
-            print(f"Error saving config: {e}")
-
-    def load_models(self):
-        """加載模型列表"""
-        if self.models_file.exists():
-            try:
-                with open(self.models_file, 'r', encoding='utf-8') as f:
-                    return json.load(f)
-            except Exception as e:
-                print(f"Error loading models: {e}")
-
-        return {"models": []}
-
-    def save_models(self):
-        """保存模型列表"""
-        try:
-            with open(self.models_file, 'w', encoding='utf-8') as f:
-                json.dump(self.models, f, indent=2, ensure_ascii=False)
-        except Exception as e:
-            print(f"Error saving models: {e}")
-
     def scan_models(self):
         """掃描 llama-hip 目錄中的 .gguf 文件"""
         if not self.hip_dir.exists():
@@ -115,7 +64,7 @@ class LlamaManager:
         existing_paths = {str(gguf_file) for gguf_file in gguf_files}
 
         # 獲取當前模型列表
-        current_models = self.models.get("models", [])
+        current_models = self.config_manager.get("models", {}).get("models", [])
         models_to_keep = []
         removed_count = 0
         added_count = 0
@@ -144,8 +93,7 @@ class LlamaManager:
                 self.log("SUCCESS", f"發現新模型: {model_info['name']} ({model_info['size']})")
 
         # 更新模型列表
-        self.models["models"] = models_to_keep
-        self.save_models()
+        self.config_manager.set("models", {"models": models_to_keep})
         self.refresh_model_list()
 
         # 顯示掃描結果
@@ -165,16 +113,54 @@ class LlamaManager:
         return "Unknown"
 
     def create_ui(self):
-        """創建主界面"""
-        # 創建主框架
-        main_frame = ttk.Frame(self.root, padding="10")
-        main_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
-
-        # 配置網格權重
+        """Create main interface with tabbed layout."""
+        # Notebook for tabs
+        self.notebook = ttk.Notebook(self.root)
+        self.notebook.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(0, weight=1)
-        main_frame.columnconfigure(0, weight=1)
-        main_frame.rowconfigure(4, weight=1)
+
+        # Server tab
+        self.server_tab = ttk.Frame(self.notebook, padding="10")
+        self.notebook.add(self.server_tab, text="Server")
+        self._create_server_tab()
+
+        # Subtitle Translation tab
+        self.subtitle_tab = SubtitleTranslationTab(
+            self.notebook,
+            get_config_callback=self.get_translation_config,
+            get_model_callback=self.get_current_model
+        )
+        self.notebook.add(self.subtitle_tab, text="Subtitle Translation")
+
+        # Refresh subtitle tab when switching to it
+        self.notebook.bind('<<NotebookTabChanged>>', self._on_tab_changed)
+
+    def get_translation_config(self):
+        """Return config dict for subtitle translation."""
+        port = self.port_var.get()
+        return {
+            'api_url': f'http://localhost:{port}/v1',
+            'model': self.get_current_model(),
+            'max_tokens': 4096,
+            'temperature': 0.2,
+            'batch_size': 20,
+        }
+
+    def get_current_model(self):
+        """Get the currently selected/loaded model name."""
+        return self.model_var.get()
+
+    def _on_tab_changed(self, event):
+        """Refresh subtitle tab when switching to it."""
+        selected = self.notebook.select()
+        tab_index = self.notebook.index(selected)
+        if tab_index == 1:  # Subtitle Translation tab
+            self.subtitle_tab.refresh_model()
+
+    def _create_server_tab(self):
+        """Create server management UI in the Server tab."""
+        main_frame = self.server_tab
 
         # 標題
         title_label = ttk.Label(
@@ -227,12 +213,12 @@ class LlamaManager:
 
         # Port
         ttk.Label(params_grid, text="端口:").grid(row=0, column=0, sticky=tk.W, padx=(0, 5))
-        self.port_var = tk.IntVar(value=self.config["server"]["port"])
+        self.port_var = tk.IntVar(value=self.config_manager.get("server.port", 8080))
         ttk.Entry(params_grid, textvariable=self.port_var, width=10).grid(row=0, column=1, padx=(0, 20))
 
         # GPU Layers
         ttk.Label(params_grid, text="GPU 層數:").grid(row=0, column=2, sticky=tk.W, padx=(0, 5))
-        self.gpu_layers_var = tk.IntVar(value=self.config["server"]["gpu_layers"])
+        self.gpu_layers_var = tk.IntVar(value=self.config_manager.get("server.gpu_layers", 99))
         ttk.Scale(
             params_grid,
             from_=0,
@@ -247,7 +233,7 @@ class LlamaManager:
 
         # Context Size
         ttk.Label(params_grid, text="上下文大小:").grid(row=0, column=5, sticky=tk.W, padx=(0, 5))
-        self.context_var = tk.IntVar(value=self.config["server"]["context_size"])
+        self.context_var = tk.IntVar(value=self.config_manager.get("server.context_size", 131072))
         context_combo = ttk.Combobox(
             params_grid,
             textvariable=self.context_var,
@@ -259,7 +245,7 @@ class LlamaManager:
 
         # Batch Size
         ttk.Label(params_grid, text="批次大小:").grid(row=0, column=7, sticky=tk.W, padx=(0, 5))
-        self.batch_var = tk.IntVar(value=self.config["server"]["batch_size"])
+        self.batch_var = tk.IntVar(value=self.config_manager.get("server.batch_size", 256))
         ttk.Entry(params_grid, textvariable=self.batch_var, width=10).grid(row=0, column=8)
 
         # 控制按鈕區
@@ -336,7 +322,7 @@ class LlamaManager:
 
     def refresh_model_list(self):
         """刷新模型列表"""
-        models = self.models.get("models", [])
+        models = self.config_manager.get("models", {}).get("models", [])
         model_names = [m.get("name", "Unknown") for m in models]
         self.model_combo['values'] = model_names
 
@@ -347,7 +333,7 @@ class LlamaManager:
     def on_model_select(self, event):
         """模型選擇事件處理"""
         model_name = self.model_var.get()
-        models = self.models.get("models", [])
+        models = self.config_manager.get("models", {}).get("models", [])
 
         for model in models:
             if model.get("name") == model_name:
@@ -376,8 +362,9 @@ class LlamaManager:
                 "format": self.detect_format(gguf_file.name)
             }
 
-            self.models.setdefault("models", []).append(model_info)
-            self.save_models()
+            models_data = self.config_manager.get("models", {}).get("models", [])
+            models_data.append(model_info)
+            self.config_manager.set("models", {"models": models_data})
             self.refresh_model_list()
 
             self.log("SUCCESS", f"已添加模型: {model_info['name']}")
@@ -395,7 +382,7 @@ class LlamaManager:
         # 獲取模型路徑
         model_name = self.model_var.get()
         model_path = None
-        for model in self.models.get("models", []):
+        for model in self.config_manager.get("models", {}).get("models", []):
             if model.get("name") == model_name:
                 model_path = model.get("path")
                 break
@@ -409,18 +396,17 @@ class LlamaManager:
             str(self.server_exe),
             "-m", model_path,
             "--port", str(self.port_var.get()),
-            "--host", self.config["server"]["host"],
+            "--host", self.config_manager.get("server.host", "0.0.0.0"),
             "-ngl", str(self.gpu_layers_var.get()),
             "-c", str(self.context_var.get()),
             "-b", str(self.batch_var.get())
         ]
 
         # 保存配置
-        self.config["server"]["port"] = self.port_var.get()
-        self.config["server"]["gpu_layers"] = self.gpu_layers_var.get()
-        self.config["server"]["context_size"] = self.context_var.get()
-        self.config["server"]["batch_size"] = self.batch_var.get()
-        self.save_config()
+        self.config_manager.set("server.port", self.port_var.get())
+        self.config_manager.set("server.gpu_layers", self.gpu_layers_var.get())
+        self.config_manager.set("server.context_size", self.context_var.get())
+        self.config_manager.set("server.batch_size", self.batch_var.get())
 
         # 啟動服務器
         try:
@@ -658,7 +644,7 @@ class LlamaManager:
             self.log_text.delete(1.0, f"{lines-1000}.0")
 
 def main():
-    root = tk.Tk()
+    root = TkinterDnD.Tk()
     app = LlamaManager(root)
     root.mainloop()
 

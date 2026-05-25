@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+
+# Project-specific
+pyvideotrans/
+temp_test_dir/
+.pytest_cache/
+*.srt
+!test*.srt
+
+# Embedded repos
+translation/immersive_prompts_temp/
+
+# Misc artifacts
+nul
+.agents/
+_fiction_prompt.json
+_prompt_dump.json
+skills-lock.json
+
+# IDE
+.vscode/
+.idea/
