@@ -2,7 +2,7 @@
 Configuration Manager Module
 
 Provides comprehensive configuration management with JSON persistence,
-nested key access, validation, and translation-specific config handling.
+nested key access, validation, and default config merging.
 """
 
 import json
@@ -35,6 +35,13 @@ DEFAULT_CONFIG = {
         'source_lang': 'auto',
         'target_lang': 'en',
         'provider': 'mock'
+    },
+    'whisper': {
+        'cli_path': '',
+        'model_dir': '',
+        'last_model': '',
+        'language': 'auto',
+        'threads': 8
     }
 }
 
@@ -48,7 +55,7 @@ class ConfigManager:
     - Nested key access with dot notation (e.g., 'server.port')
     - Auto-save functionality
     - Default config merging
-    - Translation-specific config section management
+    - Translation config section management via generic get/set
     - Config validation
     - Thread-safe operations
     """
@@ -191,53 +198,6 @@ class ConfigManager:
             # Auto-save if requested
             if auto_save:
                 self._save_to_file(self._config)
-
-    def get_translation_config(self) -> Dict[str, Any]:
-        """
-        Get the translation configuration section.
-
-        Returns default translation config if section doesn't exist.
-
-        Returns:
-            Translation configuration dictionary
-        """
-        # Load config if not already loaded
-        if not self._config:
-            self.load()
-
-        # Get translation section or return default
-        translation_config = self._config.get('translation', {})
-
-        # If empty or missing, return default
-        if not translation_config:
-            default_translation = self.default_config.get('translation', {})
-            return copy.deepcopy(default_translation)
-
-        return copy.deepcopy(translation_config)
-
-    def set_translation_config(self, config: Dict[str, Any]) -> None:
-        """
-        Set the translation configuration section.
-
-        Merges provided config with existing translation config.
-
-        Args:
-            config: Translation configuration dictionary (partial or full)
-        """
-        with self._lock:
-            # Load config if not already loaded
-            if not self._config:
-                self.load()
-
-            # Ensure translation section exists
-            if 'translation' not in self._config:
-                self._config['translation'] = {}
-
-            # Update translation config (merge with existing)
-            self._config['translation'].update(config)
-
-            # Save to file
-            self._save_to_file(self._config)
 
     def validate(self) -> List[str]:
         """

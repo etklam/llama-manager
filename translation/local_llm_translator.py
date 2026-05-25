@@ -32,6 +32,8 @@ from tenacity import (
 if TYPE_CHECKING:
     from translation.llm_client import LLMClient
 
+from translation.prompt_builder import build_translation_prompt
+
 # Configure logging
 logger = logging.getLogger(__name__)
 
@@ -218,81 +220,26 @@ class LocalLLMTranslator:
             'content': self._build_system_prompt(target_language)
         }
 
-        if self.single_step:
-            if is_traditional:
-                user_content = (
-                    f"請將下面 YAML 對象裡的 source 字段意譯為 {target_language}，"
-                    f"力求信達雅，保留特定的術語或媒體名稱（如有），"
-                    f"讓文本更通俗易懂，符合中文的表達習慣。\n"
-                    f"將翻譯結果放入 YAML 陣列中的 translation 字段。\n\n"
-                    f"示例格式:\n"
-                    f"  示例請求:\n"
-                    f"    - id: 1\n"
-                    f"      source: Source\n"
-                    f"  示例結果:\n"
-                    f"    - id: 1\n"
-                    f"      translation: 意譯結果\n\n"
-                )
-            else:
-                user_content = (
-                    f"请将下面 YAML 对象里的 source 字段意译为 {target_language}，"
-                    f"力求信达雅，保留特定的术语或媒体名称（如有），"
-                    f"让文本更通俗易懂，符合中文的表达习惯。\n"
-                    f"将翻译结果放入 YAML 数组中的 translation 字段。\n\n"
-                    f"示例格式:\n"
-                    f"  示例请求:\n"
-                    f"    - id: 1\n"
-                    f"      source: Source\n"
-                    f"  示例结果:\n"
-                    f"    - id: 1\n"
-                    f"      translation: 意译结果\n\n"
-                )
-        else:
-            if is_traditional:
-                user_content = (
-                    f"請根據以下要求完成翻譯任務：\n"
-                    f"1. 將下面 YAML 對象裡的 source 字段直接翻譯為 {target_language}，"
-                    f"保留原文特定的術語或媒體名稱（如有）。"
-                    f"將本次翻譯的結果放入 YAML 陣列中的 step1 字段。\n"
-                    f"2. 根據第一次翻譯的結果進行意譯，力求信達雅，"
-                    f"但還是要保留特定的術語或媒體名稱（如有），"
-                    f"在遵守原意的前提下讓文本更通俗易懂，符合中文的表達習慣，"
-                    f"將第二次翻譯的結果放入 YAML 陣列中的 step2 字段。\n\n"
-                    f"示例格式:\n"
-                    f"  示例請求:\n"
-                    f"    - id: 1\n"
-                    f"      source: Source\n"
-                    f"  示例結果:\n"
-                    f"    - id: 1\n"
-                    f"      step1: 直譯結果\n"
-                    f"      step2: 意譯結果\n\n"
-                )
-            else:
-                user_content = (
-                    f"请根据以下要求完成翻译任务：\n"
-                    f"1. 将下面 YAML 对象里的 source 字段直接翻译为 {target_language}，"
-                    f"保留原文特定的术语或媒体名称（如有）。"
-                    f"将本次翻译的结果放入 YAML 数组中的 step1 字段。\n"
-                    f"2. 根据第一次翻译的结果进行意译，力求信达雅，"
-                    f"但还是要保留特定的术语或媒体名称（如有），"
-                    f"在遵守原意的前提下让文本更通俗易懂，符合中文的表达习惯，"
-                    f"将第二次翻译的结果放入 YAML 数组中的 step2 字段。\n\n"
-                    f"示例格式:\n"
-                    f"  示例请求:\n"
-                    f"    - id: 1\n"
-                    f"      source: Source\n"
-                    f"  示例结果:\n"
-                    f"    - id: 1\n"
-                    f"      step1: 直译结果\n"
-                    f"      step2: 意译结果\n\n"
-                )
-
-        if context:
-            user_content += f"Context: {context}\n\n"
+        mode = 'single_step' if self.single_step else 'two_step'
+        locale = 'traditional' if is_traditional else 'simplified'
 
         # Build YAML input
         yaml_input = f"- id: 1\n  source: {text}"
-        user_content += f"开始翻译:\n\n{yaml_input}"
+
+        user_content = build_translation_prompt(
+            mode=mode,
+            locale=locale,
+            target_language=target_language,
+            yaml_text=yaml_input,
+        )
+
+        if context:
+            # Insert context before the "开始翻译" / "開始翻譯" line
+            start_marker = '開始翻譯:' if is_traditional else '开始翻译:'
+            user_content = user_content.replace(
+                start_marker,
+                f"Context: {context}\n\n{start_marker}"
+            )
 
         return [
             system_message,
@@ -853,78 +800,15 @@ class LocalLLMTranslator:
             'content': self._build_system_prompt(target_language)
         }
 
-        if self.single_step:
-            if is_traditional:
-                user_content = (
-                    f"請將下面 YAML 對象裡的 source 字段意譯為 {target_language}，"
-                    f"力求信達雅，保留特定的術語或媒體名稱（如有），"
-                    f"讓文本更通俗易懂，符合中文的表達習慣。\n"
-                    f"將翻譯結果放入 YAML 陣列中的 translation 字段。\n\n"
-                    f"示例格式:\n"
-                    f"  示例請求:\n"
-                    f"    - id: 1\n"
-                    f"      source: Source\n"
-                    f"  示例結果:\n"
-                    f"    - id: 1\n"
-                    f"      translation: 意譯結果\n\n"
-                    f"開始翻譯:\n\n{yaml_text}"
-                )
-            else:
-                user_content = (
-                    f"请将下面 YAML 对象里的 source 字段意译为 {target_language}，"
-                    f"力求信达雅，保留特定的术语或媒体名称（如有），"
-                    f"让文本更通俗易懂，符合中文的表达习惯。\n"
-                    f"将翻译结果放入 YAML 数组中的 translation 字段。\n\n"
-                    f"示例格式:\n"
-                    f"  示例请求:\n"
-                    f"    - id: 1\n"
-                    f"      source: Source\n"
-                    f"  示例结果:\n"
-                    f"    - id: 1\n"
-                    f"      translation: 意译结果\n\n"
-                    f"开始翻译:\n\n{yaml_text}"
-                )
-        else:
-            if is_traditional:
-                user_content = (
-                    f"請根據以下要求完成翻譯任務：\n"
-                    f"1. 將下面 YAML 對象裡的 source 字段直接翻譯為 {target_language}，"
-                    f"保留原文特定的術語或媒體名稱（如有）。"
-                    f"將本次翻譯的結果放入 YAML 陣列中的 step1 字段。\n"
-                    f"2. 根據第一次翻譯的結果進行意譯，力求信達雅，"
-                    f"但還是要保留特定的術語或媒體名稱（如有），"
-                    f"在遵守原意的前提下讓文本更通俗易懂，符合中文的表達習慣，"
-                    f"將第二次翻譯的結果放入 YAML 陣列中的 step2 字段。\n\n"
-                    f"示例格式:\n"
-                    f"  示例請求:\n"
-                    f"    - id: 1\n"
-                    f"      source: Source\n"
-                    f"  示例結果:\n"
-                    f"    - id: 1\n"
-                    f"      step1: 直譯結果\n"
-                    f"      step2: 意譯結果\n\n"
-                    f"開始翻譯:\n\n{yaml_text}"
-                )
-            else:
-                user_content = (
-                    f"请根据以下要求完成翻译任务：\n"
-                    f"1. 将下面 YAML 对象里的 source 字段直接翻译为 {target_language}，"
-                    f"保留原文特定的术语或媒体名称（如有）。"
-                    f"将本次翻译的结果放入 YAML 数组中的 step1 字段。\n"
-                    f"2. 根据第一次翻译的结果进行意译，力求信达雅，"
-                    f"但还是要保留特定的术语或媒体名称（如有），"
-                    f"在遵守原意的前提下让文本更通俗易懂，符合中文的表达习惯，"
-                    f"将第二次翻译的结果放入 YAML 数组中的 step2 字段。\n\n"
-                    f"示例格式:\n"
-                    f"  示例请求:\n"
-                    f"    - id: 1\n"
-                    f"      source: Source\n"
-                    f"  示例结果:\n"
-                    f"    - id: 1\n"
-                    f"      step1: 直译结果\n"
-                    f"      step2: 意译结果\n\n"
-                    f"开始翻译:\n\n{yaml_text}"
-                )
+        mode = 'single_step' if self.single_step else 'two_step'
+        locale = 'traditional' if is_traditional else 'simplified'
+
+        user_content = build_translation_prompt(
+            mode=mode,
+            locale=locale,
+            target_language=target_language,
+            yaml_text=yaml_text,
+        )
 
         return [
             system_message,

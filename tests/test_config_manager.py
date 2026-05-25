@@ -335,13 +335,14 @@ class TestSetConfigValue:
         assert config_manager.get("server.port") == 4444, "Should overwrite existing value"
 
 
-# Test 5: Test translation config section
-class TestTranslationConfig:
-    """Test suite for translation-specific configuration."""
+# Test 5: Test translation config section via generic get/set
+class TestTranslationConfigViaGetSet:
+    """Test suite verifying get('translation') and set('translation', ...) work
+    equivalently to the removed get_translation_config / set_translation_config."""
 
-    def test_get_translation_config(self, config_manager):
-        """Test getting the translation config section."""
-        trans_config = config_manager.get_translation_config()
+    def test_get_translation_config_via_get(self, config_manager):
+        """Test getting the translation config section using get('translation')."""
+        trans_config = config_manager.get("translation")
 
         assert isinstance(trans_config, dict), "Translation config should be a dict"
         assert "enabled" in trans_config, "Should contain 'enabled' key"
@@ -351,15 +352,15 @@ class TestTranslationConfig:
 
     def test_get_translation_config_values(self, config_manager):
         """Test translation config has correct values."""
-        trans_config = config_manager.get_translation_config()
+        trans_config = config_manager.get("translation")
 
-        assert trans_config["enabled"] == True, "Should have correct enabled value"
+        assert trans_config["enabled"] is True, "Should have correct enabled value"
         assert trans_config["source_lang"] == "es", "Should have correct source_lang"
         assert trans_config["target_lang"] == "en", "Should have correct target_lang"
         assert trans_config["provider"] == "google", "Should have correct provider"
 
-    def test_set_translation_config(self, config_manager):
-        """Test setting the entire translation config."""
+    def test_set_translation_config_via_set(self, config_manager):
+        """Test setting the entire translation config using set('translation', ...)."""
         new_trans_config = {
             "enabled": False,
             "source_lang": "fr",
@@ -367,29 +368,29 @@ class TestTranslationConfig:
             "provider": "deepl"
         }
 
-        config_manager.set_translation_config(new_trans_config)
+        config_manager.set("translation", new_trans_config)
 
-        retrieved = config_manager.get_translation_config()
+        retrieved = config_manager.get("translation")
         assert retrieved == new_trans_config, "Translation config should be updated"
 
-    def test_set_translation_config_partial(self, config_manager):
-        """Test setting partial translation config."""
-        config_manager.set_translation_config({"enabled": False})
+    def test_set_translation_config_partial_via_set(self, config_manager):
+        """Test updating individual translation keys using set('translation.key', ...)."""
+        config_manager.set("translation.enabled", False)
 
-        trans_config = config_manager.get_translation_config()
-        assert trans_config["enabled"] == False, "Should update specified key"
-        assert trans_config["provider"] == "google", "Should preserve other keys"
+        assert config_manager.get("translation.enabled") is False, "Should update specified key"
+        assert config_manager.get("translation.provider") == "google", "Should preserve other keys"
 
     def test_get_translation_config_with_defaults(self, temp_config_file):
-        """Test getting translation config when missing uses defaults."""
+        """Test getting translation config when missing returns default from merge."""
         # Create config without translation section
         with open(temp_config_file, 'w') as f:
             json.dump({"server": {"port": 8080}}, f)
 
         manager = ConfigManager(str(temp_config_file))
-        trans_config = manager.get_translation_config()
+        manager.load()
+        trans_config = manager.get("translation")
 
-        # Should return default translation config
+        # Should return default translation config from merge
         assert isinstance(trans_config, dict), "Should return default dict"
         assert "enabled" in trans_config, "Should have default keys"
         assert "provider" in trans_config, "Should have default provider"
@@ -400,10 +401,9 @@ class TestTranslationConfig:
             json.dump({"server": {"port": 8080}}, f)
 
         manager = ConfigManager(str(temp_config_file))
-        manager.set_translation_config({"enabled": True})
+        manager.set("translation.enabled", True)
 
-        trans_config = manager.get_translation_config()
-        assert trans_config["enabled"] == True, "Should create and set translation config"
+        assert manager.get("translation.enabled") is True, "Should create and set translation config"
 
 
 # Test 6: Test default config merge
