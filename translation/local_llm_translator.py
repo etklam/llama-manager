@@ -13,6 +13,7 @@ Uses a two-step translation approach (inspired by ImmersiveTranslate Paraphrase 
 import logging
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Callable, List, Dict, Optional, TYPE_CHECKING
 
@@ -40,7 +41,8 @@ RETRY_DELAY = 1  # Initial delay for exponential backoff
 DEFAULT_MAX_TOKENS = 4096
 DEFAULT_TEMPERATURE = 0.3
 DEFAULT_API_URL = "http://localhost:8080/v1"
-DEFAULT_BATCH_SIZE = 5  # Small batch for two-step translation (output is 2x)
+DEFAULT_BATCH_SIZE = 15  # Larger batch reduces API call overhead
+DEFAULT_MAX_WORKERS = 3  # Concurrent batch workers for parallel API calls
 
 # Load prompt template
 _PROMPT_DIR = Path(__file__).parent / "prompts"
@@ -119,6 +121,12 @@ class LocalLLMTranslator:
         if not isinstance(self.max_tokens, int) or self.max_tokens <= 0:
             self.max_tokens = DEFAULT_MAX_TOKENS
 
+        # Single-step mode: skip step1 (直译), only produce step2 (意译)
+        self.single_step = bool(config.get('single_step', False))
+
+        # Concurrent workers for batch processing
+        self.max_workers = max(1, int(config.get('max_workers', DEFAULT_MAX_WORKERS)))
+
         # Store injected client or create OpenAIClient lazily
         self._injected_client = client
         self._openai_client = None  # OpenAIClient instance (will be created lazily if needed)
@@ -190,7 +198,10 @@ class LocalLLMTranslator:
         context: Optional[str] = None
     ) -> List[Dict[str, str]]:
         """
-        Build a two-step prompt for single-text translation.
+        Build a prompt for single-text translation.
+
+        In single-step mode: only requests 意译 (translation field).
+        In two-step mode: requests step1 (直译) + step2 (意译).
 
         Args:
             text: Text to translate
@@ -207,44 +218,74 @@ class LocalLLMTranslator:
             'content': self._build_system_prompt(target_language)
         }
 
-        if is_traditional:
-            user_content = (
-                f"請根據以下要求完成翻譯任務：\n"
-                f"1. 將下面 YAML 對象裡的 source 字段直接翻譯為 {target_language}，"
-                f"保留原文特定的術語或媒體名稱（如有）。"
-                f"將本次翻譯的結果放入 YAML 陣列中的 step1 字段。\n"
-                f"2. 根據第一次翻譯的結果進行意譯，力求信達雅，"
-                f"但還是要保留特定的術語或媒體名稱（如有），"
-                f"在遵守原意的前提下讓文本更通俗易懂，符合中文的表達習慣，"
-                f"將第二次翻譯的結果放入 YAML 陣列中的 step2 字段。\n\n"
-                f"示例格式:\n"
-                f"  示例請求:\n"
-                f"    - id: 1\n"
-                f"      source: Source\n"
-                f"  示例結果:\n"
-                f"    - id: 1\n"
-                f"      step1: 直譯結果\n"
-                f"      step2: 意譯結果\n\n"
-            )
+        if self.single_step:
+            if is_traditional:
+                user_content = (
+                    f"請將下面 YAML 對象裡的 source 字段意譯為 {target_language}，"
+                    f"力求信達雅，保留特定的術語或媒體名稱（如有），"
+                    f"讓文本更通俗易懂，符合中文的表達習慣。\n"
+                    f"將翻譯結果放入 YAML 陣列中的 translation 字段。\n\n"
+                    f"示例格式:\n"
+                    f"  示例請求:\n"
+                    f"    - id: 1\n"
+                    f"      source: Source\n"
+                    f"  示例結果:\n"
+                    f"    - id: 1\n"
+                    f"      translation: 意譯結果\n\n"
+                )
+            else:
+                user_content = (
+                    f"请将下面 YAML 对象里的 source 字段意译为 {target_language}，"
+                    f"力求信达雅，保留特定的术语或媒体名称（如有），"
+                    f"让文本更通俗易懂，符合中文的表达习惯。\n"
+                    f"将翻译结果放入 YAML 数组中的 translation 字段。\n\n"
+                    f"示例格式:\n"
+                    f"  示例请求:\n"
+                    f"    - id: 1\n"
+                    f"      source: Source\n"
+                    f"  示例结果:\n"
+                    f"    - id: 1\n"
+                    f"      translation: 意译结果\n\n"
+                )
         else:
-            user_content = (
-                f"请根据以下要求完成翻译任务：\n"
-                f"1. 将下面 YAML 对象里的 source 字段直接翻译为 {target_language}，"
-                f"保留原文特定的术语或媒体名称（如有）。"
-                f"将本次翻译的结果放入 YAML 数组中的 step1 字段。\n"
-                f"2. 根据第一次翻译的结果进行意译，力求信达雅，"
-                f"但还是要保留特定的术语或媒体名称（如有），"
-                f"在遵守原意的前提下让文本更通俗易懂，符合中文的表达习惯，"
-                f"将第二次翻译的结果放入 YAML 数组中的 step2 字段。\n\n"
-                f"示例格式:\n"
-                f"  示例请求:\n"
-                f"    - id: 1\n"
-                f"      source: Source\n"
-                f"  示例结果:\n"
-                f"    - id: 1\n"
-                f"      step1: 直译结果\n"
-                f"      step2: 意译结果\n\n"
-            )
+            if is_traditional:
+                user_content = (
+                    f"請根據以下要求完成翻譯任務：\n"
+                    f"1. 將下面 YAML 對象裡的 source 字段直接翻譯為 {target_language}，"
+                    f"保留原文特定的術語或媒體名稱（如有）。"
+                    f"將本次翻譯的結果放入 YAML 陣列中的 step1 字段。\n"
+                    f"2. 根據第一次翻譯的結果進行意譯，力求信達雅，"
+                    f"但還是要保留特定的術語或媒體名稱（如有），"
+                    f"在遵守原意的前提下讓文本更通俗易懂，符合中文的表達習慣，"
+                    f"將第二次翻譯的結果放入 YAML 陣列中的 step2 字段。\n\n"
+                    f"示例格式:\n"
+                    f"  示例請求:\n"
+                    f"    - id: 1\n"
+                    f"      source: Source\n"
+                    f"  示例結果:\n"
+                    f"    - id: 1\n"
+                    f"      step1: 直譯結果\n"
+                    f"      step2: 意譯結果\n\n"
+                )
+            else:
+                user_content = (
+                    f"请根据以下要求完成翻译任务：\n"
+                    f"1. 将下面 YAML 对象里的 source 字段直接翻译为 {target_language}，"
+                    f"保留原文特定的术语或媒体名称（如有）。"
+                    f"将本次翻译的结果放入 YAML 数组中的 step1 字段。\n"
+                    f"2. 根据第一次翻译的结果进行意译，力求信达雅，"
+                    f"但还是要保留特定的术语或媒体名称（如有），"
+                    f"在遵守原意的前提下让文本更通俗易懂，符合中文的表达习惯，"
+                    f"将第二次翻译的结果放入 YAML 数组中的 step2 字段。\n\n"
+                    f"示例格式:\n"
+                    f"  示例请求:\n"
+                    f"    - id: 1\n"
+                    f"      source: Source\n"
+                    f"  示例结果:\n"
+                    f"    - id: 1\n"
+                    f"      step1: 直译结果\n"
+                    f"      step2: 意译结果\n\n"
+                )
 
         if context:
             user_content += f"Context: {context}\n\n"
@@ -350,18 +391,19 @@ class LocalLLMTranslator:
     @staticmethod
     def _parse_yaml_result(raw: str) -> List[Dict[str, str]]:
         """
-        Parse YAML-formatted translation result with step1 and step2 fields.
+        Parse YAML-formatted translation result.
 
-        Expected format:
+        Supports both two-step (step1/step2) and single-step (translation) formats:
             - id: 1
               step1: 直译结果
               step2: 意译结果
-            - id: 2
-              step1: ...
-              step2: ...
+            OR:
+            - id: 1
+              translation: 意译结果
 
         Returns:
             List of dicts with keys: id, step1, step2
+            For single-step format, 'translation' is mapped to 'step2'.
         """
         results = []
         # Try to extract YAML block from various wrapper formats
@@ -398,7 +440,7 @@ class LocalLLMTranslator:
 
             # Extract step1 - handle multi-line with proper indentation
             step1_match = re.search(
-                r'step1:\s*(.+?)(?=\s+step2:|\s+id:|\s*$)',
+                r'step1:\s*(.+?)(?=\s+step2:|\s+translation:|\s+id:|\s*$)',
                 item, re.DOTALL
             )
             step1 = step1_match.group(1).strip() if step1_match else ""
@@ -409,6 +451,17 @@ class LocalLLMTranslator:
                 item, re.DOTALL
             )
             step2 = step2_match.group(1).strip() if step2_match else ""
+
+            # Extract translation field (single-step mode)
+            translation_match = re.search(
+                r'translation:\s*(.+?)(?=\s+id:|\s*$)',
+                item, re.DOTALL
+            )
+            translation = translation_match.group(1).strip() if translation_match else ""
+
+            # For single-step responses, map translation -> step2
+            if not step2 and translation:
+                step2 = translation
 
             results.append({
                 'id': item_id,
@@ -523,12 +576,12 @@ class LocalLLMTranslator:
         """
         Translate SRT subtitle format while preserving timestamps.
 
-        Uses two-step translation:
-          Step 1: Literal translation (直译)
-          Step 2: Paraphrase/free translation (意译)
+        Supports two modes via config:
+          - Two-step (default): step1 (直译) + step2 (意译)
+          - Single-step (single_step=True): translation only (意译)
 
-        Translates in batches, with automatic fallback to individual
-        translation on failure.
+        Translates in batches with concurrent execution (ThreadPoolExecutor),
+        with automatic fallback to individual translation on batch failure.
 
         Args:
             srt_data: List of subtitle dictionaries
@@ -565,54 +618,75 @@ class LocalLLMTranslator:
         ]
         total_batches = len(batches)
         _log("INFO", f"Batching {len(srt_data)} lines in "
-             f"{total_batches} groups of {batch_size}")
+             f"{total_batches} groups of {batch_size} "
+             f"(workers={self.max_workers}, single_step={self.single_step})")
 
-        all_translated = []
         overall_start = time.time()
-        for batch_idx, batch in enumerate(batches):
-            batch_start_global = batch_idx * batch_size + 1
-            batch_end_global = batch_start_global + len(batch) - 1
+
+        # Submit all batches concurrently
+        batch_results: Dict[int, List[Dict]] = {}
+        batch_errors: Dict[int, Exception] = {}
+
+        if self.max_workers <= 1:
+            # Sequential mode (no concurrency)
+            for batch_idx, batch in enumerate(batches):
+                self._process_single_batch(
+                    batch_idx, batch, batches, srt_data, target_language,
+                    log_callback, progress_callback, batch_results, batch_errors
+                )
+        else:
+            # Concurrent mode
+            with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+                futures = {}
+                for batch_idx, batch in enumerate(batches):
+                    future = executor.submit(
+                        self._translate_batch_lines,
+                        batch, target_language, None  # log_callback=None for thread safety
+                    )
+                    futures[future] = batch_idx
+
+                for future in as_completed(futures):
+                    batch_idx = futures[future]
+                    batch = batches[batch_idx]
+                    try:
+                        batch_results[batch_idx] = future.result()
+                    except Exception as e:
+                        batch_errors[batch_idx] = e
+
+            # Log batch results
+            for batch_idx in range(total_batches):
+                batch = batches[batch_idx]
+                batch_start_global = batch_idx * batch_size + 1
+                batch_end_global = batch_start_global + len(batch) - 1
+
+                if batch_idx in batch_errors:
+                    e = batch_errors[batch_idx]
+                    _log("WARNING", f"Batch {batch_idx+1} failed ({e}), "
+                         "falling back to individual translation")
+                elif batch_idx in batch_results:
+                    _log("SUCCESS", f"Batch {batch_idx+1} done "
+                         f"({batch_start_global}-{batch_end_global})")
 
             if progress_callback:
-                progress_callback(
-                    batch_start_global, len(srt_data),
-                    f"batch {batch_idx+1}/{total_batches} L{batch_start_global}-{batch_end_global}"
-                )
+                progress_callback(len(srt_data), len(srt_data), "batches done")
 
-            _log("INFO", f"Batch {batch_idx+1}/{total_batches}: "
-                 f"lines {batch_start_global}-{batch_end_global} ({len(batch)} lines)")
+        # Reconstruct results in order, with fallback for failed batches
+        all_translated = []
+        for batch_idx, batch in enumerate(batches):
+            batch_start_global = batch_idx * batch_size + 1
 
-            batch_t0 = time.time()
-            try:
-                batch_result = self._translate_batch_lines(
-                    batch, target_language, log_callback
-                )
-                elapsed = time.time() - batch_t0
-                all_translated.extend(batch_result)
-                # Estimate remaining time
-                done_count = batch_idx + 1
-                avg_batch_time = (time.time() - overall_start) / done_count
-                remaining_batches = total_batches - done_count
-                eta = avg_batch_time * remaining_batches
-                _log("SUCCESS", f"Batch {batch_idx+1} done ({elapsed:.1f}s, "
-                     f"ETA: {eta/60:.1f}min remaining)")
-            except Exception as e:
-                _log("WARNING", f"Batch {batch_idx+1} failed ({e}), "
-                     "falling back to individual translation")
-                # Fall back one at a time for this batch
+            if batch_idx in batch_results:
+                all_translated.extend(batch_results[batch_idx])
+            elif batch_idx in batch_errors:
+                # Fall back to individual translation
                 for i, entry in enumerate(batch):
                     line_num = batch_start_global + i
-                    if progress_callback:
-                        progress_callback(
-                            line_num, len(srt_data),
-                            f"fallback L{line_num}"
-                        )
                     text = entry.get('text', '').strip().replace("\n", " ")
                     if text:
                         try:
                             translated = self.translate(text, target_language)
                         except Exception:
-                            translated = text  # Keep original on failure
+                            translated = text
                     else:
                         translated = text
                     _log("INFO", f"  L{line_num}: \"{text[:60]}\" -> \"{translated[:60]}\"")
@@ -623,9 +697,51 @@ class LocalLLMTranslator:
                     })
 
         total_elapsed = time.time() - overall_start
+        rate = len(all_translated) / total_elapsed if total_elapsed > 0 else float('inf')
         _log("INFO", f"Translation done: {len(all_translated)} lines in "
-             f"{total_elapsed:.1f}s ({len(all_translated)/total_elapsed:.1f} lines/s)")
+             f"{total_elapsed:.1f}s ({rate:.1f} lines/s)")
         return all_translated
+
+    def _process_single_batch(
+        self,
+        batch_idx: int,
+        batch: List[Dict],
+        batches: List[List[Dict]],
+        srt_data: List[Dict],
+        target_language: str,
+        log_callback: Optional[Callable],
+        progress_callback: Optional[Callable],
+        batch_results: Dict[int, List[Dict]],
+        batch_errors: Dict[int, Exception]
+    ):
+        """Process a single batch sequentially (used when max_workers <= 1)."""
+        batch_size = len(batch)
+        batch_start_global = batch_idx * max(1, self._config.get('batch_size', DEFAULT_BATCH_SIZE)) + 1
+        batch_end_global = batch_start_global + batch_size - 1
+
+        def _log(level, msg):
+            if log_callback:
+                log_callback(level, msg)
+
+        if progress_callback:
+            progress_callback(
+                batch_start_global, len(srt_data),
+                f"batch {batch_idx+1}/{len(batches)} L{batch_start_global}-{batch_end_global}"
+            )
+
+        _log("INFO", f"Batch {batch_idx+1}/{len(batches)}: "
+             f"lines {batch_start_global}-{batch_end_global} ({batch_size} lines)")
+
+        batch_t0 = time.time()
+        try:
+            batch_result = self._translate_batch_lines(
+                batch, target_language, log_callback
+            )
+            elapsed = time.time() - batch_t0
+            batch_results[batch_idx] = batch_result
+            _log("SUCCESS", f"Batch {batch_idx+1} done ({elapsed:.1f}s)")
+        except Exception as e:
+            batch_errors[batch_idx] = e
 
     def _build_batch_yaml(self, batch: List[Dict]) -> str:
         """
@@ -737,46 +853,78 @@ class LocalLLMTranslator:
             'content': self._build_system_prompt(target_language)
         }
 
-        if is_traditional:
-            user_content = (
-                f"請根據以下要求完成翻譯任務：\n"
-                f"1. 將下面 YAML 對象裡的 source 字段直接翻譯為 {target_language}，"
-                f"保留原文特定的術語或媒體名稱（如有）。"
-                f"將本次翻譯的結果放入 YAML 陣列中的 step1 字段。\n"
-                f"2. 根據第一次翻譯的結果進行意譯，力求信達雅，"
-                f"但還是要保留特定的術語或媒體名稱（如有），"
-                f"在遵守原意的前提下讓文本更通俗易懂，符合中文的表達習慣，"
-                f"將第二次翻譯的結果放入 YAML 陣列中的 step2 字段。\n\n"
-                f"示例格式:\n"
-                f"  示例請求:\n"
-                f"    - id: 1\n"
-                f"      source: Source\n"
-                f"  示例結果:\n"
-                f"    - id: 1\n"
-                f"      step1: 直譯結果\n"
-                f"      step2: 意譯結果\n\n"
-                f"開始翻譯:\n\n{yaml_text}"
-            )
+        if self.single_step:
+            if is_traditional:
+                user_content = (
+                    f"請將下面 YAML 對象裡的 source 字段意譯為 {target_language}，"
+                    f"力求信達雅，保留特定的術語或媒體名稱（如有），"
+                    f"讓文本更通俗易懂，符合中文的表達習慣。\n"
+                    f"將翻譯結果放入 YAML 陣列中的 translation 字段。\n\n"
+                    f"示例格式:\n"
+                    f"  示例請求:\n"
+                    f"    - id: 1\n"
+                    f"      source: Source\n"
+                    f"  示例結果:\n"
+                    f"    - id: 1\n"
+                    f"      translation: 意譯結果\n\n"
+                    f"開始翻譯:\n\n{yaml_text}"
+                )
+            else:
+                user_content = (
+                    f"请将下面 YAML 对象里的 source 字段意译为 {target_language}，"
+                    f"力求信达雅，保留特定的术语或媒体名称（如有），"
+                    f"让文本更通俗易懂，符合中文的表达习惯。\n"
+                    f"将翻译结果放入 YAML 数组中的 translation 字段。\n\n"
+                    f"示例格式:\n"
+                    f"  示例请求:\n"
+                    f"    - id: 1\n"
+                    f"      source: Source\n"
+                    f"  示例结果:\n"
+                    f"    - id: 1\n"
+                    f"      translation: 意译结果\n\n"
+                    f"开始翻译:\n\n{yaml_text}"
+                )
         else:
-            user_content = (
-                f"请根据以下要求完成翻译任务：\n"
-                f"1. 将下面 YAML 对象里的 source 字段直接翻译为 {target_language}，"
-                f"保留原文特定的术语或媒体名称（如有）。"
-                f"将本次翻译的结果放入 YAML 数组中的 step1 字段。\n"
-                f"2. 根据第一次翻译的结果进行意译，力求信达雅，"
-                f"但还是要保留特定的术语或媒体名称（如有），"
-                f"在遵守原意的前提下让文本更通俗易懂，符合中文的表达习惯，"
-                f"将第二次翻译的结果放入 YAML 数组中的 step2 字段。\n\n"
-                f"示例格式:\n"
-                f"  示例请求:\n"
-                f"    - id: 1\n"
-                f"      source: Source\n"
-                f"  示例结果:\n"
-                f"    - id: 1\n"
-                f"      step1: 直译结果\n"
-                f"      step2: 意译结果\n\n"
-                f"开始翻译:\n\n{yaml_text}"
-            )
+            if is_traditional:
+                user_content = (
+                    f"請根據以下要求完成翻譯任務：\n"
+                    f"1. 將下面 YAML 對象裡的 source 字段直接翻譯為 {target_language}，"
+                    f"保留原文特定的術語或媒體名稱（如有）。"
+                    f"將本次翻譯的結果放入 YAML 陣列中的 step1 字段。\n"
+                    f"2. 根據第一次翻譯的結果進行意譯，力求信達雅，"
+                    f"但還是要保留特定的術語或媒體名稱（如有），"
+                    f"在遵守原意的前提下讓文本更通俗易懂，符合中文的表達習慣，"
+                    f"將第二次翻譯的結果放入 YAML 陣列中的 step2 字段。\n\n"
+                    f"示例格式:\n"
+                    f"  示例請求:\n"
+                    f"    - id: 1\n"
+                    f"      source: Source\n"
+                    f"  示例結果:\n"
+                    f"    - id: 1\n"
+                    f"      step1: 直譯結果\n"
+                    f"      step2: 意譯結果\n\n"
+                    f"開始翻譯:\n\n{yaml_text}"
+                )
+            else:
+                user_content = (
+                    f"请根据以下要求完成翻译任务：\n"
+                    f"1. 将下面 YAML 对象里的 source 字段直接翻译为 {target_language}，"
+                    f"保留原文特定的术语或媒体名称（如有）。"
+                    f"将本次翻译的结果放入 YAML 数组中的 step1 字段。\n"
+                    f"2. 根据第一次翻译的结果进行意译，力求信达雅，"
+                    f"但还是要保留特定的术语或媒体名称（如有），"
+                    f"在遵守原意的前提下让文本更通俗易懂，符合中文的表达习惯，"
+                    f"将第二次翻译的结果放入 YAML 数组中的 step2 字段。\n\n"
+                    f"示例格式:\n"
+                    f"  示例请求:\n"
+                    f"    - id: 1\n"
+                    f"      source: Source\n"
+                    f"  示例结果:\n"
+                    f"    - id: 1\n"
+                    f"      step1: 直译结果\n"
+                    f"      step2: 意译结果\n\n"
+                    f"开始翻译:\n\n{yaml_text}"
+                )
 
         return [
             system_message,

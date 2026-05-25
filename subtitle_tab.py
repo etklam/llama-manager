@@ -170,10 +170,18 @@ class SubtitleTranslationTab(ttk.Frame):
                              pady=(0, 5))
         self._adv_frame.columnconfigure(1, weight=1)
 
+        # Restore saved values or use defaults
+        cm = self._config_manager
+        saved_batch = cm.get("ui.batch_size", 15) if cm else 15
+        saved_temp = cm.get("ui.temperature", 0.2) if cm else 0.2
+        saved_tokens = cm.get("ui.max_tokens", 16384) if cm else 16384
+        saved_workers = cm.get("ui.max_workers", 3) if cm else 3
+        saved_fast = cm.get("ui.single_step", True) if cm else True
+
         # Row 0: Batch size
         ttk.Label(self._adv_frame, text="Batch Size:").grid(
             row=0, column=0, sticky=tk.W, padx=(0, 5))
-        self._batch_var = tk.IntVar(value=5)
+        self._batch_var = tk.IntVar(value=saved_batch)
         ttk.Scale(self._adv_frame, from_=1, to=50,
                   variable=self._batch_var, orient=tk.HORIZONTAL,
                   length=150).grid(row=0, column=1, sticky=tk.W)
@@ -183,7 +191,7 @@ class SubtitleTranslationTab(ttk.Frame):
         # Row 0: Temperature
         ttk.Label(self._adv_frame, text="Temperature:").grid(
             row=0, column=3, sticky=tk.W, padx=(0, 5))
-        self._temp_var = tk.DoubleVar(value=0.2)
+        self._temp_var = tk.DoubleVar(value=saved_temp)
         ttk.Scale(self._adv_frame, from_=0.0, to=2.0,
                   variable=self._temp_var, orient=tk.HORIZONTAL,
                   length=150).grid(row=0, column=4, sticky=tk.W)
@@ -193,12 +201,31 @@ class SubtitleTranslationTab(ttk.Frame):
         # Row 1: Max tokens
         ttk.Label(self._adv_frame, text="Max Tokens:").grid(
             row=1, column=0, sticky=tk.W, padx=(0, 5))
-        self._tokens_var = tk.IntVar(value=16384)
+        self._tokens_var = tk.IntVar(value=saved_tokens)
         tokens_combo = ttk.Combobox(
             self._adv_frame, textvariable=self._tokens_var,
             values=[512, 1024, 2048, 4096, 8192, 16384, 32768],
             width=10, state="readonly")
         tokens_combo.grid(row=1, column=1, sticky=tk.W)
+
+        # Row 1: Workers
+        ttk.Label(self._adv_frame, text="并发数:").grid(
+            row=1, column=3, sticky=tk.W, padx=(20, 5))
+        self._workers_var = tk.IntVar(value=saved_workers)
+        workers_scale = ttk.Scale(self._adv_frame, from_=1, to=8,
+                  variable=self._workers_var, orient=tk.HORIZONTAL,
+                  length=120)
+        workers_scale.grid(row=1, column=4, sticky=tk.W)
+        self._workers_label = ttk.Label(self._adv_frame, text=str(saved_workers))
+        self._workers_label.grid(row=1, column=5, padx=5)
+        workers_scale.configure(command=lambda v: self._workers_label.config(
+            text=str(int(float(v)))))
+
+        # Row 2: Fast mode checkbox
+        self._fast_mode_var = tk.BooleanVar(value=saved_fast)
+        ttk.Checkbutton(self._adv_frame, text="快速模式 (跳过直译, 仅意译)",
+                        variable=self._fast_mode_var).grid(
+            row=2, column=0, columnspan=3, sticky=tk.W, pady=(5, 0))
 
         self._adv_frame.grid_remove()  # Hidden by default
 
@@ -392,7 +419,17 @@ class SubtitleTranslationTab(ttk.Frame):
         config['batch_size'] = self._batch_var.get()
         config['temperature'] = self._temp_var.get()
         config['max_tokens'] = self._tokens_var.get()
+        config['max_workers'] = int(float(self._workers_var.get()))
+        config['single_step'] = self._fast_mode_var.get()
         self._translator = LocalLLMTranslator(config)
+
+        # Persist advanced options for next session
+        if self._config_manager:
+            self._config_manager.set("ui.batch_size", config['batch_size'])
+            self._config_manager.set("ui.temperature", config['temperature'])
+            self._config_manager.set("ui.max_tokens", config['max_tokens'])
+            self._config_manager.set("ui.max_workers", config['max_workers'])
+            self._config_manager.set("ui.single_step", config['single_step'])
 
         thread = threading.Thread(target=self._run_translation, daemon=True)
         thread.start()
