@@ -47,10 +47,11 @@ SOURCE_LANGUAGES = {
 class SubtitleTranslationTab(ttk.Frame):
     """GUI tab for batch subtitle translation."""
 
-    def __init__(self, parent, get_config_callback, get_model_callback):
+    def __init__(self, parent, get_config_callback, get_model_callback, config_manager=None):
         super().__init__(parent)
         self._get_config = get_config_callback
         self._get_model = get_model_callback
+        self._config_manager = config_manager
         self._translator: Optional[LocalLLMTranslator] = None
         self._file_list: list = []
         self._translating = False
@@ -136,7 +137,8 @@ class SubtitleTranslationTab(ttk.Frame):
 
         # Source language
         ttk.Label(frame, text="Source:").pack(side=tk.LEFT, padx=(0, 2))
-        self._source_var = tk.StringVar(value="auto")
+        last_source = self._config_manager.get("ui.last_source_lang", "auto") if self._config_manager else "auto"
+        self._source_var = tk.StringVar(value=last_source)
         self._source_combo = ttk.Combobox(frame, textvariable=self._source_var,
                                            state="readonly", width=15)
         self._source_combo.pack(side=tk.LEFT, padx=(0, 10))
@@ -146,7 +148,8 @@ class SubtitleTranslationTab(ttk.Frame):
 
         # Target language
         ttk.Label(frame, text="Target:").pack(side=tk.LEFT, padx=(0, 2))
-        self._target_var = tk.StringVar(value="zh-cn")
+        last_target = self._config_manager.get("ui.last_target_lang", "zh-cn") if self._config_manager else "zh-cn"
+        self._target_var = tk.StringVar(value=last_target)
         self._target_combo = ttk.Combobox(frame, textvariable=self._target_var,
                                            state="readonly", width=15)
         self._target_combo.pack(side=tk.LEFT, padx=(0, 10))
@@ -253,17 +256,40 @@ class SubtitleTranslationTab(ttk.Frame):
         codes = list(langs.keys())
         names = [f"{code} - {langs[code]}" for code in codes]
         self._source_combo['values'] = names
-        self._source_combo.current(0)
+
+        # Restore saved source language
+        saved_source = self._source_var.get()
+        source_found = False
+        for i, name in enumerate(names):
+            if name.startswith(saved_source):
+                self._source_combo.current(i)
+                source_found = True
+                break
+        if not source_found:
+            self._source_combo.current(0)
 
         langs = TARGET_LANGUAGES
         codes = list(langs.keys())
         names = [f"{code} - {langs[code]}" for code in codes]
         self._target_combo['values'] = names
-        # Default to zh-cn
+
+        # Restore saved target language
+        saved_target = self._target_var.get()
+        target_found = False
         for i, name in enumerate(names):
-            if name.startswith('zh-cn'):
+            if name.startswith(saved_target):
                 self._target_combo.current(i)
+                target_found = True
                 break
+        if not target_found:
+            for i, name in enumerate(names):
+                if name.startswith('zh-cn'):
+                    self._target_combo.current(i)
+                    break
+
+        # Bind save on language change
+        self._source_combo.bind('<<ComboboxSelected>>', self._on_language_changed)
+        self._target_combo.bind('<<ComboboxSelected>>', self._on_language_changed)
 
     def _update_model_display(self):
         model = self._get_model()
@@ -272,8 +298,22 @@ class SubtitleTranslationTab(ttk.Frame):
         else:
             self._model_label.config(text="(no model loaded)")
 
+    def _on_language_changed(self, event=None):
+        """Save language selections when user changes them."""
+        if self._config_manager:
+            source_code = self._get_source_code()
+            target_code = self._get_target_code()
+            if source_code:
+                self._config_manager.set("ui.last_source_lang", source_code)
+            if target_code:
+                self._config_manager.set("ui.last_target_lang", target_code)
+
     def _get_target_code(self):
         val = self._target_var.get()
+        return val.split(' - ')[0] if ' - ' in val else val
+
+    def _get_source_code(self):
+        val = self._source_var.get()
         return val.split(' - ')[0] if ' - ' in val else val
 
     # --- Actions ---

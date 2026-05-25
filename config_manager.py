@@ -25,7 +25,10 @@ DEFAULT_CONFIG = {
     },
     'ui': {
         'theme': 'default',
-        'auto_scroll': True
+        'auto_scroll': True,
+        'last_model': '',
+        'last_source_lang': 'auto',
+        'last_target_lang': 'zh-cn'
     },
     'translation': {
         'enabled': False,

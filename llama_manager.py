@@ -93,7 +93,8 @@ class LlamaManager:
         self.subtitle_tab = SubtitleTranslationTab(
             self.notebook,
             get_config_callback=self.get_translation_config,
-            get_model_callback=self.get_current_model
+            get_model_callback=self.get_current_model,
+            config_manager=self.config_manager
         )
         self.notebook.add(self.subtitle_tab, text="Subtitle Translation")
 
@@ -278,8 +279,14 @@ class LlamaManager:
         )
         self.resource_label.grid(row=5, column=0, pady=(10, 0), sticky=tk.W)
 
-        # 刷新模型列表
+        # 刷新模型列表並恢復上次選擇
         self.refresh_model_list()
+
+        # 恢復上次選擇的模型
+        last_model = self.config_manager.get("ui.last_model", "")
+        if last_model and last_model in self.model_combo['values']:
+            self.model_var.set(last_model)
+            self.on_model_select(None)
 
         # 綁定模型選擇事件
         self.model_combo.bind('<<ComboboxSelected>>', self.on_model_select)
@@ -297,6 +304,11 @@ class LlamaManager:
     def on_model_select(self, event):
         """模型選擇事件處理"""
         model_name = self.model_var.get()
+
+        # 記住選擇的模型
+        if model_name:
+            self.config_manager.set("ui.last_model", model_name)
+
         for model in self.models.list_models():
             if model.get("name") == model_name:
                 info = f"大小: {model.get('size', 'N/A')} | 格式: {model.get('format', 'N/A')}"
