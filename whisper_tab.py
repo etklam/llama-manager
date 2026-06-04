@@ -11,7 +11,7 @@ from tkinterdnd2 import DND_FILES
 from whisper_controller import WhisperController
 
 from constants import SUPPORTED_MEDIA, WHISPER_LANGUAGES
-from ui_helpers import LogMixin, parse_dropped_paths
+from ui_helpers import LogMixin, parse_dropped_paths, populate_language_combo, extract_combo_code
 
 
 class WhisperTab(LogMixin, ttk.Frame):
@@ -150,18 +150,8 @@ class WhisperTab(LogMixin, ttk.Frame):
         self._progress_label.grid(row=1, column=0, sticky=tk.W)
 
     def _populate_languages(self):
-        codes = list(WHISPER_LANGUAGES.keys())
-        names = [f"{code} - {WHISPER_LANGUAGES[code]}" for code in codes]
-        self._lang_combo['values'] = names
-
         saved_lang = self._config_manager.get("whisper.language", "auto") if self._config_manager else "auto"
-        for i, name in enumerate(names):
-            if name.startswith(saved_lang):
-                self._lang_combo.current(i)
-                break
-        else:
-            self._lang_combo.current(0)
-
+        populate_language_combo(self._lang_combo, WHISPER_LANGUAGES, saved_lang)
         self._lang_combo.bind('<<ComboboxSelected>>', self._on_setting_changed)
 
     def _populate_models(self):
@@ -205,8 +195,7 @@ class WhisperTab(LogMixin, ttk.Frame):
         self._save_settings()
 
     def _get_language_code(self):
-        val = self._lang_var.get()
-        return val.split(' - ')[0] if ' - ' in val else val
+        return extract_combo_code(self._lang_var.get())
 
     def _browse_cli(self):
         path = filedialog.askopenfilename(
@@ -325,25 +314,6 @@ class WhisperTab(LogMixin, ttk.Frame):
         self.winfo_toplevel().after(0, self._on_transcription_done)
 
     def _transcribe_file(self, filepath):
-        completed = threading.Event()
-        result = {'srt_path': None, 'error': None}
-
-        def on_complete(srt_path):
-            result['srt_path'] = srt_path
-            completed.set()
-
-        def on_error(msg):
-            result['error'] = msg
-            completed.set()
-
-        controller = WhisperController(
-            cli_path=Path(self._cli_var.get().strip()),
-            on_log=lambda msg: self._log("INFO", msg),
-            on_progress=lambda msg: self._log("INFO", msg),
-            on_complete=on_complete,
-            on_error=on_error
-        )
-
         model_dir = self._model_dir_var.get().strip()
         model_name = self._model_var.get()
         model_path = self._resolve_model_path(model_dir, model_name)
@@ -354,27 +324,19 @@ class WhisperTab(LogMixin, ttk.Frame):
         self._log("INFO", f"Model: {model_path}")
         self._log("INFO", f"File: {filepath}")
 
-        controller.start(filepath, model_path, language, threads)
-
-        while not completed.is_set():
-            completed.wait(timeout=0.1)
-            if self._stop_requested:
-                controller.stop()
-                return None
-
-        if result['error']:
-            raise RuntimeError(result['error'])
-
-        return result['srt_path']
+        return WhisperController.transcribe_sync(
+            cli_path=self._cli_var.get().strip(),
+            filepath=filepath,
+            model_path=model_path,
+            language=language,
+            threads=threads,
+            on_log=lambda msg: self._log("INFO", msg),
+            check_stop=lambda: self._stop_requested,
+        )
 
     def _resolve_model_path(self, model_dir, model_name):
-        if not model_dir or not model_name:
-            return model_name
-        models = self._get_whisper_models()
-        for m in models:
-            if m.get('name') == model_name:
-                return m.get('path', model_name)
-        return str(Path(model_dir) / model_name)
+        return WhisperController.resolve_model_path(
+            model_dir, model_name, self._get_whisper_models)
 
     def _on_transcription_done(self):
         self._transcribing = False

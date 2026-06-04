@@ -1,5 +1,6 @@
 """WhisperController - Manages whisper.cpp speech recognition process lifecycle."""
 import os
+import platform
 import subprocess
 import tempfile
 import threading
@@ -10,7 +11,29 @@ from typing import Optional, Callable
 from constants import AUDIO_EXTENSIONS, VIDEO_EXTENSIONS
 
 
+def _detect_hwaccel_args():
+    if platform.system() != 'Windows':
+        return []
+    try:
+        result = subprocess.run(
+            ['ffmpeg', '-hide_banner', '-hwaccels'],
+            capture_output=True, text=True, timeout=5)
+        if 'd3d11va' in result.stdout:
+            return ['-hwaccel', 'd3d11va', '-hwaccel_output_format', 'd3d11']
+    except Exception:
+        pass
+    return []
+
+
 class WhisperController:
+
+    _hwaccel_args = None
+
+    @classmethod
+    def get_hwaccel_args(cls):
+        if cls._hwaccel_args is None:
+            cls._hwaccel_args = _detect_hwaccel_args()
+        return cls._hwaccel_args
 
     def __init__(self, cli_path: Path, on_log: Callable[[str], None],
                  on_progress: Callable[[str], None],
@@ -60,7 +83,12 @@ class WhisperController:
             "-f", wav_file,
             "--output-srt",
             "--output-file", output_base,
-            "-t", str(threads)
+            "-t", str(threads),
+            "--max-len", "200",
+            "--entropy-thold", "2.4",
+            "--logprob-thold", "-1.0",
+            "--no-speech-thold", "0.6",
+            "--suppress-nst",
         ]
 
         if language and language != 'auto':
@@ -135,6 +163,7 @@ class WhisperController:
         cmd = [
             'ffmpeg',
             '-y',
+            *self.get_hwaccel_args(),
             '-i', input_file,
             '-vn',
             '-c:a', 'aac',
@@ -160,9 +189,13 @@ class WhisperController:
     def _to_wav(self, input_file: str) -> str:
         output_path = str(Path(input_file).with_suffix('')) + '_16k.wav'
 
+        ext = Path(input_file).suffix.lower()
+        hwaccel_args = self.get_hwaccel_args() if ext in VIDEO_EXTENSIONS else []
+
         cmd = [
             'ffmpeg',
             '-y',
+            *hwaccel_args,
             '-i', input_file,
             '-ac', '1',
             '-ar', '16000',
@@ -236,3 +269,49 @@ class WhisperController:
         if ext == '.wav':
             return False
         return ext in AUDIO_EXTENSIONS or ext in VIDEO_EXTENSIONS or ext not in {'.wav'}
+
+    @staticmethod
+    def resolve_model_path(model_dir, model_name, get_whisper_models_fn=None):
+        if not model_dir or not model_name:
+            return model_name
+        if get_whisper_models_fn:
+            for m in get_whisper_models_fn():
+                if m.get('name') == model_name:
+                    return m.get('path', model_name)
+        return str(Path(model_dir) / model_name)
+
+    @staticmethod
+    def transcribe_sync(
+        cli_path, filepath, model_path, language='auto', threads=8,
+        on_log=None, check_stop=None, output_dir=None,
+    ):
+        completed = threading.Event()
+        result = {'srt': None, 'error': None}
+
+        def on_ok(srt_path):
+            result['srt'] = srt_path
+            completed.set()
+
+        def on_err(msg):
+            result['error'] = msg
+            completed.set()
+
+        log_fn = on_log or (lambda m: None)
+        controller = WhisperController(
+            cli_path=Path(cli_path),
+            on_log=log_fn,
+            on_progress=log_fn,
+            on_complete=on_ok,
+            on_error=on_err,
+        )
+        controller.start(filepath, model_path, language, threads, output_dir=output_dir)
+
+        while not completed.is_set():
+            completed.wait(timeout=0.2)
+            if check_stop and check_stop():
+                controller.stop()
+                return None
+
+        if result['error']:
+            raise RuntimeError(result['error'])
+        return result['srt']

@@ -107,6 +107,7 @@ class PipelineRunner:
                         )
                         self._translate_file(srt_path, target_lang, replace_original)
                 except Exception as e:
+                    self._on_progress(f"Error: {Path(filepath).name} - {e}")
                     self._on_log(f"Error: {Path(filepath).name} - {e}")
         finally:
             self._running = False
@@ -123,42 +124,16 @@ class PipelineRunner:
         model_path: str,
         language: str,
     ) -> Optional[str]:
-        """
-        Run WhisperController synchronously (blocking).
-
-        Returns the output SRT path on success, or None if stopped/failed.
-        """
-        completed = threading.Event()
-        result = {'srt': None, 'error': None}
-
-        def on_ok(srt_path):
-            result['srt'] = srt_path
-            completed.set()
-
-        def on_err(msg):
-            result['error'] = msg
-            completed.set()
-
-        controller = WhisperController(
-            cli_path=cli_path,
-            on_log=lambda m: self._on_log(f"  {m}"),
-            on_progress=lambda m: self._on_log(f"  {m}"),
-            on_complete=on_ok,
-            on_error=on_err,
-        )
-
         threads = self._config_manager.get("whisper.threads", 8)
-        controller.start(filepath, model_path, language, threads)
-
-        while not completed.is_set():
-            completed.wait(timeout=0.2)
-            if self._stop_requested:
-                controller.stop()
-                return None
-
-        if result['error']:
-            raise RuntimeError(result['error'])
-        return result['srt']
+        return WhisperController.transcribe_sync(
+            cli_path=cli_path,
+            filepath=filepath,
+            model_path=model_path,
+            language=language,
+            threads=threads,
+            on_log=lambda m: self._on_log(f"  {m}"),
+            check_stop=lambda: self._stop_requested,
+        )
 
     # ------------------------------------------------------------------
     # Translation step
@@ -173,16 +148,24 @@ class PipelineRunner:
         """Parse an SRT file, translate it, and write the result."""
         subtitles = parse_srt_from_file(srt_path)
         if not subtitles:
+            self._on_progress(f"Empty SRT, skipping: {Path(srt_path).name}")
             return
 
         config = build_translation_config(
             self._config_manager, self._get_port(), self._get_current_model()
         )
 
+        if not config.get('model'):
+            raise RuntimeError("No model loaded - select a model on the Server tab")
+
+        self._on_progress(f"Translating {len(subtitles)} lines: {Path(srt_path).name}")
+
         translator = LocalLLMTranslator(config)
         translated = translator.translate_srt(
             subtitles, target_lang,
-            progress_callback=lambda c, t, s: self._on_log(f"  {s}: {c}/{t}"),
+            progress_callback=lambda c, t, s: self._on_progress(
+                f"Translating {Path(srt_path).name}: {c}/{t} {s}"
+            ),
             log_callback=lambda lv, m: self._on_log(f"  [{lv}] {m}"),
         )
 

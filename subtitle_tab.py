@@ -14,7 +14,7 @@ from utils.srt_parser import parse_srt_from_file, generate_srt_from_list
 from translation.local_llm_translator import LocalLLMTranslator
 
 from constants import SUPPORTED_SUBTITLE, TARGET_LANGUAGES, SOURCE_LANGUAGES
-from ui_helpers import LogMixin, parse_dropped_paths
+from ui_helpers import LogMixin, parse_dropped_paths, populate_language_combo, extract_combo_code
 from config_helpers import build_translation_config
 
 
@@ -73,11 +73,8 @@ class SubtitleTranslationTab(LogMixin, ttk.Frame):
         # Row 3: Controls
         self._create_control_section()
 
-        # Row 4: Progress
+        # Row 4: Progress & Log
         self._create_progress_section()
-
-        # Row 5: Log
-        self._create_log_section()
 
     def _create_file_section(self):
         frame = ttk.LabelFrame(self, text="File Selection", padding="5")
@@ -247,42 +244,12 @@ class SubtitleTranslationTab(LogMixin, ttk.Frame):
     # --- Language population ---
 
     def _populate_languages(self):
-        langs = SOURCE_LANGUAGES
-        codes = list(langs.keys())
-        names = [f"{code} - {langs[code]}" for code in codes]
-        self._source_combo['values'] = names
+        last_source = self._source_var.get()
+        populate_language_combo(self._source_combo, SOURCE_LANGUAGES, last_source)
 
-        # Restore saved source language
-        saved_source = self._source_var.get()
-        source_found = False
-        for i, name in enumerate(names):
-            if name.startswith(saved_source):
-                self._source_combo.current(i)
-                source_found = True
-                break
-        if not source_found:
-            self._source_combo.current(0)
+        last_target = self._target_var.get()
+        populate_language_combo(self._target_combo, TARGET_LANGUAGES, last_target)
 
-        langs = TARGET_LANGUAGES
-        codes = list(langs.keys())
-        names = [f"{code} - {langs[code]}" for code in codes]
-        self._target_combo['values'] = names
-
-        # Restore saved target language
-        saved_target = self._target_var.get()
-        target_found = False
-        for i, name in enumerate(names):
-            if name.startswith(saved_target):
-                self._target_combo.current(i)
-                target_found = True
-                break
-        if not target_found:
-            for i, name in enumerate(names):
-                if name.startswith('zh-cn'):
-                    self._target_combo.current(i)
-                    break
-
-        # Bind save on language change
         self._source_combo.bind('<<ComboboxSelected>>', self._on_language_changed)
         self._target_combo.bind('<<ComboboxSelected>>', self._on_language_changed)
 
@@ -304,12 +271,10 @@ class SubtitleTranslationTab(LogMixin, ttk.Frame):
                 self._config_manager.set("ui.last_target_lang", target_code)
 
     def _get_target_code(self):
-        val = self._target_var.get()
-        return val.split(' - ')[0] if ' - ' in val else val
+        return extract_combo_code(self._target_var.get())
 
     def _get_source_code(self):
-        val = self._source_var.get()
-        return val.split(' - ')[0] if ' - ' in val else val
+        return extract_combo_code(self._source_var.get())
 
     # --- Actions ---
 
