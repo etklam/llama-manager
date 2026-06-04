@@ -3,9 +3,8 @@ Subtitle Translation Tab - tkinter GUI for batch SRT/TXT translation.
 """
 
 import tkinter as tk
-from tkinter import ttk, scrolledtext, filedialog, messagebox
+from tkinter import ttk, filedialog, messagebox
 import threading
-from datetime import datetime
 from pathlib import Path
 from typing import Callable, Dict, List, Optional
 
@@ -14,42 +13,17 @@ from tkinterdnd2 import DND_FILES
 from utils.srt_parser import parse_srt_from_file, generate_srt_from_list
 from translation.local_llm_translator import LocalLLMTranslator
 
-
-# Supported file extensions
-SUPPORTED_EXTENSIONS = {'.srt', '.txt'}
-
-# Hardcoded common languages
-TARGET_LANGUAGES = {
-    'zh-cn': 'Simplified Chinese',
-    'zh-tw': 'Traditional Chinese',
-    'en': 'English',
-    'ja': 'Japanese',
-    'ko': 'Korean',
-    'es': 'Spanish',
-    'fr': 'French',
-    'de': 'German',
-    'pt': 'Portuguese',
-    'ru': 'Russian',
-    'ar': 'Arabic',
-    'hi': 'Hindi',
-    'th': 'Thai',
-    'vi': 'Vietnamese',
-    'it': 'Italian',
-    'nl': 'Dutch',
-}
-
-SOURCE_LANGUAGES = {
-    'auto': 'Auto Detect',
-    **TARGET_LANGUAGES,
-}
+from constants import SUPPORTED_SUBTITLE, TARGET_LANGUAGES, SOURCE_LANGUAGES
+from ui_helpers import LogMixin, parse_dropped_paths
+from config_helpers import build_translation_config
 
 
-class SubtitleTranslationTab(ttk.Frame):
+class SubtitleTranslationTab(LogMixin, ttk.Frame):
     """GUI tab for batch subtitle translation."""
 
-    def __init__(self, parent, get_config_callback, get_model_callback, config_manager=None):
+    def __init__(self, parent, get_port_callback, get_model_callback, config_manager=None):
         super().__init__(parent)
-        self._get_config = get_config_callback
+        self._get_port = get_port_callback
         self._get_model = get_model_callback
         self._config_manager = config_manager
         self._translator: Optional[LocalLLMTranslator] = None
@@ -60,17 +34,26 @@ class SubtitleTranslationTab(ttk.Frame):
         self._init_translator()
         self._create_ui()
 
+    def _build_translation_config(self) -> dict:
+        return build_translation_config(
+            self._config_manager, self._get_port(), self._get_model()
+        )
+
     def _init_translator(self):
         """Initialize the translator with current config."""
-        config = self._get_config()
-        model = self._get_model()
-        config['model'] = model
+        config = self._build_translation_config()
         self._translator = LocalLLMTranslator(config)
 
     def refresh_model(self):
         """Refresh from current server model."""
         self._init_translator()
         self._update_model_display()
+
+    def load_file(self, filepath: str):
+        """Load a single file into the file list."""
+        if filepath not in self._file_list and self._is_supported_file(filepath):
+            self._file_list.append(filepath)
+            self._file_listbox.insert(tk.END, Path(filepath).name)
 
     # --- UI Creation ---
 
@@ -259,22 +242,7 @@ class SubtitleTranslationTab(ttk.Frame):
         self._progress_label = ttk.Label(frame, text="Ready")
         self._progress_label.grid(row=1, column=0, sticky=tk.W)
 
-    def _create_log_section(self):
-        frame = ttk.LabelFrame(self, text="Log", padding="5")
-        frame.grid(row=5, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
-        frame.columnconfigure(0, weight=1)
-        frame.rowconfigure(0, weight=1)
-
-        self._log_text = scrolledtext.ScrolledText(
-            frame, wrap=tk.WORD, height=10,
-            font=("Consolas", 9), state="disabled")
-        self._log_text.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
-
-        # Configure log tags
-        self._log_text.tag_config("INFO", foreground="blue")
-        self._log_text.tag_config("ERROR", foreground="red")
-        self._log_text.tag_config("SUCCESS", foreground="green")
-        self._log_text.tag_config("WARNING", foreground="orange")
+        self._init_log_widget(self, row=5, column=0)
 
     # --- Language population ---
 
@@ -365,7 +333,7 @@ class SubtitleTranslationTab(ttk.Frame):
         raw_data = event.data
         # tkinterdnd2 on Windows wraps paths in {} and separates with space
         # Parse out individual file paths
-        paths = self._parse_dropped_paths(raw_data)
+        paths = parse_dropped_paths(raw_data)
         added = 0
         for path in paths:
             path = path.strip()
@@ -377,17 +345,6 @@ class SubtitleTranslationTab(ttk.Frame):
                 self._file_listbox.insert(tk.END, Path(path).name)
                 added += 1
         self._log("INFO", f"Added {added} file(s) via drag-and-drop")
-
-    @staticmethod
-    def _parse_dropped_paths(raw_data):
-        """Parse file paths from tkinterdnd2 drop data on Windows."""
-        import re
-        # On Windows, paths are like: {C:/path/to/file1.srt} {C:/path/to/file2.txt}
-        paths = re.findall(r'\{([^}]+)\}', raw_data)
-        if not paths:
-            # Try without braces (Linux/mac style)
-            paths = raw_data.split()
-        return paths
 
     def _toggle_advanced(self):
         if self._adv_frame.winfo_ismapped():
@@ -414,8 +371,10 @@ class SubtitleTranslationTab(ttk.Frame):
         self._clear_log()
 
         # Update translator config
-        config = self._get_config()
-        config['model'] = self._get_model()
+        port = self._get_port()
+        config = build_translation_config(
+            self._config_manager, port, self._get_model()
+        )
         config['batch_size'] = self._batch_var.get()
         config['temperature'] = self._temp_var.get()
         config['max_tokens'] = self._tokens_var.get()
@@ -423,7 +382,6 @@ class SubtitleTranslationTab(ttk.Frame):
         config['single_step'] = self._fast_mode_var.get()
         self._translator = LocalLLMTranslator(config)
 
-        # Persist advanced options for next session
         if self._config_manager:
             self._config_manager.set("ui.batch_size", config['batch_size'])
             self._config_manager.set("ui.temperature", config['temperature'])
@@ -470,35 +428,12 @@ class SubtitleTranslationTab(ttk.Frame):
         else:
             self._log("SUCCESS", "All files translated!")
 
-    # --- Logging ---
-
-    def _log(self, level, message):
-        self.winfo_toplevel().after(0, lambda: self._insert_log(level, message))
-
-    def _insert_log(self, level, message):
-        timestamp = datetime.now().strftime("%H:%M:%S")
-        line = f"[{timestamp}] [{level}] {message}\n"
-        self._log_text.config(state="normal")
-        self._log_text.insert(tk.END, line, level)
-        self._log_text.see(tk.END)
-        self._log_text.config(state="disabled")
-
-    def _clear_log(self):
-        self._log_text.config(state="normal")
-        self._log_text.delete(1.0, tk.END)
-        self._log_text.config(state="disabled")
-
-    # --- Callbacks from logic ---
-
-    def _on_log(self, level, message):
-        self._log(level, message)
-
-    # --- Helper methods (absorbed from SubtitleTranslationLogic) ---
+    # --- Helper methods ---
 
     def _is_supported_file(self, filepath: str) -> bool:
         """Check if file has supported extension."""
         ext = Path(filepath).suffix.lower()
-        return ext in SUPPORTED_EXTENSIONS
+        return ext in SUPPORTED_SUBTITLE
 
     def _get_output_path(self, input_path: str, target_lang: str,
                          replace_original: bool = False) -> str:

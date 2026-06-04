@@ -20,11 +20,13 @@ from tkinterdnd2 import TkinterDnD, DND_FILES
 
 from subtitle_tab import SubtitleTranslationTab
 from whisper_tab import WhisperTab
-from pipeline_runner import PipelineRunner, SUPPORTED_MEDIA
+from pipeline_runner import PipelineRunner
 from config_manager import ConfigManager
 from server_controller import ServerController
 from model_registry import ModelRegistry
 from whisper_model_registry import WhisperModelRegistry
+from constants import SUPPORTED_MEDIA, WHISPER_LANGUAGES, TARGET_LANGUAGES
+from ui_helpers import parse_dropped_paths
 
 class LlamaManager:
     def __init__(self, root):
@@ -207,7 +209,6 @@ class LlamaManager:
         lang_combo = ttk.Combobox(row3, textvariable=self._pipe_lang_var,
                                    state="readonly", width=12)
         lang_combo.pack(side=tk.LEFT, padx=(0, 10))
-        from whisper_tab import WHISPER_LANGUAGES
         codes = list(WHISPER_LANGUAGES.keys())
         names = [f"{c} - {WHISPER_LANGUAGES[c]}" for c in codes]
         lang_combo['values'] = names
@@ -218,7 +219,6 @@ class LlamaManager:
         target_combo = ttk.Combobox(row3, textvariable=self._pipe_target_var,
                                      state="readonly", width=20)
         target_combo.pack(side=tk.LEFT)
-        from subtitle_tab import TARGET_LANGUAGES
         tcodes = list(TARGET_LANGUAGES.keys())
         tnames = [f"{c} - {TARGET_LANGUAGES[c]}" for c in tcodes]
         target_combo['values'] = tnames
@@ -258,6 +258,44 @@ class LlamaManager:
         elif names:
             self._pipe_wmodel_combo.current(0)
 
+    def _do_start_server(self, model_name, port):
+        model_path = self.models.get_model_path(model_name)
+        if not model_path or not Path(model_path).exists():
+            messagebox.showerror("Error", f"Model not found: {model_path}")
+            return False
+
+        gpu = self.config_manager.get("server.gpu_layers", 99)
+        ctx = self.config_manager.get("server.context_size", 131072)
+        bsz = self.config_manager.get("server.batch_size", 256)
+
+        try:
+            self.server.start(
+                model_path=model_path, port=port,
+                host=self.config_manager.get("server.host", "0.0.0.0"),
+                gpu_layers=gpu, context_size=ctx, batch_size=bsz
+            )
+            self.start_button.config(state="disabled")
+            self.stop_button.config(state="normal")
+            self.status_label.config(text="● 運行中", foreground="green")
+            self.start_resource_monitor()
+            self.config_manager.set("ui.last_model", model_name)
+            return True
+        except Exception as e:
+            messagebox.showerror("Error", f"Start failed:\n{e}")
+            return False
+
+    def _do_stop_server(self):
+        if not self.server.running:
+            return
+        try:
+            self.server.stop()
+        except Exception as e:
+            messagebox.showerror("Error", f"Stop failed: {e}")
+        self.start_button.config(state="normal")
+        self.stop_button.config(state="disabled")
+        self.status_label.config(text="● 未運行", foreground="black")
+        self.stop_resource_monitor()
+
     # -------------------------------------------------- Quick Start Llama
     def _quick_start_server(self):
         model_name = self._qs_model_var.get()
@@ -274,53 +312,19 @@ class LlamaManager:
             return
 
         port = self._qs_port_var.get()
-        self.config_manager.set("server.port", port)
-        self.config_manager.set("server.gpu_layers", self.config_manager.get("server.gpu_layers", 99))
-        self.config_manager.set("server.context_size", self.config_manager.get("server.context_size", 131072))
-        self.config_manager.set("server.batch_size", self.config_manager.get("server.batch_size", 256))
-        if model_name:
-            self.config_manager.set("ui.last_model", model_name)
-
-        try:
-            self._qs_status_label.config(text=f"Starting {model_name}...", foreground="blue")
-            self._debug_log(f"Starting server: {model_name} (port {port})")
-            self.server.start(
-                model_path=model_path, port=port,
-                host=self.config_manager.get("server.host", "0.0.0.0"),
-                gpu_layers=self.config_manager.get("server.gpu_layers", 99),
-                context_size=self.config_manager.get("server.context_size", 131072),
-                batch_size=self.config_manager.get("server.batch_size", 256)
-            )
+        if self._do_start_server(model_name, port):
             self._qs_start_btn.config(state="disabled")
             self._qs_stop_btn.config(state="normal")
             self._qs_status_label.config(text=f"● Running (port {port})", foreground="green")
-            self.start_button.config(state="disabled")
-            self.stop_button.config(state="normal")
-            self.status_label.config(text="● 運行中", foreground="green")
-            self.start_resource_monitor()
             self._debug_log(f"Server started: http://localhost:{port}")
-        except Exception as e:
-            self._qs_status_label.config(text=f"● Failed", foreground="red")
-            self._debug_log(f"Start failed: {e}")
-            messagebox.showerror("Error", f"Start failed:\n{e}")
+        else:
+            self._qs_status_label.config(text="● Failed", foreground="red")
 
     def _quick_stop_server(self):
-        if not self.server.running:
-            return
-        try:
-            self._debug_log("Stopping server...")
-            self.server.stop()
-            self._qs_start_btn.config(state="normal")
-            self._qs_stop_btn.config(state="disabled")
-            self._qs_status_label.config(text="● Stopped", foreground="gray")
-            self.start_button.config(state="normal")
-            self.stop_button.config(state="disabled")
-            self.status_label.config(text="● 未運行", foreground="black")
-            self.stop_resource_monitor()
-            self._debug_log("Server stopped")
-        except Exception as e:
-            self._qs_status_label.config(text=f"● Stop failed", foreground="red")
-            self._debug_log(f"Stop failed: {e}")
+        self._do_stop_server()
+        self._qs_start_btn.config(state="normal")
+        self._qs_stop_btn.config(state="disabled")
+        self._qs_status_label.config(text="● Stopped", foreground="gray")
 
     # ---------------------------------------------- Quick Pipeline
     def _pipe_browse_file(self):
@@ -339,11 +343,7 @@ class LlamaManager:
         self._pipe_listbox.delete(0, tk.END)
 
     def _pipe_on_drop(self, event):
-        import re
-        paths = re.findall(r'\{([^}]+)\}', event.data)
-        if not paths:
-            paths = event.data.split()
-        for p in paths:
+        for p in parse_dropped_paths(event.data):
             p = p.strip()
             if p and p not in self._pipe_files:
                 self._pipe_files.append(p)
@@ -685,48 +685,20 @@ class LlamaManager:
             return
 
         model_name = self.model_var.get()
-        model_path = self.models.get_model_path(model_name)
-
-        if not model_path or not Path(model_path).exists():
-            messagebox.showerror("錯誤", f"找不到模型文件: {model_path}")
-            return
-
         self.config_manager.set("server.port", self.port_var.get())
         self.config_manager.set("server.gpu_layers", self.gpu_layers_var.get())
         self.config_manager.set("server.context_size", self.context_var.get())
         self.config_manager.set("server.batch_size", self.batch_var.get())
 
-        try:
-            self.log("INFO", f"啟動服務器: {model_name}")
-            self.server.start(
-                model_path=model_path,
-                port=self.port_var.get(),
-                host=self.config_manager.get("server.host", "0.0.0.0"),
-                gpu_layers=self.gpu_layers_var.get(),
-                context_size=self.context_var.get(),
-                batch_size=self.batch_var.get()
-            )
-            self.start_button.config(state="disabled")
-            self.stop_button.config(state="normal")
-            self.status_label.config(text="● 運行中", foreground="green")
-            self.start_resource_monitor()
+        self.log("INFO", f"啟動服務器: {model_name}")
+        if self._do_start_server(model_name, self.port_var.get()):
             self.log("SUCCESS", f"服務器已啟動在 http://localhost:{self.port_var.get()}")
-        except Exception as e:
-            self.log("ERROR", f"啟動失敗: {str(e)}")
-            messagebox.showerror("錯誤", f"啟動服務器失敗:\n{str(e)}")
+        else:
+            self.log("ERROR", "啟動失敗")
 
     def stop_server(self):
-        if not self.server.running:
-            return
-        try:
-            self.server.stop()
-            self.start_button.config(state="normal")
-            self.stop_button.config(state="disabled")
-            self.status_label.config(text="● 未運行", foreground="black")
-            self.stop_resource_monitor()
-            self.log("SUCCESS", "服務器已停止")
-        except Exception as e:
-            self.log("ERROR", f"停止失敗: {str(e)}")
+        self._do_stop_server()
+        self.log("SUCCESS", "服務器已停止")
 
     def release_memory(self):
         try:

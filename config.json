@@ -9,13 +9,23 @@
   },
   "ui": {
     "theme": "default",
-    "auto_scroll": true
+    "auto_scroll": true,
+    "last_model": "gemma-4-E2B-it-uncensored-Q8_0",
+    "last_source_lang": "auto",
+    "last_target_lang": "zh-tw"
   },
   "translation": {
     "enabled": false,
     "source_lang": "auto",
     "target_lang": "en",
     "provider": "mock"
+  },
+  "whisper": {
+    "cli_path": "D:/AI/llama/llama-manager/whisper.cpp/build/bin/Release/whisper-cli.exe",
+    "model_dir": "D:/AI/WhisperDesktop",
+    "last_model": "medium",
+    "language": "ja",
+    "threads": 8
   },
   "models": {
     "models": [
@@ -36,6 +46,34 @@
         "path": "D:\\AI\\llama\\llama.cpp\\llama-hip\\gemma-4-E2B-it-uncensored-Q8_0.gguf",
         "size": "4.63GB",
         "format": "Q8_0"
+      }
+    ]
+  },
+  "whisper_models": {
+    "models": [
+      {
+        "name": "large-v2",
+        "path": "D:\\AI\\WhisperDesktop\\ggml-large-v2.bin",
+        "size": "2951.26MB",
+        "format": "GGML"
+      },
+      {
+        "name": "large-v3-turbo",
+        "path": "D:\\AI\\WhisperDesktop\\ggml-large-v3-turbo.bin",
+        "size": "1549.30MB",
+        "format": "GGML"
+      },
+      {
+        "name": "medium",
+        "path": "D:\\AI\\WhisperDesktop\\ggml-medium.bin",
+        "size": "1462.71MB",
+        "format": "GGML"
+      },
+      {
+        "name": "small",
+        "path": "D:\\AI\\WhisperDesktop\\ggml-small.bin",
+        "size": "465.01MB",
+        "format": "GGML"
       }
     ]
   }

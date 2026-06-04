@@ -64,16 +64,16 @@ def test_basic_functionality():
         assert manager.get("new.nested.value") == 123, "Should create nested structure"
         print("[OK] Nested key creation works")
 
-        # Test 6: Translation config
-        print("\n6. Testing translation config...")
-        trans_config = manager.get_translation_config()
+        # Test 6: Translation config via generic get/set
+        print("\n6. Testing translation config via get/set...")
+        trans_config = manager.get("translation")
         assert "enabled" in trans_config, "Should have enabled key"
         assert "provider" in trans_config, "Should have provider key"
 
-        manager.set_translation_config({"enabled": True, "provider": "test"})
-        new_trans = manager.get_translation_config()
-        assert new_trans["enabled"] == True, "Should update translation config"
-        assert new_trans["provider"] == "test", "Should update provider"
+        manager.set("translation.enabled", True)
+        manager.set("translation.provider", "test")
+        assert manager.get("translation.enabled") is True, "Should update translation config"
+        assert manager.get("translation.provider") == "test", "Should update provider"
         print("[OK] Translation config operations work")
 
         # Test 7: Validation

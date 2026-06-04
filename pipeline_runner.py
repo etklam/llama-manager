@@ -10,9 +10,8 @@ from translation.local_llm_translator import LocalLLMTranslator
 from utils.srt_parser import parse_srt_from_file, generate_srt_from_list
 from config_manager import ConfigManager
 
-
-SUPPORTED_MEDIA = {'.wav', '.mp3', '.flac', '.ogg', '.m4a', '.aac', '.wma',
-                   '.mp4', '.mkv', '.avi', '.mov', '.wmv', '.webm', '.ts'}
+from constants import SUPPORTED_MEDIA
+from config_helpers import build_translation_config
 
 
 class PipelineRunner:
@@ -176,16 +175,9 @@ class PipelineRunner:
         if not subtitles:
             return
 
-        port = self._get_port()
-        config = {
-            'api_url': f'http://localhost:{port}/v1',
-            'model': self._get_current_model(),
-            'max_tokens': self._config_manager.get("ui.max_tokens", 16384),
-            'temperature': self._config_manager.get("ui.temperature", 0.2),
-            'batch_size': self._config_manager.get("ui.batch_size", 15),
-            'max_workers': self._config_manager.get("ui.max_workers", 3),
-            'single_step': self._config_manager.get("ui.single_step", True),
-        }
+        config = build_translation_config(
+            self._config_manager, self._get_port(), self._get_current_model()
+        )
 
         translator = LocalLLMTranslator(config)
         translated = translator.translate_srt(

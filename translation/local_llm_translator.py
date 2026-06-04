@@ -17,8 +17,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Callable, List, Dict, Optional, TYPE_CHECKING
 
-import httpx
-from openai import OpenAI, LengthFinishReasonError, RateLimitError
+from openai import LengthFinishReasonError, RateLimitError
 from tenacity import (
     retry,
     stop_after_attempt,
@@ -34,7 +33,6 @@ if TYPE_CHECKING:
 
 from translation.prompt_builder import build_translation_prompt
 
-# Configure logging
 logger = logging.getLogger(__name__)
 
 # Constants
@@ -44,23 +42,7 @@ DEFAULT_MAX_TOKENS = 4096
 DEFAULT_TEMPERATURE = 0.3
 DEFAULT_API_URL = "http://localhost:8080/v1"
 DEFAULT_BATCH_SIZE = 15  # Larger batch reduces API call overhead
-DEFAULT_MAX_WORKERS = 3  # Concurrent batch workers for parallel API calls
-
-# Load prompt template
-_PROMPT_DIR = Path(__file__).parent / "prompts"
-_PROMPT_TEMPLATE_PATH = _PROMPT_DIR / "srt_translation.txt"
-
-
-def _load_prompt_template() -> str:
-    """Load the SRT translation prompt template from file."""
-    if _PROMPT_TEMPLATE_PATH.exists():
-        return _PROMPT_TEMPLATE_PATH.read_text(encoding='utf-8')
-    # Fallback simple prompt if template file is missing
-    logger.warning(f"Prompt template not found at {_PROMPT_TEMPLATE_PATH}, using fallback")
-    return "Translate the following text to {target_language}:\n\n{text}"
-
-
-SRT_TRANSLATION_PROMPT = _load_prompt_template()
+DEFAULT_MAX_WORKERS = 3
 
 
 class LocalLLMTranslator:
@@ -132,7 +114,7 @@ class LocalLLMTranslator:
         # Store injected client or create OpenAIClient lazily
         self._injected_client = client
         self._openai_client = None  # OpenAIClient instance (will be created lazily if needed)
-        self._client = None  # Legacy OpenAI client (for backward compatibility)
+        self._client = None
 
     def _get_llm_client(self) -> 'LLMClient':
         """
@@ -156,30 +138,6 @@ class LocalLLMTranslator:
             )
 
         return self._openai_client
-
-    def _get_client(self) -> OpenAI:
-        """
-        Get or create the OpenAI client (legacy method for backward compatibility).
-
-        Returns:
-            OpenAI client instance configured with the API URL, timeout, and optional proxy
-        """
-        if self._client is None:
-            client_kwargs = {
-                'api_key': self.api_key,
-                'base_url': self.api_url,
-                'timeout': 180.0,  # 3 minutes per request
-            }
-
-            if self.proxy:
-                client_kwargs['http_client'] = httpx.Client(
-                    proxy=self.proxy,
-                    timeout=httpx.Timeout(180.0, connect=30.0)
-                )
-
-            self._client = OpenAI(**client_kwargs)
-
-        return self._client
 
     def _build_system_prompt(self, target_language: str) -> str:
         """Build system prompt based on target language (simplified vs traditional Chinese)."""
@@ -240,49 +198,6 @@ class LocalLLMTranslator:
                 start_marker,
                 f"Context: {context}\n\n{start_marker}"
             )
-
-        return [
-            system_message,
-            {'role': 'user', 'content': user_content}
-        ]
-
-    def _build_srt_prompt(
-        self,
-        text: str,
-        target_language: str,
-        context: Optional[str] = None,
-        glossary: Optional[str] = None
-    ) -> List[Dict[str, str]]:
-        """
-        Build the full SRT translation prompt using the loaded template.
-
-        Args:
-            text: Formatted SRT batch text (YAML format) to translate
-            target_language: Target language name
-            context: Optional context information
-            glossary: Optional glossary/terminology
-
-        Returns:
-            List of message dictionaries for the API call
-        """
-        is_traditional = target_language in ('zh-tw', 'Traditional Chinese')
-
-        system_message = {
-            'role': 'system',
-            'content': self._build_system_prompt(target_language)
-        }
-
-        context_block = f"Context: {context}" if context else ""
-        glossary_block = f"Glossary: {glossary}" if glossary else ""
-        system_prompt_extra = ""
-
-        user_content = SRT_TRANSLATION_PROMPT.format(
-            target_language=target_language,
-            context_block=context_block,
-            glossary_block=glossary_block,
-            batch_input=text,
-            system_prompt_extra=system_prompt_extra,
-        )
 
         return [
             system_message,
