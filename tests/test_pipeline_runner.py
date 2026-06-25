@@ -327,7 +327,7 @@ class TestReplaceOriginal:
             whisper_model_dir='/models',
         )
 
-        expected_path = tmp_path / "video_translated.srt"
+        expected_path = tmp_path / "video_Simplified Chinese.srt"  # ponytail: was _translated, unified via output_path_for
         assert expected_path.exists()
         assert expected_path.read_text(encoding='utf-8') == "srt content"
         # Original should be unchanged

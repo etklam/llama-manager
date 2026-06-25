@@ -10,12 +10,13 @@ from typing import Callable, Dict, List, Optional
 
 from tkinterdnd2 import DND_FILES
 
-from utils.srt_parser import parse_srt_from_file, generate_srt_from_list
+from utils.srt_parser import parse_srt_from_file, generate_srt_from_list, output_path_for
 from translation.local_llm_translator import LocalLLMTranslator
 
 from constants import SUPPORTED_SUBTITLE, TARGET_LANGUAGES, SOURCE_LANGUAGES
-from ui_helpers import LogMixin, parse_dropped_paths, populate_language_combo, extract_combo_code
+from ui_helpers import LogMixin, populate_language_combo, extract_combo_code
 from config_helpers import build_translation_config
+from file_listbox import FileListbox
 
 
 class SubtitleTranslationTab(LogMixin, ttk.Frame):
@@ -51,9 +52,7 @@ class SubtitleTranslationTab(LogMixin, ttk.Frame):
 
     def load_file(self, filepath: str):
         """Load a single file into the file list."""
-        if filepath not in self._file_list and self._is_supported_file(filepath):
-            self._file_list.append(filepath)
-            self._file_listbox.insert(tk.END, Path(filepath).name)
+        self._file_listbox_widget.add(filepath)
 
     # --- UI Creation ---
 
@@ -81,35 +80,20 @@ class SubtitleTranslationTab(LogMixin, ttk.Frame):
         frame.grid(row=0, column=0, sticky=(tk.W, tk.E), pady=(0, 5))
         frame.columnconfigure(0, weight=1)
 
-        btn_frame = ttk.Frame(frame)
-        btn_frame.grid(row=0, column=0, sticky=tk.W)
+        self._file_listbox_widget = FileListbox(
+            frame, valid_extensions=SUPPORTED_SUBTITLE,
+            filetypes_label="Subtitle files",
+            filetypes_exts=[".srt", ".txt"],
+            on_change=self._sync_file_list,
+        )
+        self._file_listbox_widget.grid(row=0, column=0, sticky=(tk.W, tk.E))
+        self._file_listbox = self._file_listbox_widget.listbox
 
-        ttk.Button(btn_frame, text="Choose Files",
-                   command=self._choose_files).pack(side=tk.LEFT, padx=2)
-        ttk.Button(btn_frame, text="Clear",
-                   command=self._clear_files).pack(side=tk.LEFT, padx=2)
-
+        # ponytail: extra control rides along the widget's existing btn row.
         self._replace_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(btn_frame, text="Replace original",
+        ttk.Checkbutton(self._file_listbox_widget.button_row,
+                        text="Replace original",
                         variable=self._replace_var).pack(side=tk.LEFT, padx=10)
-
-        # File listbox with scrollbar
-        list_frame = ttk.Frame(frame)
-        list_frame.grid(row=1, column=0, sticky=(tk.W, tk.E), pady=(5, 0))
-        list_frame.columnconfigure(0, weight=1)
-
-        self._file_listbox = tk.Listbox(list_frame, height=4,
-                                         selectmode=tk.EXTENDED)
-        self._file_listbox.pack(side=tk.LEFT, fill=tk.X, expand=True)
-
-        # Drag-and-drop support
-        self._file_listbox.drop_target_register(DND_FILES)
-        self._file_listbox.dnd_bind('<<Drop>>', self._on_files_dropped)
-
-        scrollbar = ttk.Scrollbar(list_frame, orient=tk.VERTICAL,
-                                  command=self._file_listbox.yview)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        self._file_listbox.config(yscrollcommand=scrollbar.set)
 
     def _create_language_section(self):
         frame = ttk.Frame(self)
@@ -278,38 +262,9 @@ class SubtitleTranslationTab(LogMixin, ttk.Frame):
 
     # --- Actions ---
 
-    def _choose_files(self):
-        files = filedialog.askopenfilenames(
-            title="Select SRT/TXT files",
-            filetypes=[("Subtitle files", "*.srt;*.txt"),
-                       ("All files", "*.*")])
-        for f in files:
-            if f not in self._file_list and self._is_supported_file(f):
-                self._file_list.append(f)
-                self._file_listbox.insert(tk.END, Path(f).name)
-        self._log("INFO", f"Added {len(files)} file(s)")
-
-    def _clear_files(self):
-        self._file_list.clear()
-        self._file_listbox.delete(0, tk.END)
-
-    def _on_files_dropped(self, event):
-        """Handle drag-and-drop of files onto the listbox."""
-        raw_data = event.data
-        # tkinterdnd2 on Windows wraps paths in {} and separates with space
-        # Parse out individual file paths
-        paths = parse_dropped_paths(raw_data)
-        added = 0
-        for path in paths:
-            path = path.strip()
-            if not path:
-                continue
-            # On Windows, paths may have surrounding braces removed
-            if path not in self._file_list and self._is_supported_file(path):
-                self._file_list.append(path)
-                self._file_listbox.insert(tk.END, Path(path).name)
-                added += 1
-        self._log("INFO", f"Added {added} file(s) via drag-and-drop")
+    def _sync_file_list(self):
+        """Mirror the widget's file list so _start_translation reads it."""
+        self._file_list = self._file_listbox_widget.files
 
     def _toggle_advanced(self):
         if self._adv_frame.winfo_ismapped():
@@ -395,21 +350,6 @@ class SubtitleTranslationTab(LogMixin, ttk.Frame):
 
     # --- Helper methods ---
 
-    def _is_supported_file(self, filepath: str) -> bool:
-        """Check if file has supported extension."""
-        ext = Path(filepath).suffix.lower()
-        return ext in SUPPORTED_SUBTITLE
-
-    def _get_output_path(self, input_path: str, target_lang: str,
-                         replace_original: bool = False) -> str:
-        """Generate output path for translated file."""
-        if replace_original:
-            return input_path
-        p = Path(input_path)
-        stem = p.stem
-        lang_name = TARGET_LANGUAGES.get(target_lang, target_lang)
-        return str(p.parent / f"{stem}_{lang_name}{p.suffix}")
-
     def _translate_file(self, input_path: str, target_lang: str,
                         output_path: Optional[str] = None,
                         replace_original: bool = False):
@@ -418,8 +358,7 @@ class SubtitleTranslationTab(LogMixin, ttk.Frame):
         ext = filepath.suffix.lower()
 
         if output_path is None:
-            output_path = self._get_output_path(input_path, target_lang,
-                                               replace_original)
+            output_path = output_path_for(input_path, target_lang, replace_original)
 
         self._log("INFO", f"Translating: {filepath.name}")
         self._on_progress(filepath.name, 0, 1, "starting")

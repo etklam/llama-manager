@@ -8,8 +8,11 @@ from pathlib import Path
 from tkinterdnd2 import DND_FILES
 
 from pipeline_runner import PipelineRunner
-from constants import SUPPORTED_MEDIA, WHISPER_LANGUAGES, TARGET_LANGUAGES
-from ui_helpers import parse_dropped_paths, populate_language_combo, extract_combo_code
+from constants import (
+    SUPPORTED_MEDIA, SUPPORTED_SUBTITLE, WHISPER_LANGUAGES, TARGET_LANGUAGES,
+)
+from ui_helpers import populate_language_combo, extract_combo_code
+from file_listbox import FileListbox
 
 
 class PipelineCard(ttk.LabelFrame):
@@ -35,28 +38,25 @@ class PipelineCard(ttk.LabelFrame):
         self.columnconfigure(1, weight=1)
         self.rowconfigure(5, weight=1)
 
-        file_btn_row = ttk.Frame(self)
-        file_btn_row.grid(row=0, column=0, columnspan=2, sticky=tk.W)
-        ttk.Button(file_btn_row, text="Choose Files",
-                   command=self._pipe_browse_file).pack(side=tk.LEFT, padx=2)
-        ttk.Button(file_btn_row, text="Clear",
-                   command=self._pipe_clear_files).pack(side=tk.LEFT, padx=2)
+        # ponytail: subtitle+media union — pipeline accepts both kinds.
+        # No label: PipelineCard itself is already a LabelFrame titled above.
+        valid = SUPPORTED_SUBTITLE | SUPPORTED_MEDIA
+        self._file_listbox_widget = FileListbox(
+            self, valid_extensions=valid,
+            filetypes_label="Subtitle + Media",
+            filetypes_exts=[".srt", ".txt", *sorted(SUPPORTED_MEDIA)],
+            on_change=self._sync_pipe_files,
+        )
+        self._file_listbox_widget.grid(
+            row=0, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 5))
+        self._pipe_listbox = self._file_listbox_widget.listbox
+
+        # ponytail: extra control rides along the widget's btn row.
         self._pipe_replace_var = tk.BooleanVar(
             value=self._config.get("pipeline.replace_original", False))
-        ttk.Checkbutton(file_btn_row, text="Replace original",
+        ttk.Checkbutton(self._file_listbox_widget.button_row,
+                        text="Replace original",
                         variable=self._pipe_replace_var).pack(side=tk.LEFT, padx=10)
-
-        list_frame = ttk.Frame(self)
-        list_frame.grid(row=1, column=0, columnspan=2, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(3, 0))
-        list_frame.columnconfigure(0, weight=1)
-        list_frame.rowconfigure(0, weight=1)
-        self._pipe_listbox = tk.Listbox(list_frame, height=4, selectmode=tk.EXTENDED)
-        self._pipe_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        self._pipe_listbox.drop_target_register(DND_FILES)
-        self._pipe_listbox.dnd_bind('<<Drop>>', self._pipe_on_drop)
-        sb = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=self._pipe_listbox.yview)
-        sb.pack(side=tk.RIGHT, fill=tk.Y)
-        self._pipe_listbox.config(yscrollcommand=sb.set)
 
         ttk.Label(self, text="Whisper Model:").grid(row=2, column=0, sticky=tk.W, padx=(0, 5), pady=(5, 0))
         self._pipe_wmodel_var = tk.StringVar()
@@ -107,27 +107,9 @@ class PipelineCard(ttk.LabelFrame):
             self._pipe_wmodel_combo.current(0)
 
     # ------------------------------------------------------- File management
-    def _pipe_browse_file(self):
-        exts = ";".join(f"*{e}" for e in SUPPORTED_MEDIA)
-        files = filedialog.askopenfilenames(
-            title="Select SRT / Audio / Video files",
-            filetypes=[("Subtitle + Media", f"*.srt;*.txt;{exts}"),
-                       ("All files", "*.*")])
-        for f in files:
-            if f not in self._pipe_files:
-                self._pipe_files.append(f)
-                self._pipe_listbox.insert(tk.END, Path(f).name)
-
-    def _pipe_clear_files(self):
-        self._pipe_files.clear()
-        self._pipe_listbox.delete(0, tk.END)
-
-    def _pipe_on_drop(self, event):
-        for p in parse_dropped_paths(event.data):
-            p = p.strip()
-            if p and p not in self._pipe_files:
-                self._pipe_files.append(p)
-                self._pipe_listbox.insert(tk.END, Path(p).name)
+    def _sync_pipe_files(self):
+        """Mirror the widget's file list so _run_pipeline reads it."""
+        self._pipe_files = self._file_listbox_widget.files
 
     # ------------------------------------------------------- Pipeline control
     def _start_pipeline(self):

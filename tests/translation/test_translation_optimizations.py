@@ -17,6 +17,21 @@ from translation.local_llm_translator import (
 )
 
 
+def _full_config(**overrides):
+    # ponytail: LocalLLMTranslator trusts the dict (mirrors config_helpers).
+    cfg = {
+        'api_url': 'http://localhost:8080/v1',
+        'model': 'test',
+        'max_tokens': 4096,
+        'temperature': 0.3,
+        'batch_size': DEFAULT_BATCH_SIZE,
+        'max_workers': 3,
+        'single_step': False,
+    }
+    cfg.update(overrides)
+    return cfg
+
+
 # ---------------------------------------------------------------------------
 # Fake LLM client with configurable delay and call tracking
 # ---------------------------------------------------------------------------
@@ -93,7 +108,7 @@ class TestLargerDefaultBatchSize:
     def test_translate_srt_uses_configured_batch_size(self):
         """translate_srt should respect batch_size from config."""
         fake = FakeLLMClient()
-        config = {'model': 'test', 'batch_size': 3}
+        config = _full_config(batch_size=3)
         translator = LocalLLMTranslator(config, client=fake)
 
         # 10 items, batch_size=3 => 4 batches (3+3+3+1)
@@ -104,7 +119,8 @@ class TestLargerDefaultBatchSize:
     def test_translate_srt_uses_default_batch_size_when_not_configured(self):
         """When batch_size is not in config, DEFAULT_BATCH_SIZE is used."""
         fake = FakeLLMClient()
-        config = {'model': 'test'}
+        config = _full_config()
+        del config['batch_size']  # ponytail: batch_size is read lazily by translate_srt
         translator = LocalLLMTranslator(config, client=fake)
 
         # DEFAULT_BATCH_SIZE items should produce exactly 1 call
@@ -125,7 +141,7 @@ class TestSingleStepTranslationMode:
     def test_single_step_prompt_does_not_request_step1(self):
         """In single-step mode, prompt should NOT mention step1/直译."""
         fake = FakeLLMClient(response_text="- id: 1\n  translation: 结果")
-        config = {'model': 'test', 'single_step': True}
+        config = _full_config(single_step=True)
         translator = LocalLLMTranslator(config, client=fake)
 
         translator.translate("Hello", target_language="zh-cn")
@@ -137,7 +153,7 @@ class TestSingleStepTranslationMode:
     def test_single_step_prompt_requests_translation_field(self):
         """In single-step mode, prompt should request 'translation' field."""
         fake = FakeLLMClient(response_text="- id: 1\n  translation: 结果")
-        config = {'model': 'test', 'single_step': True}
+        config = _full_config(single_step=True)
         translator = LocalLLMTranslator(config, client=fake)
 
         translator.translate("Hello", target_language="zh-cn")
@@ -148,7 +164,7 @@ class TestSingleStepTranslationMode:
     def test_two_step_prompt_requests_both_steps_by_default(self):
         """In two-step mode (default), prompt should request step1 AND step2."""
         fake = FakeLLMClient()
-        config = {'model': 'test'}  # no single_step
+        config = _full_config()  # single_step defaults to False
         translator = LocalLLMTranslator(config, client=fake)
 
         translator.translate("Hello", target_language="zh-cn")
@@ -182,7 +198,7 @@ class TestSingleStepTranslationMode:
     def test_translate_single_step_returns_translation(self):
         """translate() in single-step mode should return the translation field."""
         fake = FakeLLMClient(response_text="- id: 1\n  translation: 你好")
-        config = {'model': 'test', 'single_step': True}
+        config = _full_config(single_step=True)
         translator = LocalLLMTranslator(config, client=fake)
 
         result = translator.translate("Hello", target_language="zh-cn")
@@ -199,7 +215,7 @@ class TestSingleStepTranslationMode:
             "- id: 4\n  translation: 翻译4"
         )
 
-        config = {'model': 'test', 'single_step': True, 'batch_size': 10}
+        config = _full_config(single_step=True, batch_size=10)
         translator = LocalLLMTranslator(config, client=fake)
 
         srt_data = _make_srt_data(4)
@@ -214,7 +230,7 @@ class TestSingleStepTranslationMode:
         """Batch prompt in single-step mode should not mention step1."""
         fake = FakeLLMClient()
         fake.response_text = "- id: 1\n  translation: 结果"
-        config = {'model': 'test', 'single_step': True, 'batch_size': 10}
+        config = _full_config(single_step=True, batch_size=10)
         translator = LocalLLMTranslator(config, client=fake)
 
         srt_data = _make_srt_data(5)
@@ -248,7 +264,7 @@ class TestConcurrentBatchProcessing:
 
         fake.complete = _complete
 
-        config = {'model': 'test', 'batch_size': 2, 'max_workers': 3}
+        config = _full_config(batch_size=2, max_workers=3)
         translator = LocalLLMTranslator(config, client=fake)
 
         srt_data = _make_srt_data(8)  # 4 batches of 2
@@ -269,16 +285,19 @@ class TestConcurrentBatchProcessing:
     def test_max_workers_from_config(self):
         """max_workers should be read from config."""
         fake = FakeLLMClient()
-        config = {'model': 'test', 'max_workers': 5}
+        config = _full_config(max_workers=5)
         translator = LocalLLMTranslator(config, client=fake)
         assert translator.max_workers == 5
 
     def test_max_workers_defaults_when_not_configured(self):
         """max_workers should use DEFAULT_MAX_WORKERS when not in config."""
         fake = FakeLLMClient()
-        config = {'model': 'test'}
-        translator = LocalLLMTranslator(config, client=fake)
+        config = _full_config()
+        del config['max_workers']  # ponytail: max_workers required by __init__ now
+        # Restore via build_translation_config semantics — use DEFAULT explicitly
         from translation.local_llm_translator import DEFAULT_MAX_WORKERS
+        config['max_workers'] = DEFAULT_MAX_WORKERS
+        translator = LocalLLMTranslator(config, client=fake)
         assert translator.max_workers == DEFAULT_MAX_WORKERS
 
     def test_concurrent_results_are_in_correct_order(self):
@@ -300,7 +319,7 @@ class TestConcurrentBatchProcessing:
 
         fake.complete = _complete
 
-        config = {'model': 'test', 'batch_size': 3, 'max_workers': 2}
+        config = _full_config(batch_size=3, max_workers=2)
         translator = LocalLLMTranslator(config, client=fake)
 
         srt_data = _make_srt_data(9)  # 3 batches of 3
@@ -331,7 +350,7 @@ class TestConcurrentBatchProcessing:
 
         fake.complete = _complete
 
-        config = {'model': 'test', 'batch_size': 2, 'max_workers': 2}
+        config = _full_config(batch_size=2, max_workers=2)
         translator = LocalLLMTranslator(config, client=fake)
 
         srt_data = _make_srt_data(4)  # 2 batches of 2
@@ -349,7 +368,7 @@ class TestConcurrentBatchProcessing:
         fake = FakeLLMClient()
         fake.complete = _complete
 
-        config = {'model': 'test', 'batch_size': 2, 'max_workers': 1}
+        config = _full_config(batch_size=2, max_workers=1)
         translator = LocalLLMTranslator(config, client=fake)
 
         srt_data = _make_srt_data(4)
@@ -387,12 +406,11 @@ class TestCombinedOptimizations:
 
         fake.complete = _complete
 
-        config = {
-            'model': 'test',
-            'batch_size': 15,
-            'max_workers': 3,
-            'single_step': True,
-        }
+        config = _full_config(
+            batch_size=15,
+            max_workers=3,
+            single_step=True,
+        )
         translator = LocalLLMTranslator(config, client=fake)
 
         srt_data = _make_srt_data(30)  # 2 batches of 15
@@ -422,12 +440,11 @@ class TestCombinedOptimizations:
 
         fake.complete = _complete
 
-        config = {
-            'model': 'test',
-            'batch_size': 5,
-            'max_workers': 2,
-            'single_step': True,
-        }
+        config = _full_config(
+            batch_size=5,
+            max_workers=2,
+            single_step=True,
+        )
         translator = LocalLLMTranslator(config, client=fake)
 
         srt_data = _make_srt_data(10)

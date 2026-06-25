@@ -7,7 +7,7 @@ from typing import Callable, Dict, List, Optional
 
 from whisper_controller import WhisperController
 from translation.local_llm_translator import LocalLLMTranslator
-from utils.srt_parser import parse_srt_from_file, generate_srt_from_list
+from utils.srt_parser import parse_srt_from_file, generate_srt_from_list, output_path_for
 from config_manager import ConfigManager
 
 from constants import SUPPORTED_MEDIA
@@ -170,10 +170,6 @@ class PipelineRunner:
         )
 
         srt_content = generate_srt_from_list(translated)
-        if replace_original:
-            out_path = srt_path
-        else:
-            p = Path(srt_path)
-            out_path = str(p.parent / f"{p.stem}_translated{p.suffix}")
+        out_path = output_path_for(srt_path, target_lang, replace_original)
         Path(out_path).write_text(srt_content, encoding='utf-8')
         self._on_progress(f"Saved: {Path(out_path).name}")

@@ -11,7 +11,8 @@ from tkinterdnd2 import DND_FILES
 from whisper_controller import WhisperController
 
 from constants import SUPPORTED_MEDIA, WHISPER_LANGUAGES
-from ui_helpers import LogMixin, parse_dropped_paths, populate_language_combo, extract_combo_code
+from ui_helpers import LogMixin, populate_language_combo, extract_combo_code
+from file_listbox import FileListbox
 
 
 class WhisperTab(LogMixin, ttk.Frame):
@@ -99,29 +100,15 @@ class WhisperTab(LogMixin, ttk.Frame):
         frame.grid(row=1, column=0, sticky=(tk.W, tk.E), pady=(0, 5))
         frame.columnconfigure(0, weight=1)
 
-        btn_frame = ttk.Frame(frame)
-        btn_frame.grid(row=0, column=0, sticky=tk.W)
-
-        ttk.Button(btn_frame, text="Choose Files",
-                   command=self._choose_files).pack(side=tk.LEFT, padx=2)
-        ttk.Button(btn_frame, text="Clear",
-                   command=self._clear_files).pack(side=tk.LEFT, padx=2)
-
-        list_frame = ttk.Frame(frame)
-        list_frame.grid(row=1, column=0, sticky=(tk.W, tk.E), pady=(5, 0))
-        list_frame.columnconfigure(0, weight=1)
-
-        self._file_listbox = tk.Listbox(list_frame, height=4,
-                                         selectmode=tk.EXTENDED)
-        self._file_listbox.pack(side=tk.LEFT, fill=tk.X, expand=True)
-
-        self._file_listbox.drop_target_register(DND_FILES)
-        self._file_listbox.dnd_bind('<<Drop>>', self._on_files_dropped)
-
-        scrollbar = ttk.Scrollbar(list_frame, orient=tk.VERTICAL,
-                                  command=self._file_listbox.yview)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        self._file_listbox.config(yscrollcommand=scrollbar.set)
+        self._file_listbox_widget = FileListbox(
+            frame, valid_extensions=SUPPORTED_MEDIA,
+            filetypes_label="Audio/Video",
+            filetypes_exts=[".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aac",
+                            ".mp4", ".mkv", ".avi", ".mov", ".wmv", ".webm", ".ts"],
+            on_change=self._sync_file_list,
+        )
+        self._file_listbox_widget.grid(row=0, column=0, sticky=(tk.W, tk.E))
+        self._file_listbox = self._file_listbox_widget.listbox
 
     def _create_control_section(self):
         frame = ttk.Frame(self)
@@ -220,39 +207,9 @@ class WhisperTab(LogMixin, ttk.Frame):
             self._model_combo.current(0)
         self._log("INFO", f"Found {len(names)} model(s)")
 
-    def _choose_files(self):
-        files = filedialog.askopenfilenames(
-            title="Select audio/video files",
-            filetypes=[("Audio/Video", "*.wav;*.mp3;*.flac;*.ogg;*.m4a;*.aac;"
-                                         "*.mp4;*.mkv;*.avi;*.mov;*.wmv;*.webm;*.ts"),
-                       ("All files", "*.*")])
-        for f in files:
-            if f not in self._file_list and self._is_supported_file(f):
-                self._file_list.append(f)
-                self._file_listbox.insert(tk.END, Path(f).name)
-        self._log("INFO", f"Added {len(files)} file(s)")
-
-    def _clear_files(self):
-        self._file_list.clear()
-        self._file_listbox.delete(0, tk.END)
-
-    def _on_files_dropped(self, event):
-        raw_data = event.data
-        paths = parse_dropped_paths(raw_data)
-        added = 0
-        for path in paths:
-            path = path.strip()
-            if not path:
-                continue
-            if path not in self._file_list and self._is_supported_file(path):
-                self._file_list.append(path)
-                self._file_listbox.insert(tk.END, Path(path).name)
-                added += 1
-        self._log("INFO", f"Added {added} file(s) via drag-and-drop")
-
-    def _is_supported_file(self, filepath: str) -> bool:
-        ext = Path(filepath).suffix.lower()
-        return ext in SUPPORTED_MEDIA
+    def _sync_file_list(self):
+        """Mirror the widget's file list so _start_transcription reads it."""
+        self._file_list = self._file_listbox_widget.files
 
     def _start_transcription(self):
         if not self._file_list:

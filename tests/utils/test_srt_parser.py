@@ -21,6 +21,7 @@ from utils.srt_parser import (
     format_time,
     time_to_milliseconds,
     milliseconds_to_time,
+    output_path_for,
 )
 
 
@@ -544,6 +545,40 @@ class TestRoundTrip:
             assert parsed[i]['start_time'] == reparsed[i]['start_time']
             assert parsed[i]['end_time'] == reparsed[i]['end_time']
             assert parsed[i]['text'] == reparsed[i]['text']
+
+
+class TestOutputPathFor:
+    # ponytail: one fn, two callers, no OutputPathResolver class
+
+    def test_replace_original_returns_input(self):
+        assert output_path_for("/x/video.srt", "zh-cn", True) == "/x/video.srt"
+
+    def test_no_replace_zh_cn_uses_lang_name(self):
+        out = Path(output_path_for("/x/video.srt", "zh-cn", False))
+        assert out.name == "video_Simplified Chinese.srt"
+
+    def test_no_replace_en(self):
+        out = Path(output_path_for("/x/video.srt", "en", False))
+        assert out.name == "video_English.srt"
+
+    def test_unknown_lang_falls_back_to_code(self):
+        out = Path(output_path_for("/x/video.srt", "xx", False))
+        assert out.name == "video_xx.srt"
+
+    def test_works_for_txt(self):
+        out = Path(output_path_for("/x/notes.txt", "en", False))
+        assert out.name == "notes_English.txt"
+        assert out.suffix == ".txt"
+
+    def test_windows_backslashes(self):
+        out = Path(output_path_for(r"C:\dir\video.srt", "en", False))
+        assert out.parent.drive == "C:"
+        assert out.name == "video_English.srt"
+
+    def test_preserves_directory(self):
+        out = Path(output_path_for("/some/deep/path/v.srt", "en", False))
+        assert out.name == "v_English.srt"
+        assert len(out.parent.parts) == 4
 
 
 if __name__ == "__main__":

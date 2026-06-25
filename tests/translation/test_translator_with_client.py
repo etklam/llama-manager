@@ -7,6 +7,22 @@ from translation.local_llm_translator import LocalLLMTranslator
 from translation.llm_client import LLMClient
 
 
+def _full_config(**overrides):
+    # ponytail: after the cleanup, LocalLLMTranslator trusts the dict and does
+    # not re-default; tests build a full dict (mirroring config_helpers output).
+    cfg = {
+        'api_url': 'http://localhost:8080/v1',
+        'model': 'test-model',
+        'max_tokens': 4096,
+        'temperature': 0.3,
+        'batch_size': 15,
+        'max_workers': 3,
+        'single_step': False,
+    }
+    cfg.update(overrides)
+    return cfg
+
+
 class FakeLLMClient:
     """Fake LLM client for testing."""
 
@@ -35,10 +51,7 @@ class TestTranslatorWithInjectedClient:
         """Test that translator uses injected client instead of creating OpenAI."""
         fake_client = FakeLLMClient(response_text="Test translation")
 
-        config = {
-            'model': 'test-model',
-            'api_url': 'http://fake.com/v1',
-        }
+        config = _full_config()
 
         translator = LocalLLMTranslator(config, client=fake_client)
 
@@ -53,10 +66,7 @@ class TestTranslatorWithInjectedClient:
         """Test that temperature is passed to injected client."""
         fake_client = FakeLLMClient(response_text="Response")
 
-        config = {
-            'model': 'test-model',
-            'temperature': 0.8,
-        }
+        config = _full_config(temperature=0.8)
 
         translator = LocalLLMTranslator(config, client=fake_client)
 
@@ -68,10 +78,7 @@ class TestTranslatorWithInjectedClient:
         """Test that max_tokens is passed to injected client."""
         fake_client = FakeLLMClient(response_text="Response")
 
-        config = {
-            'model': 'test-model',
-            'max_tokens': 2000,
-        }
+        config = _full_config(max_tokens=2000)
 
         translator = LocalLLMTranslator(config, client=fake_client)
 
@@ -83,7 +90,7 @@ class TestTranslatorWithInjectedClient:
         """Test that batch translation uses injected client."""
         fake_client = FakeLLMClient(response_text="Translated")
 
-        config = {'model': 'test-model'}
+        config = _full_config()
 
         translator = LocalLLMTranslator(config, client=fake_client)
 
@@ -97,7 +104,7 @@ class TestTranslatorWithInjectedClient:
         """Test that SRT translation uses injected client."""
         fake_client = FakeLLMClient(response_text="- id: 1\n  step1: 直译\n  step2: 意译")
 
-        config = {'model': 'test-model'}
+        config = _full_config()
 
         translator = LocalLLMTranslator(config, client=fake_client)
 
@@ -115,10 +122,7 @@ class TestTranslatorWithInjectedClient:
     def test_translator_backward_compatibility(self):
         """Test that translator still works without injected client."""
         # This should create an OpenAIClient internally
-        config = {
-            'model': 'test-model',
-            'api_url': 'http://localhost:8080/v1',
-        }
+        config = _full_config()
 
         # Should not raise an error
         translator = LocalLLMTranslator(config)

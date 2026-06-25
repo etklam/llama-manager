@@ -21,7 +21,7 @@ from server_controller import ServerController
 from model_registry import ModelRegistry
 from whisper_model_registry import WhisperModelRegistry
 # constants imported indirectly by pipeline_card, server_tab, etc.
-from ui_helpers import LogMixin
+from ui_helpers import LogMixin, log_bus
 
 class LlamaManager(LogMixin):
     def __init__(self, root):
@@ -247,8 +247,12 @@ class LlamaManager(LogMixin):
         self._debug_text.pack(fill=tk.BOTH, expand=True)
         self._debug_text.tag_config("ERROR", foreground="red")
         self._debug_text.tag_config("WARNING", foreground="orange")
+        self._debug_unsub = log_bus.subscribe(self._debug_subscriber)
 
     def _close_debug_win(self):
+        if getattr(self, "_debug_unsub", None):
+            self._debug_unsub()
+            self._debug_unsub = None
         if self._debug_win and self._debug_win.winfo_exists():
             self._debug_win.destroy()
         self._debug_win = None
@@ -259,18 +263,21 @@ class LlamaManager(LogMixin):
         self._close_debug_win()
 
     def _debug_log(self, message):
-        if not self._debug_var.get():
-            return
-        timestamp = datetime.now().strftime("%H:%M:%S")
-        line = f"[{timestamp}] {message}\n"
-        level = None
+        # ponytail: single-arg legacy entry point -> derive level + emit
         ml = message.upper()
         if "ERROR" in ml:
             level = "ERROR"
         elif "WARNING" in ml or "WARN" in ml:
             level = "WARNING"
-        lvl = level
-        self.root.after(0, lambda: self._debug_insert(line, lvl))
+        else:
+            level = "INFO"
+        log_bus.emit(level, message)
+
+    def _debug_subscriber(self, level, message):
+        # ponytail: marshal onto Tk thread; reuse existing _debug_insert formatter
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        line = f"[{timestamp}] [{level}] {message}\n"
+        self.root.after(0, lambda: self._debug_insert(line, level))
 
     def _debug_insert(self, line, level):
         if not self._debug_text:
@@ -312,7 +319,8 @@ class LlamaManager(LogMixin):
 
     # ---------------------------------------------- Logging
     def log(self, level, message):
-        self.root.after(0, lambda: self._insert_log(level, message))
+        # ponytail: was a second sink with a broken _insert_log ref; route to log_bus
+        log_bus.emit(level, message)
 
 
 

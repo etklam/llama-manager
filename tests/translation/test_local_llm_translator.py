@@ -23,17 +23,28 @@ if PROJECT_ROOT not in sys.path:
 from translation.local_llm_translator import LocalLLMTranslator
 
 
+def _full_config(**overrides):
+    # ponytail: after the cleanup, LocalLLMTranslator trusts the dict (mirrors
+    # config_helpers.build_translation_config output).
+    cfg = {
+        'api_url': 'http://localhost:8080/v1',
+        'model': 'llama-3.2-3b-instruct',
+        'max_tokens': 4096,
+        'temperature': 0.3,
+        'batch_size': 15,
+        'max_workers': 3,
+        'single_step': False,
+    }
+    cfg.update(overrides)
+    return cfg
+
+
 class TestTranslatorInitialization:
     """Test Local-LLM translator initialization."""
 
     def test_translator_initialization_with_config(self):
         """Test translator initialization with full configuration."""
-        config = {
-            'api_url': 'http://localhost:8080/v1',
-            'model': 'llama-3.2-3b-instruct',
-            'max_tokens': 2000,
-            'temperature': 0.7,
-        }
+        config = _full_config(max_tokens=2000, temperature=0.7)
 
         translator = LocalLLMTranslator(config)
 
@@ -44,10 +55,7 @@ class TestTranslatorInitialization:
 
     def test_translator_initialization_default_values(self):
         """Test translator initialization with default values."""
-        config = {
-            'api_url': 'http://localhost:8080/v1',
-            'model': 'llama-3.2-3b-instruct',
-        }
+        config = _full_config()
 
         translator = LocalLLMTranslator(config)
 
@@ -58,15 +66,12 @@ class TestTranslatorInitialization:
         assert 0 <= translator.temperature <= 2
 
     def test_translator_initialization_minimal_config(self):
-        """Test translator initialization with minimal configuration."""
-        config = {
-            'model': 'llama-3.2-3b-instruct',
-        }
+        """Test translator initialization with full config (api_url always supplied)."""
+        config = _full_config()
 
         translator = LocalLLMTranslator(config)
 
-        assert translator.model == 'llama-3-2-3b-instruct'
-        # Should use default API URL
+        assert translator.model == 'llama-3.2-3b-instruct'
         assert 'localhost:8080' in translator.api_url or '127.0.0.1:8080' in translator.api_url
 
 
@@ -86,10 +91,7 @@ class TestSingleTextTranslation:
         mock_client.chat.completions.create.return_value = mock_response
 
         # Create translator and translate
-        config = {
-            'api_url': 'http://localhost:8080/v1',
-            'model': 'llama-3.2-3b-instruct',
-        }
+        config = _full_config()
         translator = LocalLLMTranslator(config)
 
         result = translator.translate('Hello world', target_language='French')
@@ -114,10 +116,7 @@ class TestSingleTextTranslation:
         mock_response.choices[0].message.content = 'Hola'
         mock_client.chat.completions.create.return_value = mock_response
 
-        config = {
-            'api_url': 'http://localhost:8080/v1',
-            'model': 'llama-3.2-3b-instruct',
-        }
+        config = _full_config()
         translator = LocalLLMTranslator(config)
 
         result = translator.translate(
@@ -149,10 +148,7 @@ class TestBatchTextTranslation:
         ]
         mock_client.chat.completions.create.side_effect = responses
 
-        config = {
-            'api_url': 'http://localhost:8080/v1',
-            'model': 'llama-3.2-3b-instruct',
-        }
+        config = _full_config()
         translator = LocalLLMTranslator(config)
 
         texts = ['Hello', 'World']
@@ -168,10 +164,7 @@ class TestBatchTextTranslation:
     @patch('translation.openai_client.OpenAI')
     def test_translate_batch_empty_list(self, mock_openai):
         """Test translating an empty list returns empty result."""
-        config = {
-            'api_url': 'http://localhost:8080/v1',
-            'model': 'llama-3.2-3b-instruct',
-        }
+        config = _full_config()
         translator = LocalLLMTranslator(config)
 
         results = translator.translate_batch([], target_language='French')
@@ -195,10 +188,7 @@ class TestSRTFormatTranslation:
         mock_response.choices[0].message.content = 'Bonjour\nÀ tout à l\'heure'
         mock_client.chat.completions.create.return_value = mock_response
 
-        config = {
-            'api_url': 'http://localhost:8080/v1',
-            'model': 'llama-3.2-3b-instruct',
-        }
+        config = _full_config()
         translator = LocalLLMTranslator(config)
 
         srt_data = [
@@ -223,10 +213,7 @@ class TestSRTFormatTranslation:
     @patch('translation.openai_client.OpenAI')
     def test_translate_srt_empty_list(self, mock_openai):
         """Test translating empty SRT list."""
-        config = {
-            'api_url': 'http://localhost:8080/v1',
-            'model': 'llama-3.2-3b-instruct',
-        }
+        config = _full_config()
         translator = LocalLLMTranslator(config)
 
         result = translator.translate_srt([], target_language='French')
@@ -252,10 +239,7 @@ class TestAPIErrorRetry:
         ]
         mock_client.chat.completions.create.side_effect = responses
 
-        config = {
-            'api_url': 'http://localhost:8080/v1',
-            'model': 'llama-3.2-3b-instruct',
-        }
+        config = _full_config()
         translator = LocalLLMTranslator(config)
 
         result = translator.translate('Test', target_language='French')
@@ -273,10 +257,7 @@ class TestAPIErrorRetry:
         # Always fail
         mock_client.chat.completions.create.side_effect = Exception('Permanent error')
 
-        config = {
-            'api_url': 'http://localhost:8080/v1',
-            'model': 'llama-3.2-3b-instruct',
-        }
+        config = _full_config()
         translator = LocalLLMTranslator(config)
 
         # Should raise exception after max retries
@@ -301,10 +282,7 @@ class TestAPIErrorRetry:
         ]
         mock_client.chat.completions.create.side_effect = responses
 
-        config = {
-            'api_url': 'http://localhost:8080/v1',
-            'model': 'llama-3.2-3b-instruct',
-        }
+        config = _full_config()
         translator = LocalLLMTranslator(config)
 
         result = translator.translate('Test', target_language='French')
@@ -325,10 +303,7 @@ class TestPromptGeneration:
             choices=[MagicMock(message=MagicMock(content='Translated'))]
         )
 
-        config = {
-            'api_url': 'http://localhost:8080/v1',
-            'model': 'llama-3.2-3b-instruct',
-        }
+        config = _full_config()
         translator = LocalLLMTranslator(config)
 
         translator.translate('Hello', target_language='French')
@@ -350,10 +325,7 @@ class TestPromptGeneration:
             choices=[MagicMock(message=MagicMock(content='Translated'))]
         )
 
-        config = {
-            'api_url': 'http://localhost:8080/v1',
-            'model': 'llama-3.2-3b-instruct',
-        }
+        config = _full_config()
         translator = LocalLLMTranslator(config)
 
         translator.translate('Hello world', target_language='French')
@@ -375,10 +347,7 @@ class TestPromptGeneration:
             choices=[MagicMock(message=MagicMock(content='Bonjour'))]
         )
 
-        config = {
-            'api_url': 'http://localhost:8080/v1',
-            'model': 'llama-3.2-3b-instruct',
-        }
+        config = _full_config()
         translator = LocalLLMTranslator(config)
 
         translator.translate('Hello', target_language='French')
@@ -399,10 +368,7 @@ class TestPromptGeneration:
             choices=[MagicMock(message=MagicMock(content='Translated'))]
         )
 
-        config = {
-            'api_url': 'http://localhost:8080/v1',
-            'model': 'llama-3.2-3b-instruct',
-        }
+        config = _full_config()
         translator = LocalLLMTranslator(config)
 
         translator.translate(
@@ -430,11 +396,7 @@ class TestTemperatureSetting:
             choices=[MagicMock(message=MagicMock(content='Translated'))]
         )
 
-        config = {
-            'api_url': 'http://localhost:8080/v1',
-            'model': 'llama-3.2-3b-instruct',
-            'temperature': 0.8,
-        }
+        config = _full_config(temperature=0.8)
         translator = LocalLLMTranslator(config)
 
         translator.translate('Hello', target_language='French')
@@ -457,11 +419,7 @@ class TestTemperatureSetting:
                 choices=[MagicMock(message=MagicMock(content='Translated'))]
             )
 
-            config = {
-                'api_url': 'http://localhost:8080/v1',
-                'model': 'llama-3.2-3b-instruct',
-                'temperature': temp,
-            }
+            config = _full_config(temperature=temp)
             translator = LocalLLMTranslator(config)
             translator.translate('Hello', target_language='French')
 
@@ -478,11 +436,7 @@ class TestTemperatureSetting:
         )
 
         # Test with temperature > 2.0 (should be clamped)
-        config = {
-            'api_url': 'http://localhost:8080/v1',
-            'model': 'llama-3.2-3b-instruct',
-            'temperature': 3.0,
-        }
+        config = _full_config(temperature=3.0)
         translator = LocalLLMTranslator(config)
         translator.translate('Hello', target_language='French')
 
@@ -503,11 +457,7 @@ class TestMaxTokensSetting:
             choices=[MagicMock(message=MagicMock(content='Translated'))]
         )
 
-        config = {
-            'api_url': 'http://localhost:8080/v1',
-            'model': 'llama-3.2-3b-instruct',
-            'max_tokens': 1500,
-        }
+        config = _full_config(max_tokens=1500)
         translator = LocalLLMTranslator(config)
 
         translator.translate('Hello', target_language='French')
@@ -530,11 +480,7 @@ class TestMaxTokensSetting:
                 choices=[MagicMock(message=MagicMock(content='Translated'))]
             )
 
-            config = {
-                'api_url': 'http://localhost:8080/v1',
-                'model': 'llama-3.2-3b-instruct',
-                'max_tokens': max_tok,
-            }
+            config = _full_config(max_tokens=max_tok)
             translator = LocalLLMTranslator(config)
             translator.translate('Hello', target_language='French')
 
@@ -555,10 +501,7 @@ class TestAPIURLConfiguration:
         )
 
         custom_url = 'http://192.168.1.100:8000/v1'
-        config = {
-            'api_url': custom_url,
-            'model': 'llama-3.2-3b-instruct',
-        }
+        config = _full_config(api_url=custom_url)
         translator = LocalLLMTranslator(config)
 
         translator.translate('Hello', target_language='French')
@@ -578,9 +521,7 @@ class TestAPIURLConfiguration:
             choices=[MagicMock(message=MagicMock(content='Translated'))]
         )
 
-        config = {
-            'model': 'llama-3.2-3b-instruct',
-        }
+        config = _full_config()
         translator = LocalLLMTranslator(config)
 
         translator.translate('Hello', target_language='French')
@@ -600,10 +541,7 @@ class TestAPIURLConfiguration:
             choices=[MagicMock(message=MagicMock(content='Translated'))]
         )
 
-        config = {
-            'api_url': 'https://api.example.com/v1',
-            'model': 'llama-3.2-3b-instruct',
-        }
+        config = _full_config(api_url='https://api.example.com/v1')
         translator = LocalLLMTranslator(config)
 
         translator.translate('Hello', target_language='French')
@@ -618,10 +556,7 @@ class TestEmptyInputHandling:
     @patch('translation.openai_client.OpenAI')
     def test_empty_string_translation(self, mock_openai):
         """Test translating an empty string."""
-        config = {
-            'api_url': 'http://localhost:8080/v1',
-            'model': 'llama-3.2-3b-instruct',
-        }
+        config = _full_config()
         translator = LocalLLMTranslator(config)
 
         result = translator.translate('', target_language='French')
@@ -634,10 +569,7 @@ class TestEmptyInputHandling:
     @patch('translation.openai_client.OpenAI')
     def test_whitespace_only_translation(self, mock_openai):
         """Test translating whitespace-only text."""
-        config = {
-            'api_url': 'http://localhost:8080/v1',
-            'model': 'llama-3.2-3b-instruct',
-        }
+        config = _full_config()
         translator = LocalLLMTranslator(config)
 
         result = translator.translate('   \n\t  ', target_language='French')
@@ -649,10 +581,7 @@ class TestEmptyInputHandling:
     @patch('translation.openai_client.OpenAI')
     def test_none_target_language(self, mock_openai):
         """Test handling of None target language."""
-        config = {
-            'api_url': 'http://localhost:8080/v1',
-            'model': 'llama-3.2-3b-instruct',
-        }
+        config = _full_config()
         translator = LocalLLMTranslator(config)
 
         # Should raise error or handle gracefully
@@ -672,10 +601,7 @@ class TestModelConfiguration:
             choices=[MagicMock(message=MagicMock(content='Translated'))]
         )
 
-        config = {
-            'api_url': 'http://localhost:8080/v1',
-            'model': 'llama-3.2-3b-instruct',
-        }
+        config = _full_config()
         translator = LocalLLMTranslator(config)
 
         translator.translate('Hello', target_language='French')
@@ -702,10 +628,7 @@ class TestModelConfiguration:
                 choices=[MagicMock(message=MagicMock(content='Translated'))]
             )
 
-            config = {
-                'api_url': 'http://localhost:8080/v1',
-                'model': model,
-            }
+            config = _full_config(model=model)
             translator = LocalLLMTranslator(config)
             translator.translate('Hello', target_language='French')
 
@@ -725,10 +648,7 @@ class TestResponseParsing:
         mock_response.choices = []
         mock_client.chat.completions.create.return_value = mock_response
 
-        config = {
-            'api_url': 'http://localhost:8080/v1',
-            'model': 'llama-3.2-3b-instruct',
-        }
+        config = _full_config()
         translator = LocalLLMTranslator(config)
 
         with pytest.raises((ValueError, RuntimeError)):
@@ -744,10 +664,7 @@ class TestResponseParsing:
         mock_response.choices[0].message.content = ''
         mock_client.chat.completions.create.return_value = mock_response
 
-        config = {
-            'api_url': 'http://localhost:8080/v1',
-            'model': 'llama-3.2-3b-instruct',
-        }
+        config = _full_config()
         translator = LocalLLMTranslator(config)
 
         result = translator.translate('Hello', target_language='French')
@@ -764,10 +681,7 @@ class TestResponseParsing:
         mock_response.choices[0].message.content = None
         mock_client.chat.completions.create.return_value = mock_response
 
-        config = {
-            'api_url': 'http://localhost:8080/v1',
-            'model': 'llama-3.2-3b-instruct',
-        }
+        config = _full_config()
         translator = LocalLLMTranslator(config)
 
         with pytest.raises((ValueError, RuntimeError)):
@@ -786,10 +700,7 @@ class TestSpecialCases:
             choices=[MagicMock(message=MagicMock(content='Long text translated'))]
         )
 
-        config = {
-            'api_url': 'http://localhost:8080/v1',
-            'model': 'llama-3.2-3b-instruct',
-        }
+        config = _full_config()
         translator = LocalLLMTranslator(config)
 
         long_text = 'Hello ' * 1000  # 5000 characters
@@ -808,10 +719,7 @@ class TestSpecialCases:
             choices=[MagicMock(message=MagicMock(content='Translated with special chars: @#$%'))]
         )
 
-        config = {
-            'api_url': 'http://localhost:8080/v1',
-            'model': 'llama-3.2-3b-instruct',
-        }
+        config = _full_config()
         translator = LocalLLMTranslator(config)
 
         text = 'Hello @#$%^&*() World!'
@@ -829,10 +737,7 @@ class TestSpecialCases:
             choices=[MagicMock(message=MagicMock(content='你好世界'))]
         )
 
-        config = {
-            'api_url': 'http://localhost:8080/v1',
-            'model': 'llama-3.2-3b-instruct',
-        }
+        config = _full_config()
         translator = LocalLLMTranslator(config)
 
         text = 'Hello 世界'

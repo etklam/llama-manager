@@ -75,41 +75,32 @@ class LocalLLMTranslator:
         Raises:
             ValueError: If 'model' is not in config and client is not provided
         """
-        # Validate required config
+        # ponytail: config_helpers owns defaults; here we only validate the
+        # 'model' presence and clamp the numeric trust-boundary inputs.
         if 'model' not in config and client is None:
             raise ValueError("Configuration must include 'model' parameter")
 
-        # Store config for later use
         self._config = config
-
-        # Initialize configuration
         self._api_model = config['model']
-        self.api_url = config.get('api_url', DEFAULT_API_URL)
-
-        if 'api_url' not in config:
-            self.model = config['model'].replace('.', '-')
-        else:
-            self.model = config['model']
-        self.max_tokens = config.get('max_tokens', DEFAULT_MAX_TOKENS)
-        self.temperature = config.get('temperature', DEFAULT_TEMPERATURE)
+        self.api_url = config['api_url']
+        self.model = config['model']
+        self.max_tokens = config['max_tokens']
+        self.temperature = config['temperature']
         self.api_key = config.get('api_key', '')
         self.proxy = config.get('proxy', None)
 
-        # Validate and clamp temperature to valid range [0, 2]
+        # Clamp temperature to [0, 2] at the trust boundary
         if not isinstance(self.temperature, (int, float)) or self.temperature < 0:
             self.temperature = 0.0
         elif self.temperature > 2.0:
             self.temperature = 2.0
 
-        # Validate max_tokens
+        # Reject non-positive max_tokens at the trust boundary
         if not isinstance(self.max_tokens, int) or self.max_tokens <= 0:
             self.max_tokens = DEFAULT_MAX_TOKENS
 
-        # Single-step mode: skip step1 (直译), only produce step2 (意译)
-        self.single_step = bool(config.get('single_step', False))
-
-        # Concurrent workers for batch processing
-        self.max_workers = max(1, int(config.get('max_workers', DEFAULT_MAX_WORKERS)))
+        self.single_step = bool(config['single_step'])
+        self.max_workers = max(1, int(config['max_workers']))
 
         # Store injected client or create OpenAIClient lazily
         self._injected_client = client

@@ -13,6 +13,8 @@ from datetime import timedelta
 from pathlib import Path
 from typing import List, Dict, Optional
 
+from constants import TARGET_LANGUAGES
+
 
 def format_time(s_time: str = "", separate: str = ',') -> str:
     """
@@ -312,3 +314,12 @@ def generate_srt_from_list(subtitle_list: List[Dict]) -> str:
         txt += f"{line}\n{startraw} --> {endraw}\n{it['text']}\n\n"
 
     return txt.strip()
+
+
+def output_path_for(input_path: str, target_lang: str, replace_original: bool) -> str:
+    # ponytail: one fn, unifies subtitle_tab + pipeline_runner naming. No class.
+    if replace_original:
+        return input_path
+    p = Path(input_path)
+    lang_name = TARGET_LANGUAGES.get(target_lang, target_lang)
+    return str(p.parent / f"{p.stem}_{lang_name}{p.suffix}")
