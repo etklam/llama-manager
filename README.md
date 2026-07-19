@@ -208,6 +208,39 @@ curl http://localhost:8080/v1/chat/completions \
 - 系統預設編碼為 UTF-8
 - 終端機支援中文字型
 
+### Whisper 只轉出同一句 / 字幕重複
+
+若 Whisper 轉錄只產生一句重複的字幕，通常是 whisper-cli 分段參數過度限制所致：
+
+- `--max-len`：限制每段最大字元數。設成 `200` 會強制合併，造成多句被擠成一段或重複輸出。改為 `0`（關閉限制）交由 whisper 內建邏輯分段即可。
+- `--suppress-nst`：抑制非語音 token，在中文或某些語言上會誤刪正常 token，導致「只剩同一句」。建議移除。
+- `--entropy-thold` / `--logprob-thold`：閾值過嚴會丟棄正常 token，必要時可適度放寬（例如 `entropy-thold` 提高到 `2.8`）。
+
+#### 長音訊（2 小時以上）跑到一半出現大量重複
+
+這是 whisper.cpp 經典的 **context collapse / 解碼無限迴圈**：處理到某個時間點後解碼器卡在 token 循環，後續全部變成同一段重複。根因是模型把前面已產生的（錯誤）token 當成 prompt 上下文繼續餵給自己，錯誤一路累積最終崩潰。
+
+目前 `whisper_transcription.py` 的 whisper-cli adapter 已加入以下抗重複參數：
+
+- `--max-context 0`：不保留前一個 segment 的文字 context，避免錯誤跨段累積（對長音訊最重要）。
+- `--temperature 0.0` + `--no-fallback`：使用固定的貪婪解碼，不進入逐步提高 temperature 的 fallback，避免隨機發散把迴圈帶回來。
+- `--max-len 0`：關閉最大段長限制。
+
+若上述仍無法解決，可再嘗試：
+
+- 換**較大**的模型（例如 `large-v3`），小模型在長音訊上特別容易崩潰。
+- 把音訊切成 30 分鐘以下的段落分批轉錄，再合併 SRT。
+
+#### 內建分段轉錄（推薦用於長音訊）
+
+Whisper 分頁與管線分頁的 Settings 區提供了 **「Chunk long audio (30 min, anti-repeat)」** 勾選框。勾選後：
+
+1. `whisper_transcription.py` 先用 `ffprobe` 探測時長；30 分鐘以下仍使用單次轉錄，只有超過 30 分鐘才進入 chunked transcription。
+2. 長音訊由 ffmpeg 產生 30 分鐘的 16kHz mono WAV chunk，每個 chunk 各自獨立跑一次 whisper-cli，避免跨段 context collapse。
+3. module 將 chunk SRT 依時間偏移量合併、重新編號，再以 transactional replace 發佈最終 `.srt`；取消或失敗不會覆蓋既有的完整字幕。
+
+設定會儲存到 `config.json` 的 `whisper.chunk_long_audio`，管線分頁也會讀取同一個設定。Whisper 分頁與管線共用同一個 synchronous transcription lifecycle，Stop 會立即取消目前的外部 process 並清理暫存檔。
+
 ## 📊 系統需求
 
 - **作業系統**: Windows 10/11

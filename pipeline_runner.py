@@ -5,7 +5,15 @@ import threading
 from pathlib import Path
 from typing import Callable, Dict, List, Optional
 
-from whisper_controller import WhisperController
+from whisper_transcription import (
+    CancellationToken,
+    Cancelled,
+    Completed,
+    Failed,
+    TranscriptionEvent,
+    TranscriptionRequest,
+    WhisperTranscriber,
+)
 from translation.local_llm_translator import LocalLLMTranslator
 from utils.srt_parser import parse_srt_from_file, generate_srt_from_list, output_path_for
 from config_manager import ConfigManager
@@ -38,6 +46,7 @@ class PipelineRunner:
         on_log: Callable[[str], None],
         on_progress: Callable[[str], None],
         on_done: Callable[[bool], None],
+        transcriber: Optional[WhisperTranscriber] = None,
     ):
         self._config_manager = config_manager
         self._get_port = get_port
@@ -47,9 +56,11 @@ class PipelineRunner:
         self._on_log = on_log
         self._on_progress = on_progress
         self._on_done = on_done
+        self._transcriber = transcriber or WhisperTranscriber()
 
         self._running = False
         self._stop_requested = False
+        self._active_cancellation: Optional[CancellationToken] = None
 
     @property
     def running(self) -> bool:
@@ -57,6 +68,8 @@ class PipelineRunner:
 
     def stop(self) -> None:
         self._stop_requested = True
+        if self._active_cancellation is not None:
+            self._active_cancellation.cancel()
 
     def run(
         self,
@@ -78,7 +91,9 @@ class PipelineRunner:
         Calls on_done(stopped: bool) when finished.
         """
         self._running = True
-        self._stop_requested = False
+        self._active_cancellation = CancellationToken()
+        if self._stop_requested:
+            self._active_cancellation.cancel()
 
         model_path = self._resolve_whisper_model_path(whisper_model_dir, whisper_model_name)
 
@@ -97,11 +112,24 @@ class PipelineRunner:
                         self._on_progress(
                             f"[{i+1}/{len(files)}] Whisper: {Path(filepath).name}"
                         )
-                        srt_path = self._run_whisper(
+                        outcome = self._run_whisper(
                             filepath, whisper_cli_path, model_path, language
                         )
-                        if not srt_path or self._stop_requested:
+                        if isinstance(outcome, Cancelled):
+                            self._stop_requested = True
+                            break
+                        if isinstance(outcome, Failed):
+                            self._on_progress(
+                                f"Error: {Path(filepath).name} - "
+                                f"{outcome.stage}: {outcome.message}"
+                            )
+                            self._on_log(
+                                f"Whisper failed ({outcome.stage}): {outcome.message}"
+                            )
                             continue
+                        if not isinstance(outcome, Completed) or self._stop_requested:
+                            continue
+                        srt_path = str(outcome.srt_path)
                         self._on_progress(
                             f"[{i+1}/{len(files)}] Translating: {Path(srt_path).name}"
                         )
@@ -110,8 +138,11 @@ class PipelineRunner:
                     self._on_progress(f"Error: {Path(filepath).name} - {e}")
                     self._on_log(f"Error: {Path(filepath).name} - {e}")
         finally:
+            stopped = self._stop_requested
+            self._active_cancellation = None
             self._running = False
-            self._on_done(stopped=self._stop_requested)
+            self._on_done(stopped=stopped)
+            self._stop_requested = False
 
     # ------------------------------------------------------------------
     # Whisper step
@@ -123,17 +154,32 @@ class PipelineRunner:
         cli_path: Path,
         model_path: str,
         language: str,
-    ) -> Optional[str]:
+    ):
         threads = self._config_manager.get("whisper.threads", 8)
-        return WhisperController.transcribe_sync(
-            cli_path=cli_path,
-            filepath=filepath,
-            model_path=model_path,
-            language=language,
-            threads=threads,
-            on_log=lambda m: self._on_log(f"  {m}"),
-            check_stop=lambda: self._stop_requested,
+        chunk_enabled = bool(self._config_manager.get("whisper.chunk_long_audio", False))
+        cancellation = self._active_cancellation or CancellationToken()
+        return self._transcriber.transcribe(
+            TranscriptionRequest(
+                source=Path(filepath),
+                cli_path=Path(cli_path),
+                model_path=Path(model_path),
+                language=language,
+                threads=threads,
+                chunk_long_audio=chunk_enabled,
+            ),
+            cancellation=cancellation,
+            emit=self._on_whisper_event,
         )
+
+    def _on_whisper_event(self, event: TranscriptionEvent) -> None:
+        if event.kind == "diagnostic" and event.message:
+            self._on_log(f"  {event.message}")
+        elif event.kind == "progress" and event.total:
+            self._on_progress(
+                f"Whisper {event.stage}: {event.current}/{event.total}"
+            )
+        elif event.kind == "started":
+            self._on_progress(f"Whisper: {event.stage}")
 
     # ------------------------------------------------------------------
     # Translation step

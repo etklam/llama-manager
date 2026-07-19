@@ -9,7 +9,6 @@ Adapted from pyvideotrans for use in llama-manager.
 
 import re
 import copy
-from datetime import timedelta
 from pathlib import Path
 from typing import List, Dict, Optional
 
@@ -98,10 +97,9 @@ def milliseconds_to_time(ms: int) -> str:
     Returns:
         Time string in HH:MM:SS,mmm format
     """
-    td = timedelta(milliseconds=ms)
-    hours, remainder = divmod(td.seconds, 3600)
+    total_seconds, milliseconds = divmod(max(0, int(ms)), 1000)
+    hours, remainder = divmod(total_seconds, 3600)
     minutes, seconds = divmod(remainder, 60)
-    milliseconds = td.microseconds // 1000
 
     return f"{hours:02}:{minutes:02}:{seconds:02},{milliseconds:03}"
 
@@ -118,14 +116,10 @@ def _ms_to_time_string(*, ms: int = 0, seconds: Optional[int] = None, sepflag: s
     Returns:
         Time string in HH:MM:SS,mmm format
     """
-    if seconds is None:
-        td = timedelta(milliseconds=ms)
-    else:
-        td = timedelta(seconds=seconds)
-
-    hours, remainder = divmod(td.seconds, 3600)
+    total_ms = int(ms if seconds is None else seconds * 1000)
+    total_seconds, milliseconds = divmod(max(0, total_ms), 1000)
+    hours, remainder = divmod(total_seconds, 3600)
     minutes, seconds = divmod(remainder, 60)
-    milliseconds = td.microseconds // 1000
 
     return f"{hours:02}:{minutes:02}:{seconds:02}{sepflag}{milliseconds:03}"
 

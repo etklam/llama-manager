@@ -30,18 +30,6 @@
   "models": {
     "models": [
       {
-        "name": "Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive-IQ4_NL",
-        "path": "D:\\AI\\llama\\llama.cpp\\llama-hip\\Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive-IQ4_NL.gguf",
-        "size": "18.42GB",
-        "format": "IQ4_NL"
-      },
-      {
-        "name": "supergemma4-26b-uncensored-fast-v2-Q4_K_M",
-        "path": "D:\\AI\\llama\\llama.cpp\\llama-hip\\supergemma4-26b-uncensored-fast-v2-Q4_K_M.gguf",
-        "size": "15.64GB",
-        "format": "Q4_K_M"
-      },
-      {
         "name": "gemma-4-E2B-it-uncensored-Q8_0",
         "path": "D:\\AI\\llama\\llama.cpp\\llama-hip\\gemma-4-E2B-it-uncensored-Q8_0.gguf",
         "size": "4.63GB",
@@ -76,5 +64,10 @@
         "format": "GGML"
       }
     ]
+  },
+  "pipeline": {
+    "language": "ja",
+    "target_lang": "zh-tw",
+    "replace_original": true
   }
 }

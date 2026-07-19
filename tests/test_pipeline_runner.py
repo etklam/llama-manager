@@ -9,6 +9,7 @@ from unittest.mock import Mock, MagicMock, patch, call
 import pytest
 
 from pipeline_runner import PipelineRunner, SUPPORTED_MEDIA
+from whisper_transcription import Cancelled, Completed
 
 
 # ---------------------------------------------------------------------------
@@ -146,7 +147,9 @@ class TestMediaFileWhisperThenTranslate:
         self, mock_parse, mock_translator_cls, mock_generate, runner, callbacks
     ):
         # Mock _run_whisper to return an SRT path immediately
-        runner._run_whisper = Mock(return_value='/test/video.srt')
+        runner._run_whisper = Mock(
+            return_value=Completed(Path('/test/video.srt'))
+        )
 
         # Set up translation
         mock_parse.return_value = [
@@ -218,6 +221,55 @@ class TestStop:
     def test_stop_sets_flag(self, runner):
         runner.stop()
         assert runner._stop_requested is True
+
+    def test_stop_before_run_is_not_discarded(self, runner, callbacks):
+        runner.stop()
+
+        runner.run(
+            files=['/test/video.mp4'],
+            target_lang='zh-cn',
+            language='en',
+            replace_original=False,
+            whisper_cli_path=Path('whisper-cli.exe'),
+            whisper_model_name='tiny',
+            whisper_model_dir='',
+        )
+
+        callbacks['on_done'].assert_called_once_with(stopped=True)
+
+    def test_stop_cancels_active_transcription(self, config_manager, callbacks):
+        holder = {}
+
+        class CancellingTranscriber:
+            def transcribe(self, request, cancellation, emit):
+                holder['runner'].stop()
+                assert cancellation.cancelled is True
+                return Cancelled()
+
+        runner = PipelineRunner(
+            config_manager=config_manager,
+            get_port=lambda: 8080,
+            get_current_model=lambda: 'test-model',
+            resolve_whisper_model_path=lambda d, n: n,
+            get_whisper_models=lambda: [],
+            on_log=callbacks['on_log'],
+            on_progress=callbacks['on_progress'],
+            on_done=callbacks['on_done'],
+            transcriber=CancellingTranscriber(),
+        )
+        holder['runner'] = runner
+
+        runner.run(
+            files=['/test/video.mp4'],
+            target_lang='zh-cn',
+            language='en',
+            replace_original=False,
+            whisper_cli_path=Path('whisper-cli.exe'),
+            whisper_model_name='tiny',
+            whisper_model_dir='',
+        )
+
+        callbacks['on_done'].assert_called_once_with(stopped=True)
 
     @patch('pipeline_runner.generate_srt_from_list', return_value="srt output")
     @patch('pipeline_runner.LocalLLMTranslator')

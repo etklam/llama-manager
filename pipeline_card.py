@@ -198,6 +198,6 @@ class PipelineCard(ttk.LabelFrame):
             self._pipe_status_label.config(text="All done!", foreground="green")
 
     def _resolve_whisper_model_path(self, model_dir, model_name):
-        from whisper_controller import WhisperController
-        return WhisperController.resolve_model_path(
+        from whisper_transcription import resolve_model_path
+        return resolve_model_path(
             model_dir, model_name, self._get_whisper_models)
