@@ -22,6 +22,7 @@ from utils.srt_parser import (
     time_to_milliseconds,
     milliseconds_to_time,
     output_path_for,
+    collapse_repeats,
 )
 
 
@@ -579,6 +580,46 @@ class TestOutputPathFor:
         out = Path(output_path_for("/some/deep/path/v.srt", "en", False))
         assert out.name == "v_English.srt"
         assert len(out.parent.parts) == 4
+
+
+class TestCollapseRepeats:
+    """Tests for collapse_repeats: compressing pathological repetition."""
+
+    def test_collapses_separator_delimited_run(self):
+        # The reported case: one short unit + separator repeated ~100 times.
+        text = "、".join(["あ"] * 100)
+        assert collapse_repeats(text) == "あ..."
+
+    def test_collapses_contiguous_run(self):
+        assert collapse_repeats("あ" * 20) == "あ..."
+
+    def test_collapses_multichar_unit(self):
+        assert collapse_repeats("なにこれ" * 6) == "なにこれ..."
+
+    def test_collapses_long_vowel_mark_run(self):
+        assert collapse_repeats("ノー" * 20) == "ノー..."
+
+    def test_preserves_text_around_run(self):
+        text = "Help! " + "あ、" * 30 + "end"
+        assert collapse_repeats(text) == "Help! あ...end"
+
+    def test_short_emphasis_is_untouched(self):
+        # Below _MIN_REPEAT_COUNT (5): ordinary emphasis must survive.
+        assert collapse_repeats("はは") == "はは"
+        assert collapse_repeats("あああ") == "あああ"
+        assert collapse_repeats("は、は") == "は、は"
+
+    def test_plain_text_unchanged(self):
+        text = "no repeats here at all"
+        assert collapse_repeats(text) == text
+
+    def test_empty_and_none_safe(self):
+        assert collapse_repeats("") == ""
+        assert collapse_repeats(None) is None
+
+    def test_multiple_distinct_runs_each_collapsed(self):
+        text = "あ" * 10 + " then " + "ね、" * 10
+        assert collapse_repeats(text) == "あ... then ね..."
 
 
 if __name__ == "__main__":

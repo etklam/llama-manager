@@ -25,7 +25,11 @@ class ServerController:
         self._log_thread_stopped = False  # Flag to track if log thread ended naturally
 
     def start(self, model_path: str, port: int, host: str,
-              gpu_layers: int, context_size: int, batch_size: int) -> None:
+              gpu_layers: int, context_size: int, batch_size: int,
+              parallel: int = 1, flash_attn: bool = True,
+              cont_batching: bool = True,
+              cache_type_k: Optional[str] = None,
+              cache_type_v: Optional[str] = None) -> None:
         """Start the server with given params.
 
         Args:
@@ -35,6 +39,13 @@ class ServerController:
             gpu_layers: Number of GPU layers to offload
             context_size: Context window size
             batch_size: Batch size for processing
+            parallel: Number of server slots (-np). >1 enables concurrent
+                request handling; KV cache is split evenly across slots.
+            flash_attn: Enable FlashAttention (--flash-attn on). Saves
+                attention VRAM and is required by some builds for quantized KV.
+            cont_batching: Enable continuous batching (--cont-batching).
+            cache_type_k: KV cache K data type (e.g. "q8_0"); None keeps f16.
+            cache_type_v: KV cache V data type (e.g. "q8_0"); None keeps f16.
 
         Raises:
             FileNotFoundError: If model_path doesn't exist
@@ -58,6 +69,20 @@ class ServerController:
             "-c", str(context_size),
             "-b", str(batch_size)
         ]
+
+        # Concurrency: enable multiple server slots so ThreadPoolExecutor
+        # workers on the client side are actually processed in parallel.
+        if parallel and parallel > 1:
+            cmd += ["--parallel", str(parallel)]
+        if cont_batching:
+            cmd += ["--cont-batching"]
+        if flash_attn:
+            cmd += ["--flash-attn", "on"]
+        # KV cache quantization (requires flash-attn on most builds).
+        if cache_type_k:
+            cmd += ["--cache-type-k", cache_type_k]
+        if cache_type_v:
+            cmd += ["--cache-type-v", cache_type_v]
 
         # Start process
         self._process = subprocess.Popen(

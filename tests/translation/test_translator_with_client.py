@@ -75,7 +75,11 @@ class TestTranslatorWithInjectedClient:
         assert fake_client.last_temperature == 0.8
 
     def test_translator_with_custom_max_tokens(self):
-        """Test that max_tokens is passed to injected client."""
+        """max_tokens sent to the client is the dynamic value, capped by config.
+
+        config['max_tokens'] is an upper bound now; a single-line translate()
+        sizes the request via _dynamic_max_tokens(1), which is below the 2000 cap.
+        """
         fake_client = FakeLLMClient(response_text="Response")
 
         config = _full_config(max_tokens=2000)
@@ -84,7 +88,8 @@ class TestTranslatorWithInjectedClient:
 
         translator.translate("Hello", target_language="French")
 
-        assert fake_client.last_max_tokens == 2000
+        assert fake_client.last_max_tokens == translator._dynamic_max_tokens(1)
+        assert fake_client.last_max_tokens <= 2000
 
     def test_translator_batch_uses_injected_client(self):
         """Test that batch translation uses injected client."""

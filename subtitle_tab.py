@@ -5,6 +5,7 @@ Subtitle Translation Tab - tkinter GUI for batch SRT/TXT translation.
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import threading
+import time
 from pathlib import Path
 from typing import Callable, Dict, List, Optional
 
@@ -31,6 +32,10 @@ class SubtitleTranslationTab(LogMixin, ttk.Frame):
         self._file_list: list = []
         self._translating = False
         self._stop_requested = False
+        # Progress state read by _on_progress (set per-run in _run_translation).
+        self._current_file_idx = 0
+        self._total_files = 1
+        self._file_start_time = time.time()
 
         self._init_translator()
         self._create_ui()
@@ -321,16 +326,26 @@ class SubtitleTranslationTab(LogMixin, ttk.Frame):
         target_lang = self._get_target_code()
         replace = self._replace_var.get()
 
+        # File-level context read by _on_progress to compute overall percentage
+        # (file index + within-file line fraction) and per-file ETA.
+        self._total_files = total
+        self._file_start_time = time.time()
+
         for i, filepath in enumerate(self._file_list):
             if self._stop_requested:
                 self._log("WARNING", "Translation stopped by user")
                 break
+
+            self._current_file_idx = i
+            self._file_start_time = time.time()
 
             try:
                 self._translate_file(filepath, target_lang, replace_original=replace)
             except Exception as e:
                 self._log("ERROR", f"Failed: {Path(filepath).name} - {e}")
 
+            # Snap the bar to the whole-file boundary once the file finishes;
+            # within-file advancement is driven by _on_progress at line level.
             pct = ((i + 1) / total) * 100
             self.winfo_toplevel().after(0, lambda p=pct: self._progress_var.set(p))
 
@@ -392,6 +407,43 @@ class SubtitleTranslationTab(LogMixin, ttk.Frame):
         self._log("SUCCESS", f"Saved: {output_path}")
 
     def _on_progress(self, file_name, current, total, status):
-        """Handle progress updates from translator."""
-        self.winfo_toplevel().after(0, lambda: self._progress_label.config(
-            text=f"{status}: {file_name} ({current}/{total})"))
+        """Handle progress updates from the translator.
+
+        Advances the progress bar at line granularity: overall percentage is
+        (completed files + current file's line fraction) / total files, so a
+        single large SRT no longer freezes the bar. Also derives lines/s and an
+        ETA for the current file from the wall-clock elapsed since it started.
+        """
+        total = max(1, total)
+        file_frac = min(current, total) / total
+
+        file_idx = getattr(self, "_current_file_idx", 0)
+        total_files = max(1, getattr(self, "_total_files", 1))
+        overall_pct = ((file_idx + file_frac) / total_files) * 100
+
+        elapsed = time.time() - getattr(self, "_file_start_time", time.time())
+        detail = f"{status}" if status else ""
+        if current > 0 and elapsed > 0:
+            rate = current / elapsed
+            remaining = (total - current) / rate if rate > 0 else 0
+            eta = self._format_eta(remaining)
+            detail = f"{rate:.1f} lines/s · ETA {eta}"
+
+        label = f"{file_name} ({current}/{total})"
+        if detail:
+            label = f"{label} · {detail}"
+
+        self.winfo_toplevel().after(0, lambda p=overall_pct, t=label: (
+            self._progress_var.set(p),
+            self._progress_label.config(text=t),
+        ))
+
+    @staticmethod
+    def _format_eta(seconds: float) -> str:
+        """Format a seconds count as mm:ss (or h:mm:ss when over an hour)."""
+        seconds = max(0, int(seconds))
+        m, s = divmod(seconds, 60)
+        h, m = divmod(m, 60)
+        if h:
+            return f"{h}:{m:02d}:{s:02d}"
+        return f"{m:02d}:{s:02d}"

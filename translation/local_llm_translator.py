@@ -32,6 +32,7 @@ if TYPE_CHECKING:
     from translation.llm_client import LLMClient
 
 from translation.prompt_builder import build_translation_prompt
+from utils.srt_parser import collapse_repeats
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +44,15 @@ DEFAULT_TEMPERATURE = 0.3
 DEFAULT_API_URL = "http://localhost:8080/v1"
 DEFAULT_BATCH_SIZE = 15  # Larger batch reduces API call overhead
 DEFAULT_MAX_WORKERS = 3
+
+# Dynamic max_tokens budgeting. Subtitle lines are short, so a fixed
+# max_tokens=16384 reserves far more KV than a batch ever needs and, on the
+# rare runaway generation, lets the model ramble much longer before hitting
+# the length stop. Instead we size the request to the batch: a per-line token
+# budget times the line count, floored so tiny batches still have headroom and
+# capped by the user's configured max_tokens.
+PER_LINE_TOKEN_BUDGET = 160  # conservative tokens per subtitle line (one field)
+MIN_DYNAMIC_MAX_TOKENS = 512
 
 
 class LocalLLMTranslator:
@@ -195,12 +205,29 @@ class LocalLLMTranslator:
             {'role': 'user', 'content': user_content}
         ]
 
-    def _call_api(self, messages: List[Dict[str, str]]) -> str:
+    def _dynamic_max_tokens(self, line_count: int) -> int:
+        """Size max_tokens to the request instead of using a fixed ceiling.
+
+        Budget = per-line tokens x line count, doubled in two-step mode
+        (the model emits both step1 直译 and step2 意译). The result is floored
+        at MIN_DYNAMIC_MAX_TOKENS so short batches keep headroom and capped at
+        the user-configured self.max_tokens so this never raises the ceiling.
+        """
+        line_count = max(1, line_count)
+        per_line = PER_LINE_TOKEN_BUDGET * (1 if self.single_step else 2)
+        budget = line_count * per_line
+        budget = max(MIN_DYNAMIC_MAX_TOKENS, budget)
+        return min(budget, self.max_tokens)
+
+    def _call_api(self, messages: List[Dict[str, str]],
+                  max_tokens: Optional[int] = None) -> str:
         """
         Call the LLM API via the client port with retry logic.
 
         Args:
             messages: List of message dictionaries
+            max_tokens: Per-request token cap; falls back to self.max_tokens
+                (the user-configured ceiling) when not supplied.
 
         Returns:
             Raw response text
@@ -216,7 +243,7 @@ class LocalLLMTranslator:
             response = client.complete(
                 messages=messages,
                 model=self._api_model,
-                max_tokens=self.max_tokens,
+                max_tokens=max_tokens if max_tokens is not None else self.max_tokens,
                 temperature=self.temperature
             )
 
@@ -275,42 +302,42 @@ class LocalLLMTranslator:
         if match:
             text = match.group(1).strip()
 
-        # Parse YAML-like blocks: each starts with "- id: N"
-        # Split into individual items
-        items = re.split(r'\n\s*-\s+id:', text)
+        # Split into individual YAML list items on the "- " list marker.
+        # We split on the list dash rather than "- id:" because models often
+        # omit the id field; splitting on the dash keeps each entry isolated so
+        # a value can't bleed into the next item's marker. Prepend a newline so
+        # a leading "- " at the very start also becomes a split boundary.
+        items = re.split(r'\n\s*-\s+', '\n' + text)
 
         for item in items:
             item = item.strip()
             if not item:
                 continue
 
-            # Re-add "id:" prefix that was consumed by split
-            item = "id:" + item
-
-            # Extract id
+            # Extract id (optional - the model may omit it)
             id_match = re.search(r'id:\s*(\d+)', item)
             item_id = int(id_match.group(1)) if id_match else len(results) + 1
 
-            # Extract step1 - handle multi-line with proper indentation
+            # Extract step1 - stop at the next field label or end of item.
             step1_match = re.search(
-                r'step1:\s*(.+?)(?=\s+step2:|\s+translation:|\s+id:|\s*$)',
+                r'step1:\s*(.+?)(?=\n\s*(?:step2|translation|id)\s*:|$)',
                 item, re.DOTALL
             )
-            step1 = step1_match.group(1).strip() if step1_match else ""
+            step1 = LocalLLMTranslator._clean_field_value(step1_match.group(1)) if step1_match else ""
 
-            # Extract step2 - handle multi-line
+            # Extract step2 - stop at the next field label or end of item.
             step2_match = re.search(
-                r'step2:\s*(.+?)(?=\s+id:|\s*$)',
+                r'step2:\s*(.+?)(?=\n\s*(?:id|translation)\s*:|$)',
                 item, re.DOTALL
             )
-            step2 = step2_match.group(1).strip() if step2_match else ""
+            step2 = LocalLLMTranslator._clean_field_value(step2_match.group(1)) if step2_match else ""
 
             # Extract translation field (single-step mode)
             translation_match = re.search(
-                r'translation:\s*(.+?)(?=\s+id:|\s*$)',
+                r'translation:\s*(.+?)(?=\n\s*(?:id|step1|step2)\s*:|$)',
                 item, re.DOTALL
             )
-            translation = translation_match.group(1).strip() if translation_match else ""
+            translation = LocalLLMTranslator._clean_field_value(translation_match.group(1)) if translation_match else ""
 
             # For single-step responses, map translation -> step2
             if not step2 and translation:
@@ -323,6 +350,48 @@ class LocalLLMTranslator:
             })
 
         return results
+
+    @staticmethod
+    def _clean_field_value(value: str) -> str:
+        """Strip leaked YAML markers from an extracted field value.
+
+        Models sometimes emit malformed output where one entry's value bleeds
+        into the next list item (e.g. "结果\n- translation: 下一句") or where a
+        value is prefixed with a stray marker. This truncates at the first
+        subsequent list/field marker and strips any leading marker or wrapping
+        quotes so raw tokens like "- translation:" never reach the subtitle.
+        """
+        if not value:
+            return ""
+
+        # Truncate at the first subsequent list item or field marker that
+        # appears on a new line (a sign the next entry leaked in).
+        value = re.split(
+            r'\n\s*-\s+|\n\s*(?:id|step1|step2|translation)\s*:',
+            value, maxsplit=1
+        )[0]
+
+        # Leading markers and wrapping quotes can be nested in either order
+        # (e.g. '"- translation: 你好"' vs '- "你好"'), so peel them off
+        # iteratively until the value stops shrinking.
+        while True:
+            before = value
+            value = value.strip()
+
+            # Strip a leading list marker / field label left over from a bad split.
+            value = re.sub(
+                r'^\s*(?:-\s*)?(?:id\s*:\s*\d+\s*)?(?:step1|step2|translation)\s*:\s*',
+                '', value
+            )
+
+            # Strip matching wrapping quotes the model may have added.
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
+                value = value[1:-1]
+
+            if value == before:
+                break
+
+        return value.strip()
 
     def translate(
         self,
@@ -357,7 +426,9 @@ class LocalLLMTranslator:
         messages = self._build_single_prompt(text, target_language, context)
 
         try:
-            raw_result = self._call_api(messages)
+            raw_result = self._call_api(
+                messages, max_tokens=self._dynamic_max_tokens(1)
+            )
         except RetryError as e:
             if e.last_attempt.exception():
                 raise e.last_attempt.exception()
@@ -424,7 +495,8 @@ class LocalLLMTranslator:
         srt_data: List[Dict],
         target_language: str,
         progress_callback: Optional[Callable] = None,
-        log_callback: Optional[Callable] = None
+        log_callback: Optional[Callable] = None,
+        _deduplicate: bool = True
     ) -> List[Dict]:
         """
         Translate SRT subtitle format while preserving timestamps.
@@ -454,6 +526,87 @@ class LocalLLMTranslator:
         def _log(level, msg):
             if log_callback:
                 log_callback(level, msg)
+
+        # Collapse pathological repetition (e.g. "あ、あ、あ、..." x100) in each
+        # cue's source before translating. Such runs burn tokens and can hang
+        # the model. We copy each entry so the caller's dicts stay untouched and
+        # only the text field is normalized; timestamps/line numbers are kept.
+        collapsed_count = 0
+        normalized: List[Dict] = []
+        for entry in srt_data:
+            text = entry.get('text', '')
+            new_text = collapse_repeats(text)
+            if new_text != text:
+                collapsed_count += 1
+                entry = {**entry, 'text': new_text}
+            normalized.append(entry)
+        if collapsed_count:
+            _log("INFO", f"Collapsed repeated runs in {collapsed_count} line(s)")
+        srt_data = normalized
+
+        # Translate identical cues only once, then fan the result back out to
+        # every original timestamp. Exact text after whitespace normalization is
+        # the cache key; repetition compression above runs first, so pathological
+        # variants such as 100x "あ、" also converge to the same short key.
+        if _deduplicate and len(srt_data) > 1:
+            unique_entries: List[Dict] = []
+            unique_index: Dict[str, int] = {}
+            entry_keys: List[str] = []
+
+            for entry in srt_data:
+                key = re.sub(r'\s+', ' ', entry.get('text', '')).strip()
+                entry_keys.append(key)
+                if key not in unique_index:
+                    unique_index[key] = len(unique_entries)
+                    unique_entries.append(entry)
+
+            duplicate_count = len(srt_data) - len(unique_entries)
+            if duplicate_count:
+                _log(
+                    "INFO",
+                    f"Deduplicated {duplicate_count} repeated line(s): "
+                    f"{len(srt_data)} -> {len(unique_entries)} LLM inputs"
+                )
+
+                def unique_progress(current, total, status):
+                    if progress_callback:
+                        ratio = min(current, total) / max(1, total)
+                        original_current = min(
+                            len(srt_data), round(ratio * len(srt_data))
+                        )
+                        progress_callback(
+                            original_current, len(srt_data),
+                            f"{status} · {len(unique_entries)} unique lines"
+                        )
+
+                unique_translated = self.translate_srt(
+                    unique_entries,
+                    target_language,
+                    progress_callback=unique_progress,
+                    log_callback=log_callback,
+                    _deduplicate=False,
+                )
+
+                translated_by_key = {}
+                for idx, entry in enumerate(unique_entries):
+                    key = re.sub(r'\s+', ' ', entry.get('text', '')).strip()
+                    if idx < len(unique_translated):
+                        translated_by_key[key] = unique_translated[idx].get(
+                            'text', entry.get('text', '')
+                        )
+                    else:
+                        translated_by_key[key] = entry.get('text', '')
+
+                return [
+                    {
+                        'text': translated_by_key.get(
+                            key, entry.get('text', '')
+                        ),
+                        'time': entry.get('time', ''),
+                        'line': entry.get('line', idx + 1),
+                    }
+                    for idx, (entry, key) in enumerate(zip(srt_data, entry_keys))
+                ]
 
         batch_size = max(1, self._config.get('batch_size', DEFAULT_BATCH_SIZE))
 
@@ -488,40 +641,43 @@ class LocalLLMTranslator:
                     log_callback, progress_callback, batch_results, batch_errors
                 )
         else:
-            # Concurrent mode
+            # Concurrent mode. log_callback is safe to pass through: the UI
+            # marshals it via log_bus.emit -> root.after(0, ...) rather than
+            # touching Tk directly, so per-line logs stay visible with workers>1.
+            done_lines = 0
             with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
                 futures = {}
                 for batch_idx, batch in enumerate(batches):
                     future = executor.submit(
                         self._translate_batch_lines,
-                        batch, target_language, None  # log_callback=None for thread safety
+                        batch, target_language, log_callback
                     )
                     futures[future] = batch_idx
 
                 for future in as_completed(futures):
                     batch_idx = futures[future]
                     batch = batches[batch_idx]
+                    batch_start_global = batch_idx * batch_size + 1
+                    batch_end_global = batch_start_global + len(batch) - 1
                     try:
                         batch_results[batch_idx] = future.result()
+                        _log("SUCCESS", f"Batch {batch_idx+1} done "
+                             f"({batch_start_global}-{batch_end_global})")
                     except Exception as e:
                         batch_errors[batch_idx] = e
+                        _log("WARNING", f"Batch {batch_idx+1} failed ({e}), "
+                             "falling back to individual translation")
 
-            # Log batch results
-            for batch_idx in range(total_batches):
-                batch = batches[batch_idx]
-                batch_start_global = batch_idx * batch_size + 1
-                batch_end_global = batch_start_global + len(batch) - 1
-
-                if batch_idx in batch_errors:
-                    e = batch_errors[batch_idx]
-                    _log("WARNING", f"Batch {batch_idx+1} failed ({e}), "
-                         "falling back to individual translation")
-                elif batch_idx in batch_results:
-                    _log("SUCCESS", f"Batch {batch_idx+1} done "
-                         f"({batch_start_global}-{batch_end_global})")
-
-            if progress_callback:
-                progress_callback(len(srt_data), len(srt_data), "batches done")
+                    # Report line-level progress as each batch completes so the
+                    # UI progress bar / ETA advances smoothly, not once at the end.
+                    done_lines += len(batch)
+                    if progress_callback:
+                        elapsed = time.time() - overall_start
+                        rate = done_lines / elapsed if elapsed > 0 else 0.0
+                        progress_callback(
+                            done_lines, len(srt_data),
+                            f"{rate:.1f} lines/s"
+                        )
 
         # Reconstruct results in order, with fallback for failed batches
         all_translated = []
@@ -630,7 +786,9 @@ class LocalLLMTranslator:
         messages = self._build_batch_prompt(yaml_input, target_language)
 
         try:
-            raw_result = self._call_api(messages)
+            raw_result = self._call_api(
+                messages, max_tokens=self._dynamic_max_tokens(len(batch))
+            )
         except LengthFinishReasonError:
             raise  # Let caller fall back to individual
         except RetryError as e:

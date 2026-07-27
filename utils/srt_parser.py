@@ -15,6 +15,46 @@ from typing import List, Dict, Optional
 from constants import TARGET_LANGUAGES
 
 
+# --- Repetition compression -------------------------------------------------
+
+# A single subtitle cue sometimes contains one short unit repeated dozens of
+# times - screams, stutters, or ASR artefacts like
+# "あ、あ、あ、あ、..." (often 50-100+ copies). Sent verbatim this burns huge
+# amounts of tokens, splits into tiny KV-hungry requests, and can make the model
+# hang or emit garbage. We collapse such runs to "<unit>..." before translating.
+_MAX_REPEAT_UNIT = 4        # longest repeating unit (in chars) we try to detect
+_MIN_REPEAT_COUNT = 5       # collapse only when the unit repeats at least this many times
+
+_REPEAT_RE = re.compile(
+    r'(?P<unit>.{1,%d}?)'                    # the repeating unit (non-greedy)
+    r'(?P<sep>[\s、，,。.！!？?・･…]*)'          # optional separator between repeats
+    r'(?:(?P=unit)(?P=sep)){%d,}'            # unit+sep repeated
+    r'(?P=unit)?'                            # optional trailing unit without a separator
+    % (_MAX_REPEAT_UNIT, _MIN_REPEAT_COUNT - 1),
+    flags=re.DOTALL,
+)
+
+
+def collapse_repeats(text: str, marker: str = '...') -> str:
+    """Collapse a run of the same short unit repeated many times to "unit...".
+
+    Handles both separator-delimited runs ("あ、あ、あ、...") and contiguous ones
+    ("ああああ..."). A unit is 1-4 characters; a run must reach _MIN_REPEAT_COUNT
+    copies before it is collapsed, so ordinary emphasis such as "はは" or "あああ"
+    survives untouched. Multiple distinct runs in one string are each collapsed.
+
+    Args:
+        text: The (subtitle) text to normalize.
+        marker: The suffix appended to the surviving unit (default "...").
+
+    Returns:
+        The text with over-long repetitions collapsed; unchanged if none qualify.
+    """
+    if not text:
+        return text
+    return _REPEAT_RE.sub(lambda m: m.group('unit') + marker, text)
+
+
 def format_time(s_time: str = "", separate: str = ',') -> str:
     """
     Normalize various time formats to standard SRT format (HH:MM:SS,mmm).

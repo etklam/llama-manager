@@ -96,7 +96,7 @@ class ServerTab(LogMixin, ttk.Frame):
         self.gpu_layers_label.grid(row=0, column=4, padx=(0, 20))
 
         ttk.Label(params_grid, text="\u4E0A\u4E0B\u6587\u5927\u5C0F:").grid(row=0, column=5, sticky=tk.W, padx=(0, 5))
-        self.context_var = tk.IntVar(value=self._config.get("server.context_size", 131072))
+        self.context_var = tk.IntVar(value=self._config.get("server.context_size", 16384))
         context_combo = ttk.Combobox(
             params_grid, textvariable=self.context_var,
             values=[512, 1024, 2048, 4096, 8192, 16384, 32768, 49152, 65536, 98304, 131072],
@@ -104,8 +104,31 @@ class ServerTab(LogMixin, ttk.Frame):
         context_combo.grid(row=0, column=6, padx=(0, 20))
 
         ttk.Label(params_grid, text="\u6279\u6B21\u5927\u5C0F:").grid(row=0, column=7, sticky=tk.W, padx=(0, 5))
-        self.batch_var = tk.IntVar(value=self._config.get("server.batch_size", 256))
+        self.batch_var = tk.IntVar(value=self._config.get("server.batch_size", 512))
         ttk.Entry(params_grid, textvariable=self.batch_var, width=10).grid(row=0, column=8)
+
+        # Second row: concurrency + KV cache quantization
+        ttk.Label(params_grid, text="\u4E26\u767C\u69FD (-np):").grid(row=1, column=0, sticky=tk.W, padx=(0, 5), pady=(8, 0))
+        self.parallel_var = tk.IntVar(value=self._config.get("server.parallel", 3))
+        ttk.Spinbox(params_grid, from_=1, to=16, textvariable=self.parallel_var,
+                    width=8).grid(row=1, column=1, padx=(0, 20), pady=(8, 0))
+
+        self.flash_attn_var = tk.BooleanVar(value=self._config.get("server.flash_attn", True))
+        ttk.Checkbutton(params_grid, text="FlashAttention",
+                        variable=self.flash_attn_var).grid(row=1, column=2, columnspan=2,
+                                                           sticky=tk.W, padx=(0, 20), pady=(8, 0))
+
+        ttk.Label(params_grid, text="KV \u5FEB\u53D6 K:").grid(row=1, column=4, sticky=tk.W, padx=(0, 5), pady=(8, 0))
+        self.cache_type_k_var = tk.StringVar(value=self._config.get("server.cache_type_k", "q8_0"))
+        ttk.Combobox(params_grid, textvariable=self.cache_type_k_var,
+                     values=["f16", "q8_0", "q4_0"], width=8,
+                     state="readonly").grid(row=1, column=5, padx=(0, 20), pady=(8, 0))
+
+        ttk.Label(params_grid, text="KV \u5FEB\u53D6 V:").grid(row=1, column=6, sticky=tk.W, padx=(0, 5), pady=(8, 0))
+        self.cache_type_v_var = tk.StringVar(value=self._config.get("server.cache_type_v", "q8_0"))
+        ttk.Combobox(params_grid, textvariable=self.cache_type_v_var,
+                     values=["f16", "q8_0", "q4_0"], width=8,
+                     state="readonly").grid(row=1, column=7, columnspan=2, sticky=tk.W, pady=(8, 0))
 
         control_frame = ttk.Frame(main_frame)
         control_frame.grid(row=3, column=0, pady=(0, 10))
@@ -206,6 +229,10 @@ class ServerTab(LogMixin, ttk.Frame):
         self._config.set("server.gpu_layers", self.gpu_layers_var.get())
         self._config.set("server.context_size", self.context_var.get())
         self._config.set("server.batch_size", self.batch_var.get())
+        self._config.set("server.parallel", self.parallel_var.get())
+        self._config.set("server.flash_attn", self.flash_attn_var.get())
+        self._config.set("server.cache_type_k", self.cache_type_k_var.get())
+        self._config.set("server.cache_type_v", self.cache_type_v_var.get())
 
         self.log("INFO", f"\u555F\u52D5\u670D\u52A1\u5668: {model_name}")
         if self._do_start_server(model_name, self.port_var.get()):
@@ -224,14 +251,22 @@ class ServerTab(LogMixin, ttk.Frame):
             return False
 
         gpu = self._config.get("server.gpu_layers", 99)
-        ctx = self._config.get("server.context_size", 131072)
-        bsz = self._config.get("server.batch_size", 256)
+        ctx = self._config.get("server.context_size", 16384)
+        bsz = self._config.get("server.batch_size", 512)
+        parallel = self._config.get("server.parallel", 3)
+        flash_attn = self._config.get("server.flash_attn", True)
+        cont_batching = self._config.get("server.cont_batching", True)
+        cache_type_k = self._config.get("server.cache_type_k", "q8_0")
+        cache_type_v = self._config.get("server.cache_type_v", "q8_0")
 
         try:
             self._server.start(
                 model_path=model_path, port=port,
                 host=self._config.get("server.host", "0.0.0.0"),
-                gpu_layers=gpu, context_size=ctx, batch_size=bsz
+                gpu_layers=gpu, context_size=ctx, batch_size=bsz,
+                parallel=parallel, flash_attn=flash_attn,
+                cont_batching=cont_batching,
+                cache_type_k=cache_type_k, cache_type_v=cache_type_v
             )
             self.start_button.config(state="disabled")
             self.stop_button.config(state="normal")

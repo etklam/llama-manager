@@ -61,8 +61,9 @@ class TestServerStart:
             batch_size=256
         )
 
-        # Verify Popen was called with correct command
-        expected_cmd = [
+        # Verify Popen was called with the core arguments. Concurrency/KV
+        # flags default on, so assert the prefix rather than exact equality.
+        expected_prefix = [
             str(server_exe),
             "-m", temp_model_file,
             "--port", "8080",
@@ -73,7 +74,7 @@ class TestServerStart:
         ]
         mock_popen.assert_called_once()
         call_args = mock_popen.call_args
-        assert call_args[0][0] == expected_cmd
+        assert call_args[0][0][:len(expected_prefix)] == expected_prefix
 
         # Verify stdout/stderr are piped
         import subprocess
@@ -153,6 +154,123 @@ class TestServerStart:
                 context_size=131072,
                 batch_size=256
             )
+
+
+class TestConcurrencyAndKVFlags:
+    """Test that concurrency and KV-cache flags are emitted correctly."""
+
+    @patch('server_controller.subprocess.Popen')
+    def test_parallel_greater_than_one_adds_parallel_flag(self, mock_popen, temp_model_file):
+        """parallel > 1 should add --parallel N to the command."""
+        mock_process = Mock()
+        mock_process.stdout.readline.return_value = ''
+        mock_process.poll.return_value = None
+        mock_popen.return_value = mock_process
+
+        controller = ServerController(Path("llama-server.exe"), Mock())
+        controller.start(
+            model_path=temp_model_file, port=8080, host="0.0.0.0",
+            gpu_layers=99, context_size=16384, batch_size=512,
+            parallel=3
+        )
+
+        cmd = mock_popen.call_args[0][0]
+        assert "--parallel" in cmd
+        assert cmd[cmd.index("--parallel") + 1] == "3"
+
+    @patch('server_controller.subprocess.Popen')
+    def test_parallel_one_omits_parallel_flag(self, mock_popen, temp_model_file):
+        """parallel == 1 should not add --parallel (server default)."""
+        mock_process = Mock()
+        mock_process.stdout.readline.return_value = ''
+        mock_process.poll.return_value = None
+        mock_popen.return_value = mock_process
+
+        controller = ServerController(Path("llama-server.exe"), Mock())
+        controller.start(
+            model_path=temp_model_file, port=8080, host="0.0.0.0",
+            gpu_layers=99, context_size=16384, batch_size=512,
+            parallel=1
+        )
+
+        assert "--parallel" not in mock_popen.call_args[0][0]
+
+    @patch('server_controller.subprocess.Popen')
+    def test_flash_attn_and_cont_batching_flags(self, mock_popen, temp_model_file):
+        """flash_attn and cont_batching should emit their flags when enabled."""
+        mock_process = Mock()
+        mock_process.stdout.readline.return_value = ''
+        mock_process.poll.return_value = None
+        mock_popen.return_value = mock_process
+
+        controller = ServerController(Path("llama-server.exe"), Mock())
+        controller.start(
+            model_path=temp_model_file, port=8080, host="0.0.0.0",
+            gpu_layers=99, context_size=16384, batch_size=512,
+            flash_attn=True, cont_batching=True
+        )
+
+        cmd = mock_popen.call_args[0][0]
+        assert "--cont-batching" in cmd
+        assert "--flash-attn" in cmd
+        assert cmd[cmd.index("--flash-attn") + 1] == "on"
+
+    @patch('server_controller.subprocess.Popen')
+    def test_flags_omitted_when_disabled(self, mock_popen, temp_model_file):
+        """flash_attn / cont_batching False should omit their flags."""
+        mock_process = Mock()
+        mock_process.stdout.readline.return_value = ''
+        mock_process.poll.return_value = None
+        mock_popen.return_value = mock_process
+
+        controller = ServerController(Path("llama-server.exe"), Mock())
+        controller.start(
+            model_path=temp_model_file, port=8080, host="0.0.0.0",
+            gpu_layers=99, context_size=16384, batch_size=512,
+            flash_attn=False, cont_batching=False
+        )
+
+        cmd = mock_popen.call_args[0][0]
+        assert "--flash-attn" not in cmd
+        assert "--cont-batching" not in cmd
+
+    @patch('server_controller.subprocess.Popen')
+    def test_kv_cache_type_flags(self, mock_popen, temp_model_file):
+        """cache_type_k/v should emit -ctk/-ctv equivalents when set."""
+        mock_process = Mock()
+        mock_process.stdout.readline.return_value = ''
+        mock_process.poll.return_value = None
+        mock_popen.return_value = mock_process
+
+        controller = ServerController(Path("llama-server.exe"), Mock())
+        controller.start(
+            model_path=temp_model_file, port=8080, host="0.0.0.0",
+            gpu_layers=99, context_size=16384, batch_size=512,
+            cache_type_k="q8_0", cache_type_v="q8_0"
+        )
+
+        cmd = mock_popen.call_args[0][0]
+        assert cmd[cmd.index("--cache-type-k") + 1] == "q8_0"
+        assert cmd[cmd.index("--cache-type-v") + 1] == "q8_0"
+
+    @patch('server_controller.subprocess.Popen')
+    def test_kv_cache_type_omitted_when_none(self, mock_popen, temp_model_file):
+        """cache_type_k/v None should omit the flags (keeps f16 default)."""
+        mock_process = Mock()
+        mock_process.stdout.readline.return_value = ''
+        mock_process.poll.return_value = None
+        mock_popen.return_value = mock_process
+
+        controller = ServerController(Path("llama-server.exe"), Mock())
+        controller.start(
+            model_path=temp_model_file, port=8080, host="0.0.0.0",
+            gpu_layers=99, context_size=16384, batch_size=512,
+            cache_type_k=None, cache_type_v=None
+        )
+
+        cmd = mock_popen.call_args[0][0]
+        assert "--cache-type-k" not in cmd
+        assert "--cache-type-v" not in cmd
 
 
 class TestServerStop:

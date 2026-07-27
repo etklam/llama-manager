@@ -450,7 +450,12 @@ class TestMaxTokensSetting:
 
     @patch('translation.openai_client.OpenAI')
     def test_max_tokens_passed_to_api(self, mock_openai):
-        """Test that max_tokens parameter is passed to API."""
+        """max_tokens sent to the API is the request-sized dynamic value.
+
+        config['max_tokens'] is now an upper cap, not the literal value sent.
+        A single-line translate() sizes the request via _dynamic_max_tokens(1),
+        which stays well under the 1500 cap here.
+        """
         mock_client = MagicMock()
         mock_openai.return_value = mock_client
         mock_client.chat.completions.create.return_value = MagicMock(
@@ -464,11 +469,11 @@ class TestMaxTokensSetting:
 
         call_args = mock_client.chat.completions.create.call_args
         assert 'max_tokens' in call_args.kwargs
-        assert call_args.kwargs['max_tokens'] == 1500
+        assert call_args.kwargs['max_tokens'] == translator._dynamic_max_tokens(1)
 
     @patch('translation.openai_client.OpenAI')
     def test_different_max_tokens_values(self, mock_openai):
-        """Test different max_tokens values."""
+        """The cap bounds the dynamic value: a small cap wins, a large one doesn't."""
         mock_client = MagicMock()
         mock_openai.return_value = mock_client
 
@@ -485,7 +490,9 @@ class TestMaxTokensSetting:
             translator.translate('Hello', target_language='French')
 
             call_args = mock_client.chat.completions.create.call_args
-            assert call_args.kwargs['max_tokens'] == max_tok
+            assert call_args.kwargs['max_tokens'] == translator._dynamic_max_tokens(1)
+            # Never exceeds the configured cap.
+            assert call_args.kwargs['max_tokens'] <= max_tok
 
 
 class TestAPIURLConfiguration:

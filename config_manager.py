@@ -19,9 +19,14 @@ DEFAULT_CONFIG = {
         'port': 8080,
         'host': '0.0.0.0',
         'gpu_layers': 99,
-        'context_size': 131072,
-        'batch_size': 256,
-        'threads': -1
+        'context_size': 16384,
+        'batch_size': 512,
+        'threads': -1,
+        'parallel': 3,
+        'flash_attn': True,
+        'cont_batching': True,
+        'cache_type_k': 'q8_0',
+        'cache_type_v': 'q8_0'
     },
     'ui': {
         'theme': 'default',

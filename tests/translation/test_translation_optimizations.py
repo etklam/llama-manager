@@ -193,6 +193,40 @@ class TestSingleStepTranslationMode:
         assert parsed[0]['step2'] == '你好'
         assert parsed[1]['step2'] == '世界'
 
+    def test_parse_strips_leaked_translation_marker(self):
+        """A value that bleeds into the next item's marker must be truncated.
+
+        Reproduces the observed pollution where the model omits ids and a
+        value swallows the following "- translation:" marker, leaving raw
+        tokens like "- translation: ..." in the subtitle text.
+        """
+        raw = (
+            "- translation: やば啊！快被發現躲起來！\n"
+            "- translation: 水快跑！"
+        )
+        parsed = LocalLLMTranslator._parse_yaml_result(raw)
+        assert len(parsed) == 2
+        assert parsed[0]['step2'] == 'やば啊！快被發現躲起來！'
+        assert parsed[1]['step2'] == '水快跑！'
+        for entry in parsed:
+            assert 'translation:' not in entry['step2']
+            assert not entry['step2'].startswith('-')
+
+    def test_parse_strips_leading_marker_and_quotes(self):
+        """Leftover leading markers and wrapping quotes are stripped."""
+        raw = '- id: 1\n  translation: "- translation: 你好世界"'
+        parsed = LocalLLMTranslator._parse_yaml_result(raw)
+        assert len(parsed) == 1
+        assert parsed[0]['step2'] == '你好世界'
+
+    def test_parse_two_step_value_does_not_swallow_next_field(self):
+        """step1 must stop at step2 rather than absorbing it."""
+        raw = "- id: 1\n  step1: 直译\n  step2: 意译"
+        parsed = LocalLLMTranslator._parse_yaml_result(raw)
+        assert len(parsed) == 1
+        assert parsed[0]['step1'] == '直译'
+        assert parsed[0]['step2'] == '意译'
+
     # --- End-to-end translate test ---
 
     def test_translate_single_step_returns_translation(self):
@@ -454,3 +488,193 @@ class TestCombinedOptimizations:
             assert entry['time'] == srt_data[i]['time'], (
                 f"Timestamp mismatch at line {i+1}"
             )
+
+
+# ===================================================================
+# P1-3: Dynamic max_tokens sized to the batch
+# ===================================================================
+
+class TestDynamicMaxTokens:
+    """P1-3: max_tokens is sized to the request, capped by the user ceiling."""
+
+    def test_batch_request_uses_dynamic_max_tokens_not_ceiling(self):
+        """A batch call should request far fewer tokens than the fixed ceiling."""
+        captured = {}
+
+        def _complete(messages, model, max_tokens, temperature):
+            captured['max_tokens'] = max_tokens
+            import re
+            ids = re.findall(r'id:\s*(\d+)', messages[1]['content'])
+            lines = []
+            for idx_str in ids:
+                lines.append(f"- id: {idx_str}")
+                lines.append(f"  translation: 结果{idx_str}")
+            return "\n".join(lines)
+
+        fake = FakeLLMClient()
+        fake.complete = _complete
+
+        # Large ceiling, small batch: dynamic value must stay well under it.
+        config = _full_config(
+            max_tokens=16384, batch_size=5, max_workers=1, single_step=True
+        )
+        translator = LocalLLMTranslator(config, client=fake)
+
+        translator.translate_srt(_make_srt_data(5), 'zh-cn')
+
+        assert captured['max_tokens'] < 16384
+        # 5 lines x 160 tokens (single-step) = 800, floored at 512 -> 800.
+        assert captured['max_tokens'] == 800
+
+    def test_dynamic_max_tokens_capped_by_user_ceiling(self):
+        """The dynamic budget never exceeds the user-configured max_tokens."""
+        config = _full_config(max_tokens=1000, single_step=True)
+        translator = LocalLLMTranslator(config, client=FakeLLMClient())
+
+        # 100 lines x 160 = 16000, but capped at the 1000 ceiling.
+        assert translator._dynamic_max_tokens(100) == 1000
+
+    def test_dynamic_max_tokens_floored_for_tiny_batches(self):
+        """Tiny batches keep a minimum headroom rather than a razor-thin cap."""
+        config = _full_config(max_tokens=16384, single_step=True)
+        translator = LocalLLMTranslator(config, client=FakeLLMClient())
+
+        # 1 line x 160 = 160, floored to MIN_DYNAMIC_MAX_TOKENS (512).
+        assert translator._dynamic_max_tokens(1) == 512
+
+    def test_two_step_budgets_double_of_single_step(self):
+        """Two-step emits step1+step2, so it needs roughly double the budget."""
+        two_step = LocalLLMTranslator(
+            _full_config(max_tokens=16384, single_step=False),
+            client=FakeLLMClient(),
+        )
+        single = LocalLLMTranslator(
+            _full_config(max_tokens=16384, single_step=True),
+            client=FakeLLMClient(),
+        )
+
+        assert two_step._dynamic_max_tokens(20) == 2 * single._dynamic_max_tokens(20)
+
+
+class TestRepetitionCollapsing:
+    """translate_srt collapses pathological repetition before sending to the LLM."""
+
+    def test_translate_srt_collapses_repeated_source(self):
+        """A cue of 100x "あ、" is sent to the client as the collapsed form."""
+        fake = FakeLLMClient()
+
+        def _complete(messages, model, max_tokens, temperature):
+            import re
+            ids = re.findall(r'id:\s*(\d+)', messages[1]['content'])
+            fake.messages_list.append(messages)
+            lines = []
+            for idx_str in ids:
+                lines.append(f"- id: {idx_str}")
+                lines.append(f"  translation: 结果{idx_str}")
+            return "\n".join(lines)
+
+        fake.complete = _complete
+
+        config = _full_config(batch_size=10, max_workers=1, single_step=True)
+        translator = LocalLLMTranslator(config, client=fake)
+
+        srt_data = _make_srt_data(4)
+        srt_data[0]['text'] = 'あ、' * 100
+        translator.translate_srt(srt_data, 'zh-cn')
+
+        # The oversized run must never reach the model verbatim.
+        sent = "".join(m[1]['content'] for m in fake.messages_list)
+        assert 'あ、' * 100 not in sent
+        assert 'あ...' in sent
+
+    def test_translate_srt_does_not_mutate_caller_data(self):
+        """Normalization copies entries; the caller's dicts stay unchanged."""
+        fake = FakeLLMClient()
+        config = _full_config(batch_size=10, max_workers=1, single_step=True)
+        translator = LocalLLMTranslator(config, client=fake)
+
+        srt_data = _make_srt_data(4)
+        original = 'あ、' * 100
+        srt_data[0]['text'] = original
+        translator.translate_srt(srt_data, 'zh-cn')
+
+        assert srt_data[0]['text'] == original
+
+
+class TestDuplicateSubtitleDeduplication:
+    """Identical subtitle cues are translated once and fanned back out."""
+
+    def test_repeated_sentences_only_call_llm_once_per_unique_text(self):
+        fake = FakeLLMClient()
+
+        def _complete(messages, model, max_tokens, temperature):
+            import re
+            fake.call_count += 1
+            fake.messages_list.append(messages)
+            sources = re.findall(r'^\s*source:\s*(.+)$', messages[1]['content'], re.MULTILINE)
+            source = sources[-1]
+            return f"- id: 1\n  translation: TR:{source}"
+
+        fake.complete = _complete
+        translator = LocalLLMTranslator(
+            _full_config(batch_size=10, max_workers=1, single_step=True),
+            client=fake,
+        )
+
+        texts = ["Hello", "Hello", "Bye", "Hello", "Bye", "Unique"]
+        srt_data = _make_srt_data(len(texts))
+        for entry, text in zip(srt_data, texts):
+            entry['text'] = text
+
+        result = translator.translate_srt(srt_data, 'zh-cn')
+
+        assert fake.call_count == 3
+        assert [entry['text'] for entry in result] == [
+            "TR:Hello", "TR:Hello", "TR:Bye",
+            "TR:Hello", "TR:Bye", "TR:Unique",
+        ]
+
+    def test_deduplication_preserves_each_timestamp_and_line_number(self):
+        fake = SingleStepFakeLLMClient(
+            response_text="- id: 1\n  translation: 同一句翻譯"
+        )
+        translator = LocalLLMTranslator(
+            _full_config(batch_size=10, max_workers=1, single_step=True),
+            client=fake,
+        )
+
+        srt_data = _make_srt_data(8)
+        for entry in srt_data:
+            entry['text'] = "Same sentence"
+
+        result = translator.translate_srt(srt_data, 'zh-cn')
+
+        assert fake.call_count == 1
+        assert len(result) == 8
+        assert all(entry['text'] == "同一句翻譯" for entry in result)
+        assert [entry['time'] for entry in result] == [
+            entry['time'] for entry in srt_data
+        ]
+        assert [entry['line'] for entry in result] == [
+            entry['line'] for entry in srt_data
+        ]
+
+    def test_whitespace_equivalent_sentences_share_translation(self):
+        fake = SingleStepFakeLLMClient(
+            response_text="- id: 1\n  translation: 相同翻譯"
+        )
+        translator = LocalLLMTranslator(
+            _full_config(batch_size=10, max_workers=1, single_step=True),
+            client=fake,
+        )
+
+        srt_data = _make_srt_data(4)
+        srt_data[0]['text'] = "Hello world"
+        srt_data[1]['text'] = "Hello\nworld"
+        srt_data[2]['text'] = "Hello   world"
+        srt_data[3]['text'] = "Hello world"
+
+        result = translator.translate_srt(srt_data, 'zh-cn')
+
+        assert fake.call_count == 1
+        assert all(entry['text'] == "相同翻譯" for entry in result)
