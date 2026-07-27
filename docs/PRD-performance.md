@@ -1,6 +1,6 @@
 # PRD：llama-manager 性能提升
 
-- 狀態：P0 / P1 已實作，P2 待排期
+- 狀態：P0 / P1 / P2-1 / P2-2 已實作，P2-3 暫緩
 - 版本：v0.2
 - 日期：2026-07-27
 - 範圍：翻譯吞吐、VRAM 使用、輸出清理、Whisper 轉錄、UI/UX
@@ -18,6 +18,8 @@
 - P1-3：`max_tokens` 按批次大小動態計算，使用者設定改作上限 cap。
 - P1-4：清理 malformed YAML 回應，避免 `- translation:` 等標記污染字幕。
 - P1-5：壓縮句內大量重複短單位；相同字幕句子只翻譯一次再回填。
+- P2-1：翻譯模式 / 長上下文模式用途 preset。
+- P2-2：切模型時自動停止舊 server、釋放記憶體並啟動新模型。
 
 本機 llama.cpp ROCm build 已確認支援：
 - `--parallel N`
@@ -25,7 +27,7 @@
 - `--flash-attn on|off|auto`
 - `--cache-type-k/v` 的 `q8_0`、`q4_0` 等型別
 
-回歸測試：`python -m pytest -q`，**384 passed**。
+回歸測試：`python -m pytest -q`，**391 passed**。
 
 ---
 
@@ -213,27 +215,30 @@ def start(self, model_path, port, host, gpu_layers, context_size, batch_size,
 
 ---
 
-### P2-1　用途 preset（對應 G4）
+### P2-1　用途 preset（對應 G4）✅ 已完成
 
-**改動位置**：`server_tab.py` 加 preset 按鈕群。
+**改動位置**：`server_tab.py` preset 按鈕群與 preset constants。
 
-- 「翻譯模式」：context 8192-16384、`-np 3`、KV q8_0、flash-attn on。
-- 「長對話模式」：context 65536+、`-np 1`、KV f16。
-- 一鍵套用到現有欄位，使用者仍可微調後再啟動。
+- 「翻譯模式」：context 16384、batch 512、`-np 3`、KV K/V q8_0、FlashAttention on、continuous batching on。
+- 「長上下文模式」：context 65536、batch 512、`-np 1`、KV K/V f16、FlashAttention on、continuous batching on。
+- 一鍵同步更新可見 UI 欄位與 `ConfigManager`；使用者仍可在啟動前微調。
 
-**驗收**：切 preset 後對應欄位即時更新；啟動指令符合 preset。
+**驗收結果**：headless tests 驗證兩個 preset 的 UI 值及所有 `server.*` config 值。
 
 ---
 
-### P2-2　切換模型自動釋放（對應 G4）
+### P2-2　切換模型自動釋放（對應 G4）✅ 已完成
 
-**改動位置**：`server_tab.py` `_do_start_server`。
+**改動位置**：`server_tab.py` `start_server()`、`_do_start_server()`、`_do_stop_server()`。
 
-- 現況需手動：停 server → 釋放記憶體 → 啟新模型。
-- 改法：啟動前若偵測 `self._server.running`，先 `stop()` + `gc.collect()`（server_tab 已 import gc）再啟動，並在 log 說明。
-- 屬破壞性較低操作，但仍建議在 log 明確標示「已停止舊 server 並釋放」。
+- Server 運行期間保留「切換模型」按鈕；選另一模型後按一次即可切換。
+- 先驗證新模型路徑，再依序執行 `stop()` → `gc.collect()` → `start()`，避免先停舊模型後才發現新模型不存在。
+- `ServerController.stop()` 等待舊 process 結束，確保模型 VRAM 在新 process 載入前釋放。
+- 同一模型重複按啟動會提示而不 restart。
+- Stop 失敗時取消切換，不會同時啟動第二個 server。
+- Resource monitor 加 generation token，避免立即 stop/start 時舊 monitor thread 復活造成雙重監控。
 
-**驗收**：切換模型只需選模型 + 按啟動一步。
+**驗收結果**：tests 驗證 stop → GC → start 次序、同模型保護、stop failure、UI state、callback 與 monitor generation。
 
 ---
 
@@ -348,12 +353,14 @@ D:/AI/llama/llama.cpp/llama-hip/llama-server.exe \
 | P1-3 | 翻譯多批 | 動態 token cap 生效；截斷 / hang 風險下降 |
 | P1-4 | 模型漏 id 或輸出 malformed YAML | 字幕不含 `- translation:` 等標記 |
 | P1-5 | 高重複 SRT | 唯一句子各翻譯一次；時間軸與順序不變 |
-| P2-x | preset / 自動釋放 / whisper GPU | 見各節驗收 |
+| P2-1 | 切換兩個用途 preset | UI 與 config 值同步更新 |
+| P2-2 | 運行中選另一模型並啟動 | stop → GC → start；時間軸外功能不受影響 |
+| P2-3 | whisper GPU | 暫不排期 |
 
 ### 6.3 回歸
 - 完整測試：`python -m pytest -q`。
-- 2026-07-27 實測結果：**384 passed in 24.62s**。
-- 已覆蓋 server flags、動態 max_tokens、malformed YAML 清理、句內重複壓縮、跨字幕去重與 timestamp 回填。
+- 2026-07-27 實測結果：**391 passed in 24.46s**。
+- 已覆蓋 server flags、用途 preset、自動模型切換、monitor generation、動態 max_tokens、malformed YAML 清理、句內重複壓縮、跨字幕去重與 timestamp 回填。
 
 ---
 
@@ -375,5 +382,5 @@ D:/AI/llama/llama.cpp/llama-hip/llama-server.exe \
 2. ✅ **P1-1 + P1-2**：行級進度、速率 / ETA、併發即時 log。
 3. ✅ **P1-3**：動態 max_tokens。
 4. ✅ **P1-4 + P1-5**：LLM 標記清理、句內重複壓縮、跨字幕去重。
-5. ⏳ **P2-1 / P2-2**：用途 preset / 切模型自動釋放，屬操作便利性改善。
+5. ✅ **P2-1 / P2-2**：用途 preset / 切模型自動釋放。
 6. ⏸️ **P2-3**：Whisper 目前速度足夠，暫不排期。

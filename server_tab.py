@@ -16,6 +16,27 @@ import psutil
 from ui_helpers import LogMixin
 
 
+TRANSLATION_PRESET = {
+    "context_size": 16384,
+    "batch_size": 512,
+    "parallel": 3,
+    "flash_attn": True,
+    "cont_batching": True,
+    "cache_type_k": "q8_0",
+    "cache_type_v": "q8_0",
+}
+
+LONG_CONTEXT_PRESET = {
+    "context_size": 65536,
+    "batch_size": 512,
+    "parallel": 1,
+    "flash_attn": True,
+    "cont_batching": True,
+    "cache_type_k": "f16",
+    "cache_type_v": "f16",
+}
+
+
 class ServerTab(LogMixin, ttk.Frame):
     def __init__(self, parent, server_controller, models_registry,
                  config_manager, base_dir, on_model_selected=None,
@@ -29,6 +50,8 @@ class ServerTab(LogMixin, ttk.Frame):
         self._on_server_state_changed = on_server_state_changed
         self._monitor_thread = None
         self._monitor_running = False
+        self._monitor_generation = 0
+        self._active_model_name = None
 
         self._create_ui()
 
@@ -130,6 +153,25 @@ class ServerTab(LogMixin, ttk.Frame):
                      values=["f16", "q8_0", "q4_0"], width=8,
                      state="readonly").grid(row=1, column=7, columnspan=2, sticky=tk.W, pady=(8, 0))
 
+        preset_frame = ttk.Frame(server_frame)
+        preset_frame.grid(row=1, column=0, sticky=tk.W, pady=(10, 0))
+        ttk.Label(preset_frame, text="用途 Preset:").pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(
+            preset_frame, text="翻譯模式",
+            command=self._apply_translation_preset,
+            width=14,
+        ).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(
+            preset_frame, text="長上下文模式",
+            command=self._apply_long_context_preset,
+            width=16,
+        ).pack(side=tk.LEFT)
+        ttk.Label(
+            preset_frame,
+            text="翻譯: 16K / 3 slots / KV q8 · 長上下文: 64K / 1 slot / KV f16",
+            foreground="gray",
+        ).pack(side=tk.LEFT, padx=(10, 0))
+
         control_frame = ttk.Frame(main_frame)
         control_frame.grid(row=3, column=0, pady=(0, 10))
 
@@ -150,7 +192,7 @@ class ServerTab(LogMixin, ttk.Frame):
 
         self.status_label = ttk.Label(
             control_frame, text="\u25CF \u672A\u904B\u884C", font=("Arial", 10))
-        self.status_label.grid(row=0, column=2, padx=20)
+        self.status_label.grid(row=0, column=3, padx=20)
 
         self._init_log_widget(main_frame, row=4, column=0,
                               label="\U0001F4CB \u904B\u884C\u65E5\u8A8C", height=15, max_lines=1000)
@@ -215,16 +257,46 @@ class ServerTab(LogMixin, ttk.Frame):
         if hasattr(root, '_app') and hasattr(root._app, 'scan_models'):
             root._app.scan_models()
 
+    # -------------------------------------------------------- Server presets
+    def _apply_translation_preset(self):
+        self._apply_server_preset("翻譯模式", TRANSLATION_PRESET)
+
+    def _apply_long_context_preset(self):
+        self._apply_server_preset("長上下文模式", LONG_CONTEXT_PRESET)
+
+    def _apply_server_preset(self, name, values):
+        """Apply a server-use preset to the visible fields and config.
+
+        Values are persisted immediately so other launch paths observe the same
+        settings. The user can still fine-tune any field before starting.
+        """
+        self.context_var.set(values["context_size"])
+        self.batch_var.set(values["batch_size"])
+        self.parallel_var.set(values["parallel"])
+        self.flash_attn_var.set(values["flash_attn"])
+        self.cache_type_k_var.set(values["cache_type_k"])
+        self.cache_type_v_var.set(values["cache_type_v"])
+
+        for key, value in values.items():
+            self._config.set(f"server.{key}", value)
+
+        self.log(
+            "INFO",
+            f"已套用{name}: ctx={values['context_size']}, "
+            f"slots={values['parallel']}, "
+            f"KV={values['cache_type_k']}/{values['cache_type_v']}"
+        )
+
     # -------------------------------------------------------- Server control
     def start_server(self):
         if not self.model_var.get():
             messagebox.showerror("\u932F\u8AA4", "\u8ACB\u5148\u9078\u64C7\u4E00\u500B\u6A21\u578B\uFF01")
             return
-        if self._server.running:
-            messagebox.showwarning("\u8B66\u544A", "\u670D\u52A1\u5668\u5DF2\u5728\u904B\u884C\u4E2D\uFF01")
-            return
 
         model_name = self.model_var.get()
+        if self._server.running and self._active_model_name == model_name:
+            messagebox.showwarning("\u8B66\u544A", "\u6B64\u6A21\u578B\u5DF2\u5728\u904B\u884C\u4E2D\uFF01")
+            return
         self._config.set("server.port", self.port_var.get())
         self._config.set("server.gpu_layers", self.gpu_layers_var.get())
         self._config.set("server.context_size", self.context_var.get())
@@ -241,14 +313,27 @@ class ServerTab(LogMixin, ttk.Frame):
             self.log("ERROR", "\u555F\u52D5\u5931\u6557")
 
     def stop_server(self):
-        self._do_stop_server()
-        self.log("SUCCESS", "\u670D\u52A1\u5668\u5DF2\u505C\u6B62")
+        if self._do_stop_server():
+            self.log("SUCCESS", "\u670D\u52A1\u5668\u5DF2\u505C\u6B62")
 
     def _do_start_server(self, model_name, port):
         model_path = self._models.get_model_path(model_name)
         if not model_path or not Path(model_path).exists():
             messagebox.showerror("Error", f"Model not found: {model_path}")
             return False
+
+        # P2-2: switching model is one action. Validate the new model first,
+        # then stop the old server and release Python-side references before
+        # launching it. ServerController.stop() waits for process termination,
+        # so model VRAM is released before the next process starts loading.
+        if self._server.running:
+            previous = self._active_model_name or "目前模型"
+            self.log("INFO", f"切換模型: {previous} -> {model_name}")
+            if not self._do_stop_server():
+                self.log("ERROR", "無法停止舊 server，已取消模型切換")
+                return False
+            gc.collect()
+            self.log("SUCCESS", "舊 server 已停止並釋放記憶體")
 
         gpu = self._config.get("server.gpu_layers", 99)
         ctx = self._config.get("server.context_size", 16384)
@@ -268,10 +353,13 @@ class ServerTab(LogMixin, ttk.Frame):
                 cont_batching=cont_batching,
                 cache_type_k=cache_type_k, cache_type_v=cache_type_v
             )
-            self.start_button.config(state="disabled")
+            # Keep the start button available while running so selecting another
+            # model + pressing it performs the automatic switch above.
+            self.start_button.config(state="normal", text="\U0001F504 \u5207\u63DB\u6A21\u578B")
             self.stop_button.config(state="normal")
             self.status_label.config(text="\u25CF \u904B\u884C\u4E2D", foreground="green")
             self.start_resource_monitor()
+            self._active_model_name = model_name
             self._config.set("ui.last_model", model_name)
             self.model_var.set(model_name)
             self.port_var.set(port)
@@ -287,12 +375,15 @@ class ServerTab(LogMixin, ttk.Frame):
 
     def _do_stop_server(self):
         if not self._server.running:
-            return
+            return True
         try:
             self._server.stop()
         except Exception as e:
             messagebox.showerror("Error", f"Stop failed: {e}")
-        self.start_button.config(state="normal")
+            return False
+
+        self._active_model_name = None
+        self.start_button.config(state="normal", text="\u25B6\uFE0F \u555F\u52D5\u670D\u52D9\u5668")
         self.stop_button.config(state="disabled")
         self.status_label.config(text="\u25CF \u672A\u904B\u884C", foreground="black")
         self.stop_resource_monitor()
@@ -300,6 +391,7 @@ class ServerTab(LogMixin, ttk.Frame):
         # Notify parent about state change
         if self._on_server_state_changed:
             self._on_server_state_changed(False, None, None)
+        return True
 
     def release_memory(self):
         try:
@@ -350,15 +442,26 @@ class ServerTab(LogMixin, ttk.Frame):
 
     # -------------------------------------------------------- Resource monitor
     def start_resource_monitor(self):
+        # A model switch stops and restarts monitoring immediately. Generation
+        # tokens make the previous thread exit even if _monitor_running becomes
+        # True again before its sleep finishes.
+        self._monitor_generation += 1
+        generation = self._monitor_generation
         self._monitor_running = True
-        self._monitor_thread = threading.Thread(target=self.monitor_resources, daemon=True)
+        self._monitor_thread = threading.Thread(
+            target=self.monitor_resources, args=(generation,), daemon=True
+        )
         self._monitor_thread.start()
 
     def stop_resource_monitor(self):
         self._monitor_running = False
+        self._monitor_generation += 1
 
-    def monitor_resources(self):
-        while self._monitor_running:
+    def monitor_resources(self, generation=None):
+        if generation is None:
+            generation = self._monitor_generation
+        while (self._monitor_running
+               and generation == self._monitor_generation):
             try:
                 ram = psutil.virtual_memory()
                 ram_used = ram.used / (1024**3)
