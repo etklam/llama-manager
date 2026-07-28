@@ -3,6 +3,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from server_tab import (
+    CHAT_PRESET,
     LONG_CONTEXT_PRESET,
     TRANSLATION_PRESET,
     ServerTab,
@@ -101,6 +102,27 @@ class TestServerPresets:
         assert tab.cache_type_v_var.get() == "q8_0"
         for key, value in TRANSLATION_PRESET.items():
             assert tab._config.get(f"server.{key}") == value
+
+    def test_chat_preset_updates_fields_and_config(self, tmp_path):
+        tab = _make_tab(tmp_path / "model.gguf")
+
+        tab._apply_chat_preset()
+
+        assert tab.context_var.get() == 32768
+        assert tab.batch_var.get() == 512
+        assert tab.parallel_var.get() == 2
+        assert tab.flash_attn_var.get() is True
+        assert tab.cache_type_k_var.get() == "q8_0"
+        assert tab.cache_type_v_var.get() == "q8_0"
+        for key, value in CHAT_PRESET.items():
+            assert tab._config.get(f"server.{key}") == value
+
+    def test_chat_preset_sits_between_translation_and_long_context(self):
+        assert (
+            TRANSLATION_PRESET["context_size"]
+            < CHAT_PRESET["context_size"]
+            < LONG_CONTEXT_PRESET["context_size"]
+        )
 
     def test_long_context_preset_updates_fields_and_config(self, tmp_path):
         tab = _make_tab(tmp_path / "model.gguf")

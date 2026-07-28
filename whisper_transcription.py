@@ -285,16 +285,33 @@ class FfmpegMediaAdapter:
             raise RuntimeError("ffmpeg produced no chunk WAV")
 
 
+def _is_ansi_safe(text: str) -> bool:
+    """Can this path survive whisper-cli's narrow (ANSI codepage) handling?
+
+    whisper-cli takes its paths as narrow bytes in the active Windows ANSI
+    codepage rather than as UTF-16, so any character the codepage cannot encode
+    reaches it as a literal "?" and the open fails with a path that looks
+    plausible but names nothing. On cp950 (Traditional Chinese) that includes
+    common Japanese kanji such as 瀬, so a folder like "七瀬ひな" breaks while
+    its neighbours work. Non-Windows platforms pass paths as bytes and need no
+    such check.
+    """
+    if os.name != "nt":
+        return True
+    try:
+        text.encode("mbcs")
+    except (UnicodeEncodeError, LookupError):
+        return False
+    return True
+
+
 class WhisperCliAdapter:
-    def transcribe(
+    def _build_command(
         self,
         audio: Path,
-        destination: Path,
+        output_base: Path,
         request: TranscriptionRequest,
-        cancellation: CancellationToken,
-        emit: Callable[[TranscriptionEvent], None],
-    ) -> None:
-        output_base = destination.with_suffix("")
+    ) -> List[str]:
         command = [
             str(request.cli_path),
             "-m", str(request.model_path),
@@ -312,8 +329,72 @@ class WhisperCliAdapter:
         ]
         if request.language and request.language != "auto":
             command.extend(["--language", request.language])
+        return command
 
-        _run_process(command, cancellation, emit, "transcribing")
+    def transcribe(
+        self,
+        audio: Path,
+        destination: Path,
+        request: TranscriptionRequest,
+        cancellation: CancellationToken,
+        emit: Callable[[TranscriptionEvent], None],
+    ) -> None:
+        output_base = destination.with_suffix("")
+
+        # Media living under a path this machine's ANSI codepage cannot express
+        # is transcribed through an ANSI-safe scratch directory: whisper-cli only
+        # ever sees representable paths, and we move the SRT back ourselves. The
+        # model path is checked too, since it is passed the same way.
+        if not all(_is_ansi_safe(str(p)) for p in
+                   (audio, output_base, request.model_path)):
+            self._transcribe_via_scratch(
+                audio, destination, request, cancellation, emit)
+            return
+
+        _run_process(
+            self._build_command(audio, output_base, request),
+            cancellation, emit, "transcribing")
+        if not destination.exists():
+            raise RuntimeError("whisper-cli produced no SRT")
+
+    def _transcribe_via_scratch(
+        self,
+        audio: Path,
+        destination: Path,
+        request: TranscriptionRequest,
+        cancellation: CancellationToken,
+        emit: Callable[[TranscriptionEvent], None],
+    ) -> None:
+        """Run whisper-cli entirely inside an ANSI-safe scratch directory."""
+        if not _is_ansi_safe(str(request.model_path)):
+            raise RuntimeError(
+                "Whisper model path contains characters the system ANSI "
+                f"codepage cannot represent: {request.model_path}"
+            )
+
+        with tempfile.TemporaryDirectory(prefix="whisper-ansi-") as scratch_name:
+            scratch = Path(scratch_name)
+            if not _is_ansi_safe(str(scratch)):
+                raise RuntimeError(
+                    "No ANSI-safe temporary directory available for a source "
+                    f"path the ANSI codepage cannot represent: {audio}"
+                )
+
+            staged_audio = scratch / "input.wav"
+            staged_base = scratch / "result"
+            staged_srt = staged_base.with_suffix(".srt")
+            shutil.copy2(audio, staged_audio)
+
+            _run_process(
+                self._build_command(staged_audio, staged_base, request),
+                cancellation, emit, "transcribing")
+            if not staged_srt.exists():
+                raise RuntimeError("whisper-cli produced no SRT")
+
+            # Back to the caller's (possibly non-representable) destination via
+            # Python, which uses the wide Windows API and handles it correctly.
+            shutil.copyfile(staged_srt, destination)
+
         if not destination.exists():
             raise RuntimeError("whisper-cli produced no SRT")
 

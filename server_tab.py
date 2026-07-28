@@ -26,6 +26,21 @@ TRANSLATION_PRESET = {
     "cache_type_v": "q8_0",
 }
 
+# Chat mode serves an external tool over llama-server's OpenAI-compatible
+# endpoint, so a conversation accumulates history across turns: more context
+# than the per-batch translation path needs, but quantized KV keeps the VRAM
+# cost of that history down. Two slots let a second client (or a retry) through
+# without the deep-context cost of the long-context preset.
+CHAT_PRESET = {
+    "context_size": 32768,
+    "batch_size": 512,
+    "parallel": 2,
+    "flash_attn": True,
+    "cont_batching": True,
+    "cache_type_k": "q8_0",
+    "cache_type_v": "q8_0",
+}
+
 LONG_CONTEXT_PRESET = {
     "context_size": 65536,
     "batch_size": 512,
@@ -162,13 +177,18 @@ class ServerTab(LogMixin, ttk.Frame):
             width=14,
         ).pack(side=tk.LEFT, padx=(0, 6))
         ttk.Button(
+            preset_frame, text="對話模式",
+            command=self._apply_chat_preset,
+            width=14,
+        ).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(
             preset_frame, text="長上下文模式",
             command=self._apply_long_context_preset,
             width=16,
         ).pack(side=tk.LEFT)
         ttk.Label(
             preset_frame,
-            text="翻譯: 16K / 3 slots / KV q8 · 長上下文: 64K / 1 slot / KV f16",
+            text="翻譯 16K/3 slots · 對話 32K/2 slots · 長上下文 64K/1 slot",
             foreground="gray",
         ).pack(side=tk.LEFT, padx=(10, 0))
 
@@ -260,6 +280,9 @@ class ServerTab(LogMixin, ttk.Frame):
     # -------------------------------------------------------- Server presets
     def _apply_translation_preset(self):
         self._apply_server_preset("翻譯模式", TRANSLATION_PRESET)
+
+    def _apply_chat_preset(self):
+        self._apply_server_preset("對話模式", CHAT_PRESET)
 
     def _apply_long_context_preset(self):
         self._apply_server_preset("長上下文模式", LONG_CONTEXT_PRESET)

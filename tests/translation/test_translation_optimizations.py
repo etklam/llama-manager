@@ -6,6 +6,7 @@ Plan A: Concurrent batch processing via ThreadPoolExecutor
 Plan B: Single-step translation mode (skip step1 literal translation)
 Plan C: Larger default batch size
 """
+import re
 import threading
 import time
 
@@ -108,6 +109,23 @@ class TestLargerDefaultBatchSize:
     def test_translate_srt_uses_configured_batch_size(self):
         """translate_srt should respect batch_size from config."""
         fake = FakeLLMClient()
+
+        # Echo one YAML entry per requested id. A fixed single-line response
+        # would leave every line past the first "missing", triggering per-line
+        # retries (the dropped-line recovery path) and inflating call_count —
+        # which measures batches, not lines. A realistic model answers every id.
+        def _complete(messages, model, max_tokens, temperature):
+            with fake._lock:
+                fake.call_count += 1
+            ids = re.findall(r'id:\s*(\d+)', messages[1]['content'])
+            lines = []
+            for idx_str in ids:
+                lines.append(f"- id: {idx_str}")
+                lines.append(f"  step1: 直译{idx_str}")
+                lines.append(f"  step2: 意译{idx_str}")
+            return "\n".join(lines)
+
+        fake.complete = _complete
         config = _full_config(batch_size=3)
         translator = LocalLLMTranslator(config, client=fake)
 
@@ -601,6 +619,160 @@ class TestRepetitionCollapsing:
         assert srt_data[0]['text'] == original
 
 
+class TestBatchAlignmentByModelId:
+    """Batch results align to sources by the model's echoed id, not by position.
+
+    Local models intermittently reorder, merge, or drop entries in a YAML batch
+    response. Reconstructing positionally shifted every following translation
+    onto the wrong subtitle and ran the tail off the end of the parsed list,
+    where it fell back to the untranslated source — the "translate returned the
+    original text" symptom.
+    """
+
+    @staticmethod
+    def _batch_sources(messages):
+        """Sources from the batch YAML, excluding the prompt's example line.
+
+        The prompt template contains a literal "source: Source" example, which
+        a naive regex would pick up as a phantom first line.
+        """
+        content = messages[1]['content']
+        body = content.split('翻譯:' if '翻譯:' in content else '翻译:')[-1]
+        return re.findall(r'^\s*source:\s*(.+)$', body, re.MULTILINE)
+
+    def test_reordered_response_maps_each_translation_to_its_own_source(self):
+        """Ids returned out of order must still land on the right subtitle."""
+        fake = FakeLLMClient()
+
+        def _complete(messages, model, max_tokens, temperature):
+            with fake._lock:
+                fake.call_count += 1
+            sources = self._batch_sources(messages)
+            pairs = list(enumerate(sources, start=1))
+            lines = []
+            for out_id, src in reversed(pairs):  # model answers in reverse
+                lines.append(f"- id: {out_id}")
+                lines.append(f"  translation: TR[{src}]")
+            return "\n".join(lines)
+
+        fake.complete = _complete
+        translator = LocalLLMTranslator(
+            _full_config(batch_size=10, max_workers=1, single_step=True),
+            client=fake,
+        )
+
+        srt_data = _make_srt_data(4)
+        for i, entry in enumerate(srt_data):
+            entry['text'] = f'src{i + 1}'
+
+        result = translator.translate_srt(srt_data, 'zh-cn')
+
+        assert [entry['text'] for entry in result] == [
+            'TR[src1]', 'TR[src2]', 'TR[src3]', 'TR[src4]'
+        ]
+
+    def test_dropped_line_is_retried_instead_of_returning_original(self):
+        """A line absent from the batch response gets its own retry call."""
+        fake = FakeLLMClient()
+
+        def _complete(messages, model, max_tokens, temperature):
+            with fake._lock:
+                fake.call_count += 1
+            sources = self._batch_sources(messages)
+            lines = []
+            for out_id, src in enumerate(sources, start=1):
+                # Omit id 3 from the multi-line batch, but answer a
+                # single-line retry normally.
+                if len(sources) > 1 and out_id == 3:
+                    continue
+                lines.append(f"- id: {out_id}")
+                lines.append(f"  translation: TR[{src}]")
+            return "\n".join(lines)
+
+        fake.complete = _complete
+        translator = LocalLLMTranslator(
+            _full_config(batch_size=10, max_workers=1, single_step=True),
+            client=fake,
+        )
+
+        srt_data = _make_srt_data(4)
+        for i, entry in enumerate(srt_data):
+            entry['text'] = f'src{i + 1}'
+
+        result = translator.translate_srt(srt_data, 'zh-cn')
+
+        # Every line is translated; the dropped one no longer leaks its source.
+        assert [entry['text'] for entry in result] == [
+            'TR[src1]', 'TR[src2]', 'TR[src3]', 'TR[src4]'
+        ]
+        assert all(
+            not entry['text'].startswith('src') for entry in result
+        )
+        # One batch call plus exactly one targeted retry.
+        assert fake.call_count == 2
+
+    def test_well_behaved_response_incurs_no_retry_calls(self):
+        """When the model answers every id, no extra per-line calls are made."""
+        fake = FakeLLMClient()
+
+        def _complete(messages, model, max_tokens, temperature):
+            with fake._lock:
+                fake.call_count += 1
+            sources = self._batch_sources(messages)
+            lines = []
+            for out_id, src in enumerate(sources, start=1):
+                lines.append(f"- id: {out_id}")
+                lines.append(f"  translation: TR[{src}]")
+            return "\n".join(lines)
+
+        fake.complete = _complete
+        translator = LocalLLMTranslator(
+            _full_config(batch_size=10, max_workers=1, single_step=True),
+            client=fake,
+        )
+
+        srt_data = _make_srt_data(6)
+        for i, entry in enumerate(srt_data):
+            entry['text'] = f'src{i + 1}'
+
+        result = translator.translate_srt(srt_data, 'zh-cn')
+
+        assert fake.call_count == 1
+        assert len(result) == 6
+
+    def test_duplicated_id_does_not_clobber_a_distinct_line(self):
+        """A repeated id keeps the first value; the other line is retried."""
+        fake = FakeLLMClient()
+
+        def _complete(messages, model, max_tokens, temperature):
+            with fake._lock:
+                fake.call_count += 1
+            sources = self._batch_sources(messages)
+            if len(sources) > 1:
+                # Model emits id 1 twice and never mentions id 2.
+                return (
+                    f"- id: 1\n  translation: TR[{sources[0]}]\n"
+                    f"- id: 1\n  translation: BOGUS"
+                )
+            return f"- id: 1\n  translation: TR[{sources[0]}]"
+
+        fake.complete = _complete
+        translator = LocalLLMTranslator(
+            _full_config(batch_size=10, max_workers=1, single_step=True),
+            client=fake,
+        )
+
+        srt_data = _make_srt_data(2)
+        srt_data[0]['text'] = 'src1'
+        srt_data[1]['text'] = 'src2'
+
+        result = translator.translate_srt(srt_data, 'zh-cn')
+
+        assert result[0]['text'] == 'TR[src1]'
+        # The second line must not inherit the duplicate's value.
+        assert result[1]['text'] == 'TR[src2]'
+
+
 class TestDuplicateSubtitleDeduplication:
     """Identical subtitle cues are translated once and fanned back out."""
 
@@ -678,3 +850,97 @@ class TestDuplicateSubtitleDeduplication:
 
         assert fake.call_count == 1
         assert all(entry['text'] == "相同翻譯" for entry in result)
+
+
+def _long_text(chars: int) -> str:
+    """Build long text whose units all differ, so collapse_repeats leaves it."""
+    parts = []
+    i = 0
+    while len(" ".join(parts)) <= chars:
+        parts.append(f"sentence{i}")
+        i += 1
+    return " ".join(parts)
+
+
+def _echoing_client() -> FakeLLMClient:
+    """Client that answers every id present in the request (single-step)."""
+    fake = FakeLLMClient()
+
+    def _complete(messages, model, max_tokens, temperature):
+        fake.call_count += 1
+        fake.messages_list.append(messages)
+        ids = re.findall(r'id:\s*(\d+)', messages[1]['content'])
+        lines = []
+        for idx_str in ids:
+            lines.append(f"- id: {idx_str}")
+            lines.append(f"  translation: 翻譯{idx_str}")
+        return "\n".join(lines)
+
+    fake.complete = _complete
+    return fake
+
+
+class TestLongSourceSoftGuard:
+    """The translate path warns about over-long cues but never drops them.
+
+    Translation is tuned for subtitle-sized context (see the translation server
+    preset). Long-form input belongs on the chat endpoint, so it is flagged --
+    softly, because refusing or truncating a cue would silently lose subtitle
+    content the user asked to translate.
+    """
+
+    def _translate(self, srt_data):
+        logs = []
+        fake = _echoing_client()
+        translator = LocalLLMTranslator(
+            _full_config(batch_size=10, max_workers=1, single_step=True),
+            client=fake,
+        )
+        result = translator.translate_srt(
+            srt_data, 'zh-cn', log_callback=lambda lv, m: logs.append((lv, m))
+        )
+        return result, logs, fake
+
+    def _warnings(self, logs):
+        return [m for lv, m in logs if lv == "WARNING" and "exceed" in m]
+
+    def test_long_line_is_warned_about_and_names_the_line(self):
+        srt_data = _make_srt_data(4)
+        srt_data[2]['text'] = _long_text(600)
+
+        _, logs, _ = self._translate(srt_data)
+
+        warnings = self._warnings(logs)
+        assert len(warnings) == 1
+        assert "L3" in warnings[0]
+        assert "chat" in warnings[0].lower()
+
+    def test_long_line_is_still_translated_not_rejected_or_truncated(self):
+        long_text = _long_text(600)
+        srt_data = _make_srt_data(4)
+        srt_data[2]['text'] = long_text
+
+        result, _, fake = self._translate(srt_data)
+
+        # Soft: the cue reached the model in full and came back translated.
+        assert len(result) == 4
+        assert result[2]['text'] == "翻譯3"
+        assert long_text in "".join(m[1]['content'] for m in fake.messages_list)
+
+    def test_subtitle_sized_lines_produce_no_warning(self):
+        result, logs, _ = self._translate(_make_srt_data(4))
+
+        assert self._warnings(logs) == []
+        assert len(result) == 4
+
+    def test_many_long_lines_are_summarized_in_one_warning(self):
+        srt_data = _make_srt_data(8)
+        for entry in srt_data:
+            entry['text'] = _long_text(600) + f" tail{entry['line']}"
+
+        _, logs, _ = self._translate(srt_data)
+
+        warnings = self._warnings(logs)
+        assert len(warnings) == 1
+        assert "8 line(s)" in warnings[0]
+        assert "+3 more" in warnings[0]

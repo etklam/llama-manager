@@ -10,6 +10,7 @@ from whisper_transcription import (
     CancellationToken,
     Cancelled,
     Completed,
+    _is_ansi_safe,
     Failed,
     FfmpegMediaAdapter,
     TranscriptionRequest,
@@ -388,3 +389,123 @@ def test_ffprobe_adapter_reads_real_wav_duration(tmp_path):
         source, CancellationToken(), lambda event: None)
 
     assert duration == pytest.approx(1.0, abs=0.05)
+
+
+class TestAnsiUnsafePaths:
+    """whisper-cli receives paths as narrow ANSI bytes, not UTF-16.
+
+    A character the active codepage cannot encode arrives at the tool as a
+    literal "?", so it opens nothing and reports a not-found path that looks
+    plausible (e.g. "D:\\collection\\sorted\\???\\prepared.wav"). Such media is
+    staged through an ANSI-safe scratch directory instead. The predicate is
+    patched in these tests so they assert the routing on any codepage.
+    """
+
+    def _request(self, audio, **kw):
+        params = dict(
+            source=audio,
+            cli_path=Path("whisper-cli.exe"),
+            model_path=Path("D:/models/ggml.bin"),
+        )
+        params.update(kw)
+        return TranscriptionRequest(**params)
+
+    @patch("whisper_transcription._run_process")
+    def test_representable_path_runs_directly_without_staging(self, mock_run, tmp_path):
+        audio = tmp_path / "prepared.wav"
+        audio.write_bytes(b"wav")
+        destination = tmp_path / "result.srt"
+
+        def create_output(command, cancellation, emit, stage):
+            destination.write_text("srt", encoding="utf-8")
+            return ""
+
+        mock_run.side_effect = create_output
+        with patch("whisper_transcription._is_ansi_safe", return_value=True):
+            WhisperCliAdapter().transcribe(
+                audio, destination, self._request(audio),
+                CancellationToken(), lambda event: None)
+
+        # The real path went straight to the tool: no scratch indirection.
+        command = mock_run.call_args.args[0]
+        assert command[command.index("-f") + 1] == str(audio)
+        assert destination.read_text(encoding="utf-8") == "srt"
+
+    @patch("whisper_transcription._run_process")
+    def test_unrepresentable_path_is_staged_and_srt_returned(self, mock_run, tmp_path):
+        # Mirrors the reported failure: a Japanese folder unencodable in cp950.
+        media_dir = tmp_path / "七瀬ひな"
+        media_dir.mkdir()
+        audio = media_dir / "prepared.wav"
+        audio.write_bytes(b"wav")
+        destination = media_dir / "result.srt"
+        seen = {}
+
+        def create_output(command, cancellation, emit, stage):
+            audio_arg = command[command.index("-f") + 1]
+            base_arg = command[command.index("--output-file") + 1]
+            seen["audio"] = audio_arg
+            seen["base"] = base_arg
+            # The staged input must really exist where the tool is told to read.
+            assert Path(audio_arg).read_bytes() == b"wav"
+            Path(base_arg).with_suffix(".srt").write_text(
+                "staged srt", encoding="utf-8")
+            return ""
+
+        mock_run.side_effect = create_output
+
+        def only_scratch_is_safe(text):
+            return "瀬" not in text
+
+        with patch("whisper_transcription._is_ansi_safe",
+                   side_effect=only_scratch_is_safe):
+            WhisperCliAdapter().transcribe(
+                audio, destination, self._request(audio),
+                CancellationToken(), lambda event: None)
+
+        # whisper-cli never saw the unrepresentable path...
+        assert "瀬" not in seen["audio"]
+        assert "瀬" not in seen["base"]
+        # ...yet the SRT landed at the real destination, and staging is gone.
+        assert destination.read_text(encoding="utf-8") == "staged srt"
+        assert not Path(seen["audio"]).exists()
+
+    @patch("whisper_transcription._run_process")
+    def test_unrepresentable_model_path_fails_with_a_clear_reason(
+        self, mock_run, tmp_path
+    ):
+        media_dir = tmp_path / "七瀬ひな"
+        media_dir.mkdir()
+        audio = media_dir / "prepared.wav"
+        audio.write_bytes(b"wav")
+
+        # Staging cannot rescue a model path the tool also cannot open.
+        with patch("whisper_transcription._is_ansi_safe",
+                   side_effect=lambda text: "瀬" not in text):
+            with pytest.raises(RuntimeError, match="ANSI"):
+                WhisperCliAdapter().transcribe(
+                    audio, media_dir / "result.srt",
+                    self._request(audio, model_path=media_dir / "ggml.bin"),
+                    CancellationToken(), lambda event: None)
+
+        mock_run.assert_not_called()
+
+    @patch("whisper_transcription._run_process")
+    def test_staged_run_producing_no_srt_is_reported_as_failure(
+        self, mock_run, tmp_path
+    ):
+        media_dir = tmp_path / "七瀬ひな"
+        media_dir.mkdir()
+        audio = media_dir / "prepared.wav"
+        audio.write_bytes(b"wav")
+        mock_run.return_value = ""
+
+        with patch("whisper_transcription._is_ansi_safe",
+                   side_effect=lambda text: "瀬" not in text):
+            with pytest.raises(RuntimeError, match="no SRT"):
+                WhisperCliAdapter().transcribe(
+                    audio, media_dir / "result.srt", self._request(audio),
+                    CancellationToken(), lambda event: None)
+
+    def test_ansi_safe_accepts_plain_ascii_paths(self):
+        assert _is_ansi_safe("D:/media/clip.wav") is True

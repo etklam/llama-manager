@@ -54,6 +54,12 @@ DEFAULT_MAX_WORKERS = 3
 PER_LINE_TOKEN_BUDGET = 160  # conservative tokens per subtitle line (one field)
 MIN_DYNAMIC_MAX_TOKENS = 512
 
+# Soft ceiling for a single source cue on the translation path. A spoken
+# subtitle line rarely runs past a couple hundred characters, so anything well
+# beyond that is long-form text on the wrong path. Exceeding it only logs a
+# warning — see translate_srt — never rejects or truncates the line.
+LONG_SOURCE_WARN_CHARS = 500
+
 
 class LocalLLMTranslator:
     """
@@ -544,6 +550,28 @@ class LocalLLMTranslator:
             _log("INFO", f"Collapsed repeated runs in {collapsed_count} line(s)")
         srt_data = normalized
 
+        # Soft guard: this path is tuned for subtitle-sized cues, and the
+        # translation server preset runs a correspondingly small context. An
+        # over-long cue still gets translated — we only warn, because refusing
+        # or truncating would silently lose subtitle content — but the warning
+        # names the lines to look at when a result comes back mangled or when
+        # the request trips the context limit. Long-form input belongs on the
+        # chat endpoint with its larger context, not here.
+        if _deduplicate:
+            long_lines = [
+                entry.get('line', idx + 1)
+                for idx, entry in enumerate(srt_data)
+                if len(entry.get('text', '')) > LONG_SOURCE_WARN_CHARS
+            ]
+            if long_lines:
+                shown = ', '.join(f"L{n}" for n in long_lines[:5])
+                if len(long_lines) > 5:
+                    shown += f", +{len(long_lines) - 5} more"
+                _log("WARNING",
+                     f"{len(long_lines)} line(s) exceed "
+                     f"{LONG_SOURCE_WARN_CHARS} chars ({shown}); this path is "
+                     "tuned for short context — use chat mode for long-form text")
+
         # Translate identical cues only once, then fan the result back out to
         # every original timestamp. Exact text after whitespace normalization is
         # the cache key; repetition compression above runs first, so pathological
@@ -805,31 +833,64 @@ class LocalLLMTranslator:
             translations = self._parse_numbered_result(raw_result, len(batch))
             return self._reconstruct_batch(batch, translations, _log)
 
-        # Log per-line results (step1 -> step2)
+        # Map parsed entries by the id echoed back by the model. The batch YAML
+        # numbers sources 1..N (see _build_batch_yaml), so the source at
+        # position j carries id j+1. Reconstructing by id — not by list
+        # position — means a reordered, dropped, or merged line in the model's
+        # response can no longer shift every following translation onto the
+        # wrong subtitle. That positional shift was exactly what surfaced as
+        # lines "returning the original text": once one line was missing or out
+        # of order, the tail ran off the end of `parsed` and fell back to the
+        # untranslated source. First id wins so a duplicated id can't clobber a
+        # real one.
+        by_id: Dict[int, Dict[str, str]] = {}
+        for parsed_entry in parsed:
+            pid = parsed_entry.get('id')
+            if isinstance(pid, int) and pid not in by_id:
+                by_id[pid] = parsed_entry
+
+        result = []
+        missing_positions: List[int] = []
         for j, entry in enumerate(batch):
-            src = entry.get('text', '').strip().replace("\n", " ")
-            if j < len(parsed):
-                s1 = parsed[j].get('step1', '')[:60]
-                s2 = parsed[j].get('step2', '')[:60]
+            matched = by_id.get(j + 1)
+            final_text = ''
+            if matched is not None:
+                final_text = matched.get('step2', '') or matched.get('step1', '')
+                s1 = matched.get('step1', '')[:60]
+                s2 = matched.get('step2', '')[:60]
                 _log("INFO", f"  L{entry.get('line', '?')}: "
                      f"直译=\"{s1}\" -> 意译=\"{s2}\"")
-            else:
-                _log("WARNING", f"  L{entry.get('line', '?')}: missing parsed result")
-
-        # Reconstruct entries using step2 (意译) as final text
-        result = []
-        for j, entry in enumerate(batch):
-            if j < len(parsed):
-                final_text = parsed[j].get('step2', '') or parsed[j].get('step1', '')
-                if not final_text:
-                    final_text = entry.get('text', '')
-            else:
+            if not final_text:
+                # The model returned no usable text for this line. Emitting the
+                # source verbatim is precisely the "not translated" symptom, so
+                # mark it for a targeted individual retry below.
+                missing_positions.append(j)
                 final_text = entry.get('text', '')
+                _log("WARNING", f"  L{entry.get('line', '?')}: missing parsed result")
             result.append({
                 'text': final_text,
                 'time': entry.get('time', ''),
                 'line': entry.get('line', 0)
             })
+
+        # Retranslate any dropped/garbled lines one at a time rather than
+        # leaving the untranslated source in the output. This is bounded by the
+        # batch size and only fires for lines the batch response actually
+        # missed, so a well-behaved model incurs no extra calls.
+        for j in missing_positions:
+            entry = batch[j]
+            src = entry.get('text', '').strip().replace("\n", " ")
+            if not src:
+                continue
+            try:
+                retry_text = self.translate(src, target_language)
+            except Exception as e:
+                _log("WARNING", f"  L{entry.get('line', '?')}: retry failed ({e}), keeping original")
+                continue
+            if retry_text and retry_text.strip():
+                _log("INFO", f"  L{entry.get('line', '?')}: retried -> \"{retry_text[:60]}\"")
+                result[j]['text'] = retry_text
+
         return result
 
     def _reconstruct_batch(
