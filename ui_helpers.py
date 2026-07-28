@@ -1,29 +1,67 @@
 import re
 import threading
 from datetime import datetime
-from typing import Any, Callable, List, Optional
+from typing import Any, Callable, List, Optional, Sequence
 import tkinter as tk
 from tkinter import ttk, scrolledtext
 
 
+# Log channels. Every emitter names the subsystem it speaks for so a log widget
+# can show only its own traffic: whisper emits one diagnostic line per decoded
+# segment and the translator one per subtitle, and fanning both into all four
+# sinks made every tab unreadable while tripling the Tk inserts per line.
+CHANNEL_APP = "app"
+CHANNEL_SERVER = "server"
+CHANNEL_TRANSLATE = "translate"
+CHANNEL_WHISPER = "whisper"
+CHANNEL_PIPELINE = "pipeline"
+
+
 class _LogBus:
+    """Fan-out log bus with per-channel subscriptions.
+
+    Subscribers registered via subscribe() take (level, message) and may filter
+    to a set of channels. subscribe_all() takes (level, message, channel) and
+    always sees everything — that is what the debug window uses.
+    """
+
     def __init__(self):
         self._subscribers = []
 
-    def subscribe(self, fn):
-        self._subscribers.append(fn)
+    def subscribe(self, fn, channels: Optional[Sequence[str]] = None):
+        """Subscribe to `channels` (all channels when None)."""
+        entry = (fn, frozenset(channels) if channels else None, False)
+        self._subscribers.append(entry)
 
         def _unsub():
             try:
-                self._subscribers.remove(fn)
+                self._subscribers.remove(entry)
             except ValueError:
                 pass
 
         return _unsub
 
-    def emit(self, level, msg):
-        for fn in list(self._subscribers):
-            fn(level, msg)
+    def subscribe_all(self, fn):
+        """Subscribe to every channel with the channel name passed through."""
+        entry = (fn, None, True)
+        self._subscribers.append(entry)
+
+        def _unsub():
+            try:
+                self._subscribers.remove(entry)
+            except ValueError:
+                pass
+
+        return _unsub
+
+    def emit(self, level, msg, channel: str = CHANNEL_APP):
+        for fn, channels, wants_channel in list(self._subscribers):
+            if channels is not None and channel not in channels:
+                continue
+            if wants_channel:
+                fn(level, msg, channel)
+            else:
+                fn(level, msg)
 
 
 log_bus = _LogBus()
@@ -59,9 +97,12 @@ def extract_combo_code(var_value):
 class LogMixin:
     _log_text: scrolledtext.ScrolledText
     _log_max_lines: int = 2000
+    # Channel this widget emits on and subscribes to. Subclasses override it;
+    # the default keeps standalone LogMixin users on the shared app channel.
+    log_channel: str = CHANNEL_APP
 
     def _init_log_widget(self, parent, row=0, column=0, label="Log",
-                         height=10, max_lines=2000):
+                         height=10, max_lines=2000, channels=None):
         frame = tk.LabelFrame(parent, text=label)
         frame.grid(row=row, column=column, sticky=(tk.W, tk.E, tk.N, tk.S), padx=5, pady=5)
         frame.columnconfigure(0, weight=1)
@@ -78,13 +119,18 @@ class LogMixin:
         self._log_text.tag_config("SUCCESS", foreground="green")
         self._log_text.tag_config("WARNING", foreground="orange")
 
-        self._log_unsub = log_bus.subscribe(self._log_bus_handler)
+        # Subscribe to this widget's own channel only, so a tab shows its own
+        # subsystem's traffic. `channels` overrides it for widgets that need to
+        # watch more than one (the Server tab also carries app-level notices).
+        self._log_channels = tuple(channels) if channels else (self.log_channel,)
+        self._log_unsub = log_bus.subscribe(
+            self._log_bus_handler, channels=self._log_channels)
 
     def _log_bus_handler(self, level, message):
         self.winfo_toplevel().after(0, lambda: self._insert_log(level, message))
 
     def _log(self, level, message):
-        log_bus.emit(level, message)
+        log_bus.emit(level, message, self.log_channel)
 
     def _insert_log(self, level, message):
         timestamp = datetime.now().strftime("%H:%M:%S")

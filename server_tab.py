@@ -13,7 +13,7 @@ from datetime import datetime
 
 import psutil
 
-from ui_helpers import LogMixin
+from ui_helpers import CHANNEL_APP, CHANNEL_SERVER, LogMixin
 
 
 TRANSLATION_PRESET = {
@@ -53,6 +53,8 @@ LONG_CONTEXT_PRESET = {
 
 
 class ServerTab(LogMixin, ttk.Frame):
+    log_channel = CHANNEL_SERVER
+
     def __init__(self, parent, server_controller, models_registry,
                  config_manager, base_dir, on_model_selected=None,
                  on_server_state_changed=None):
@@ -214,8 +216,11 @@ class ServerTab(LogMixin, ttk.Frame):
             control_frame, text="\u25CF \u672A\u904B\u884C", font=("Arial", 10))
         self.status_label.grid(row=0, column=3, padx=20)
 
+        # The server log also carries app-level notices (model scan results),
+        # which the Main tab has no log widget of its own to show.
         self._init_log_widget(main_frame, row=4, column=0,
-                              label="\U0001F4CB \u904B\u884C\u65E5\u8A8C", height=15, max_lines=1000)
+                              label="\U0001F4CB \u904B\u884C\u65E5\u8A8C", height=15, max_lines=1000,
+                              channels=(CHANNEL_SERVER, CHANNEL_APP))
 
         self.resource_label = ttk.Label(
             main_frame,
@@ -303,11 +308,20 @@ class ServerTab(LogMixin, ttk.Frame):
         for key, value in values.items():
             self._config.set(f"server.{key}", value)
 
+        # Bind the translation worker count to the slot count this preset asks
+        # for. The two settings live in different tabs and used to drift: the
+        # default of 3 workers against a 1-slot server queues two of every three
+        # requests, which reads as parallel in the log and is serial in fact.
+        # A preset is a statement about how the server will be run, so it is the
+        # right place to bring the client's side of that pairing along.
+        self._config.set("ui.max_workers", values["parallel"])
+
         self.log(
             "INFO",
             f"已套用{name}: ctx={values['context_size']}, "
             f"slots={values['parallel']}, "
-            f"KV={values['cache_type_k']}/{values['cache_type_v']}"
+            f"KV={values['cache_type_k']}/{values['cache_type_v']}, "
+            f"翻譯 workers={values['parallel']}"
         )
 
     # -------------------------------------------------------- Server control

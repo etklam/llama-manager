@@ -183,8 +183,11 @@ class PipelineCard(ttk.LabelFrame):
         color = "red" if msg.startswith("Error") else "blue"
         self.winfo_toplevel().after(0, lambda: self._pipe_status_label.config(
             text=msg, foreground=color))
+        # One emission is enough: _on_log publishes on CHANNEL_PIPELINE and the
+        # debug window subscribes to all channels. Re-emitting through the legacy
+        # debug callback duplicates every line in Debug and, because that path
+        # defaults to CHANNEL_APP, also leaks pipeline progress into Server.
         self._on_log("INFO", msg)
-        self._on_debug_log(msg)
 
     def _pipeline_done(self, stopped=False):
         self.winfo_toplevel().after(0, lambda: self._update_pipeline_done(stopped))

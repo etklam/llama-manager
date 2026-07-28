@@ -52,7 +52,13 @@ DEFAULT_MAX_WORKERS = 3
 # budget times the line count, floored so tiny batches still have headroom and
 # capped by the user's configured max_tokens.
 PER_LINE_TOKEN_BUDGET = 160  # conservative tokens per subtitle line (one field)
-MIN_DYNAMIC_MAX_TOKENS = 512
+# The floor covers 1-3 line requests, which is also where single-line retries
+# and short files land. A chatty local model spends its first few hundred tokens
+# on a preamble before emitting the YAML, so a floor that only just fits the
+# translation itself truncates the answer before it starts. This is generous for
+# one line on purpose: the cost of over-reserving is a slightly larger KV
+# allocation, while the cost of under-reserving is a failed line.
+MIN_DYNAMIC_MAX_TOKENS = 1024
 
 # Soft ceiling for a single source cue on the translation path. A spoken
 # subtitle line rarely runs past a couple hundred characters, so anything well

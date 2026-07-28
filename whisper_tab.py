@@ -20,11 +20,14 @@ from whisper_transcription import (
 )
 
 from constants import SUPPORTED_MEDIA, WHISPER_LANGUAGES
-from ui_helpers import LogMixin, populate_language_combo, extract_combo_code
+from ui_helpers import (
+    CHANNEL_WHISPER, LogMixin, populate_language_combo, extract_combo_code,
+)
 from file_listbox import FileListbox
 
 
 class WhisperTab(LogMixin, ttk.Frame):
+    log_channel = CHANNEL_WHISPER
 
     def __init__(self, parent, config_manager, get_whisper_models,
                  scan_whisper_models, on_srt_generated, transcriber=None):

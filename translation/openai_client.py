@@ -13,6 +13,7 @@ from tenacity import (
     retry,
     stop_after_attempt,
     wait_exponential,
+    retry_if_not_exception_type,
     before_sleep_log,
     RetryError
 )
@@ -83,9 +84,15 @@ class OpenAIClient:
 
         return self._client
 
+    # Retries exist for transient faults (connection drops, rate limits). A
+    # length stop is not transient: the same prompt at the same temperature
+    # produces the same over-long generation, so re-sending it only adds the
+    # backoff delay before failing identically. Excluding it turns three
+    # identical failures per line into one.
     @retry(
         stop=stop_after_attempt(RETRY_NUMS),
         wait=wait_exponential(multiplier=1, min=RETRY_DELAY, max=10),
+        retry=retry_if_not_exception_type(LengthFinishReasonError),
         before_sleep=before_sleep_log(logger, logging.WARNING)
     )
     def complete(
@@ -138,10 +145,23 @@ class OpenAIClient:
         if not hasattr(response, 'choices') or not response.choices:
             raise RuntimeError(f'Invalid response - no choices: {response}')
 
-        if response.choices[0].finish_reason == 'length':
-            raise LengthFinishReasonError(completion=response)
-
         content = response.choices[0].message.content
+
+        # A truncated response is not automatically a failed one. Local models
+        # often prepend commentary and then emit the YAML we asked for, so by
+        # the time the token budget runs out there is usually a complete entry
+        # or two in hand. Returning that partial text lets the caller's parser
+        # salvage what arrived; discarding it here caused fully translated lines
+        # to fall back to their untranslated source. Only raise when nothing
+        # usable came back, since then there is genuinely nothing to parse.
+        if response.choices[0].finish_reason == 'length':
+            if content and content.strip():
+                logger.warning(
+                    '[OpenAIClient] Response hit the token limit; returning '
+                    'the partial content for parsing'
+                )
+                return content.strip()
+            raise LengthFinishReasonError(completion=response)
 
         if content is None:
             raise RuntimeError(

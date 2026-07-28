@@ -13,15 +13,22 @@ from tkinterdnd2 import DND_FILES
 
 from utils.srt_parser import parse_srt_from_file, generate_srt_from_list, output_path_for
 from translation.local_llm_translator import LocalLLMTranslator
+from translation.server_probe import (
+    clamp_workers, probe_server, unreachable_message,
+)
 
 from constants import SUPPORTED_SUBTITLE, TARGET_LANGUAGES, SOURCE_LANGUAGES
-from ui_helpers import LogMixin, populate_language_combo, extract_combo_code
+from ui_helpers import (
+    CHANNEL_TRANSLATE, LogMixin, populate_language_combo, extract_combo_code,
+)
 from config_helpers import build_translation_config
 from file_listbox import FileListbox
 
 
 class SubtitleTranslationTab(LogMixin, ttk.Frame):
     """GUI tab for batch subtitle translation."""
+
+    log_channel = CHANNEL_TRANSLATE
 
     def __init__(self, parent, get_port_callback, get_model_callback, config_manager=None):
         super().__init__(parent)
@@ -54,6 +61,23 @@ class SubtitleTranslationTab(LogMixin, ttk.Frame):
         """Refresh from current server model."""
         self._init_translator()
         self._update_model_display()
+        self._sync_workers_from_config()
+
+    def _sync_workers_from_config(self):
+        """Pull ui.max_workers back into the slider.
+
+        A Server-tab preset writes the slot count it configured into
+        ui.max_workers, but this tab only read that key when it was built, so the
+        slider kept showing a stale number until restart. This runs on tab
+        switch, which is the point where the user would look at it.
+        """
+        if not self._config_manager:
+            return
+        saved = self._config_manager.get("ui.max_workers", None)
+        if not isinstance(saved, int) or saved < 1:
+            return
+        self._workers_var.set(saved)
+        self._workers_label.config(text=str(saved))
 
     def load_file(self, filepath: str):
         """Load a single file into the file list."""
@@ -151,21 +175,32 @@ class SubtitleTranslationTab(LogMixin, ttk.Frame):
         ttk.Label(self._adv_frame, text="Batch Size:").grid(
             row=0, column=0, sticky=tk.W, padx=(0, 5))
         self._batch_var = tk.IntVar(value=saved_batch)
-        ttk.Scale(self._adv_frame, from_=1, to=50,
-                  variable=self._batch_var, orient=tk.HORIZONTAL,
-                  length=150).grid(row=0, column=1, sticky=tk.W)
-        ttk.Label(self._adv_frame, textvariable=self._batch_var).grid(
-            row=0, column=2, padx=(5, 20))
+        batch_scale = ttk.Scale(self._adv_frame, from_=1, to=50,
+                                variable=self._batch_var, orient=tk.HORIZONTAL,
+                                length=150)
+        batch_scale.grid(row=0, column=1, sticky=tk.W)
+        # A Scale writes doubles into its variable even when it is an IntVar, so
+        # a bound textvariable renders "23.548387096774196". Format for display
+        # and leave the var alone — IntVar.get() already truncates for us.
+        self._batch_label = ttk.Label(self._adv_frame, text=str(saved_batch))
+        self._batch_label.grid(row=0, column=2, padx=(5, 20))
+        batch_scale.configure(command=lambda v: self._batch_label.config(
+            text=str(int(float(v)))))
 
         # Row 0: Temperature
         ttk.Label(self._adv_frame, text="Temperature:").grid(
             row=0, column=3, sticky=tk.W, padx=(0, 5))
         self._temp_var = tk.DoubleVar(value=saved_temp)
-        ttk.Scale(self._adv_frame, from_=0.0, to=2.0,
-                  variable=self._temp_var, orient=tk.HORIZONTAL,
-                  length=150).grid(row=0, column=4, sticky=tk.W)
-        ttk.Label(self._adv_frame,
-                  textvariable=self._temp_var).grid(row=0, column=5, padx=5)
+        temp_scale = ttk.Scale(self._adv_frame, from_=0.0, to=2.0,
+                               variable=self._temp_var, orient=tk.HORIZONTAL,
+                               length=150)
+        temp_scale.grid(row=0, column=4, sticky=tk.W)
+        # Round for display only: bound straight to the DoubleVar, a drag shows
+        # the raw float ("0.36129032258064515") and swamps the row.
+        self._temp_label = ttk.Label(self._adv_frame, text=f"{saved_temp:.2f}")
+        self._temp_label.grid(row=0, column=5, padx=5)
+        temp_scale.configure(command=lambda v: self._temp_label.config(
+            text=f"{float(v):.2f}"))
 
         # Row 1: Max tokens
         ttk.Label(self._adv_frame, text="Max Tokens:").grid(
@@ -287,6 +322,19 @@ class SubtitleTranslationTab(LogMixin, ttk.Frame):
         if self._translating:
             return
 
+        # Read every Tk variable here, on the UI thread, and hand the plain dict
+        # to the worker: the preflight below runs off-thread, and Tk variables
+        # are not safe to touch from there.
+        config = build_translation_config(
+            self._config_manager, self._get_port(), self._get_model()
+        )
+        config['batch_size'] = self._batch_var.get()
+        config['temperature'] = self._temp_var.get()
+        config['max_tokens'] = self._tokens_var.get()
+        config['single_step'] = self._fast_mode_var.get()
+        requested_workers = int(float(self._workers_var.get()))
+        config['max_workers'] = requested_workers
+
         self._translating = True
         self._stop_requested = False
         self._start_btn.config(state="disabled")
@@ -295,27 +343,61 @@ class SubtitleTranslationTab(LogMixin, ttk.Frame):
         self._progress_var.set(0)
         self._clear_log()
 
-        # Update translator config
-        port = self._get_port()
-        config = build_translation_config(
-            self._config_manager, port, self._get_model()
-        )
-        config['batch_size'] = self._batch_var.get()
-        config['temperature'] = self._temp_var.get()
-        config['max_tokens'] = self._tokens_var.get()
-        config['max_workers'] = int(float(self._workers_var.get()))
-        config['single_step'] = self._fast_mode_var.get()
-        self._translator = LocalLLMTranslator(config)
-
         if self._config_manager:
             self._config_manager.set("ui.batch_size", config['batch_size'])
             self._config_manager.set("ui.temperature", config['temperature'])
             self._config_manager.set("ui.max_tokens", config['max_tokens'])
-            self._config_manager.set("ui.max_workers", config['max_workers'])
+            # Persist what the user asked for, not the value the clamp settles
+            # on: the clamp reflects the server that happens to be running now,
+            # and saving it would silently ratchet the slider down after one run
+            # against a single-slot server.
+            self._config_manager.set("ui.max_workers", requested_workers)
             self._config_manager.set("ui.single_step", config['single_step'])
 
-        thread = threading.Thread(target=self._run_translation, daemon=True)
+        thread = threading.Thread(
+            target=self._preflight_and_translate, args=(config,), daemon=True)
         thread.start()
+
+    def _preflight_and_translate(self, config: dict):
+        """Probe the server, then run the batch. Runs on the worker thread.
+
+        The probe is here rather than in _start_translation because it is a
+        network call: against a server that is down it costs about a second, and
+        on the UI thread that reads as the window locking up on the click.
+        """
+        # Without this check, an unreachable server is discovered one batch at a
+        # time: each batch spends three tenacity attempts with exponential
+        # backoff before failing, so a long SRT takes minutes to report what was
+        # knowable before the first request.
+        info = probe_server(config['api_url'])
+        if not info.reachable:
+            message = unreachable_message(config['api_url'], info)
+            self._log("ERROR", message)
+            self.winfo_toplevel().after(0, lambda: (
+                messagebox.showerror("Server not reachable", message),
+                self._on_translation_aborted(),
+            ))
+            return
+
+        # Align client concurrency with the server's real slot count. Each worker
+        # holds one request open and llama-server runs at most total_slots of
+        # them at once, so workers beyond that simply queue: throughput equal to
+        # one worker, while the log claims parallelism.
+        workers, note = clamp_workers(config['max_workers'], info)
+        config['max_workers'] = workers
+        if note:
+            self._log("WARNING", note)
+
+        self._translator = LocalLLMTranslator(config)
+        self._run_translation()
+
+    def _on_translation_aborted(self):
+        """Return the controls to idle after a run that never started."""
+        self._translating = False
+        self._start_btn.config(state="normal")
+        self._stop_btn.config(state="disabled")
+        self._file_listbox.config(state="normal")
+        self._progress_label.config(text="Ready")
 
     def _stop_translation(self):
         self._stop_requested = True

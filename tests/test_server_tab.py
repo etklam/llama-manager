@@ -103,6 +103,31 @@ class TestServerPresets:
         for key, value in TRANSLATION_PRESET.items():
             assert tab._config.get(f"server.{key}") == value
 
+    def test_preset_binds_translation_workers_to_slot_count(self, tmp_path):
+        """A preset configures both sides of the concurrency pairing.
+
+        The worker count lives on the Subtitle tab and the slot count here, so
+        they used to drift: the default 3 workers against a 1-slot server queues
+        two of every three requests, which reads as parallel in the log while
+        being serial in fact.
+        """
+        tab = _make_tab(tmp_path / "model.gguf")
+
+        tab._apply_long_context_preset()
+
+        assert tab._config.get("server.parallel") == 1
+        assert tab._config.get("ui.max_workers") == 1
+
+    def test_each_preset_keeps_workers_equal_to_slots(self, tmp_path):
+        for apply_name, preset in (
+            ("_apply_translation_preset", TRANSLATION_PRESET),
+            ("_apply_chat_preset", CHAT_PRESET),
+            ("_apply_long_context_preset", LONG_CONTEXT_PRESET),
+        ):
+            tab = _make_tab(tmp_path / "model.gguf")
+            getattr(tab, apply_name)()
+            assert tab._config.get("ui.max_workers") == preset["parallel"]
+
     def test_chat_preset_updates_fields_and_config(self, tmp_path):
         tab = _make_tab(tmp_path / "model.gguf")
 

@@ -21,7 +21,7 @@ from server_controller import ServerController
 from model_registry import ModelRegistry
 from whisper_model_registry import WhisperModelRegistry
 # constants imported indirectly by pipeline_card, server_tab, etc.
-from ui_helpers import LogMixin, log_bus
+from ui_helpers import CHANNEL_APP, CHANNEL_PIPELINE, LogMixin, log_bus
 
 class LlamaManager(LogMixin):
     def __init__(self, root):
@@ -160,7 +160,10 @@ class LlamaManager(LogMixin):
             get_port=lambda: self.server_tab.port_var.get(),
             get_current_model=self.get_current_model,
             get_whisper_models=self.get_whisper_models,
-            on_log=lambda level, msg: self.log(level, msg),
+            # Pipeline runs emit whisper diagnostics and per-line translation
+            # logs on their own channel: the card's status label is the visible
+            # feedback, and the debug window has the full detail when wanted.
+            on_log=lambda level, msg: log_bus.emit(level, msg, CHANNEL_PIPELINE),
             on_debug_log=self._debug_log,
         )
         self.pipeline_card.grid(row=0, column=1, sticky=(tk.W, tk.E, tk.N, tk.S), padx=(5, 0))
@@ -247,7 +250,9 @@ class LlamaManager(LogMixin):
         self._debug_text.pack(fill=tk.BOTH, expand=True)
         self._debug_text.tag_config("ERROR", foreground="red")
         self._debug_text.tag_config("WARNING", foreground="orange")
-        self._debug_unsub = log_bus.subscribe(self._debug_subscriber)
+        # The debug window is the one sink that sees every channel, so it stays
+        # the place to watch a whole run end to end.
+        self._debug_unsub = log_bus.subscribe_all(self._debug_subscriber)
 
     def _close_debug_win(self):
         if getattr(self, "_debug_unsub", None):
@@ -273,10 +278,10 @@ class LlamaManager(LogMixin):
             level = "INFO"
         log_bus.emit(level, message)
 
-    def _debug_subscriber(self, level, message):
+    def _debug_subscriber(self, level, message, channel=CHANNEL_APP):
         # ponytail: marshal onto Tk thread; reuse existing _debug_insert formatter
         timestamp = datetime.now().strftime("%H:%M:%S")
-        line = f"[{timestamp}] [{level}] {message}\n"
+        line = f"[{timestamp}] [{level}] [{channel}] {message}\n"
         self.root.after(0, lambda: self._debug_insert(line, level))
 
     def _debug_insert(self, line, level):

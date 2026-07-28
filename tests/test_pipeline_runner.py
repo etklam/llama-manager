@@ -9,6 +9,7 @@ from unittest.mock import Mock, MagicMock, patch, call
 import pytest
 
 from pipeline_runner import PipelineRunner, SUPPORTED_MEDIA
+from translation.server_probe import ServerInfo
 from whisper_transcription import Cancelled, Completed
 
 
@@ -24,6 +25,20 @@ def config_manager(tmp_path):
     cm = ConfigManager(str(config_file))
     cm.load()
     return cm
+
+
+@pytest.fixture(autouse=True)
+def reachable_server():
+    """Make the preflight probe succeed for tests about later stages.
+
+    run() now probes llama-server before touching any file, so without this every
+    test would exercise nothing but the early return. Tests that care about the
+    preflight itself patch probe_server themselves.
+    """
+    from translation.server_probe import ServerInfo
+    with patch('pipeline_runner.probe_server',
+               return_value=ServerInfo(reachable=True, slots=4)) as probe:
+        yield probe
 
 
 @pytest.fixture
@@ -595,3 +610,285 @@ class TestTranslationConfig:
         translator_call_config = mock_translator_cls.call_args[0][0]
         assert translator_call_config['batch_size'] == 25
         assert translator_call_config['temperature'] == 0.5
+
+
+# ---------------------------------------------------------------------------
+# Preflight probe
+# ---------------------------------------------------------------------------
+
+class TestPreflight:
+
+    @patch('pipeline_runner.LocalLLMTranslator')
+    @patch('pipeline_runner.parse_srt_from_file')
+    def test_unreachable_server_stops_before_any_file(
+        self, mock_parse, mock_translator_cls, runner, callbacks, reachable_server
+    ):
+        """An unreachable server must abort the run, not translate file by file.
+
+        Without the preflight this ran the whole batch, spending three tenacity
+        retries per batch on a server that was never going to answer.
+        """
+        reachable_server.return_value = ServerInfo(
+            reachable=False, error="ConnectError: refused")
+
+        runner.run(
+            files=['/test/a.srt', '/test/b.srt'],
+            target_lang='zh-cn',
+            language='en',
+            replace_original=False,
+            whisper_cli_path=Path('whisper-cli.exe'),
+            whisper_model_name='tiny',
+            whisper_model_dir='/models',
+        )
+
+        mock_parse.assert_not_called()
+        mock_translator_cls.assert_not_called()
+
+    def test_unreachable_server_does_not_report_success(
+        self, runner, callbacks, reachable_server
+    ):
+        """A failed preflight must not finish as a clean run.
+
+        on_done(stopped=False) makes the pipeline card paint a green "All done!"
+        over the error it just showed.
+        """
+        reachable_server.return_value = ServerInfo(
+            reachable=False, error="ConnectError: refused")
+
+        runner.run(
+            files=['/test/a.srt'],
+            target_lang='zh-cn',
+            language='en',
+            replace_original=False,
+            whisper_cli_path=Path('whisper-cli.exe'),
+            whisper_model_name='tiny',
+            whisper_model_dir='/models',
+        )
+
+        callbacks['on_done'].assert_called_once_with(stopped=True)
+
+    @patch('pipeline_runner.generate_srt_from_list', return_value="srt output")
+    @patch('pipeline_runner.LocalLLMTranslator')
+    @patch('pipeline_runner.parse_srt_from_file')
+    @patch('pathlib.Path.write_text', MagicMock())
+    def test_unreachable_server_skips_whisper_too(
+        self, mock_parse, mock_translator_cls, mock_generate,
+        runner, callbacks, reachable_server
+    ):
+        """Media files must not be transcribed when translation cannot follow.
+
+        Probing after Whisper would mean waiting out a full transcription before
+        learning the server was never up.
+        """
+        reachable_server.return_value = ServerInfo(reachable=False, error="down")
+        runner._run_whisper = Mock()
+
+        runner.run(
+            files=['/test/video.mp4'],
+            target_lang='zh-cn',
+            language='en',
+            replace_original=False,
+            whisper_cli_path=Path('whisper-cli.exe'),
+            whisper_model_name='tiny',
+            whisper_model_dir='/models',
+        )
+
+        runner._run_whisper.assert_not_called()
+
+    @patch('pipeline_runner.generate_srt_from_list', return_value="srt output")
+    @patch('pipeline_runner.LocalLLMTranslator')
+    @patch('pipeline_runner.parse_srt_from_file')
+    @patch('pathlib.Path.write_text', MagicMock())
+    def test_probed_once_per_run_not_per_file(
+        self, mock_parse, mock_translator_cls, mock_generate,
+        runner, callbacks, reachable_server
+    ):
+        mock_parse.return_value = [
+            {'line': 1, 'text': 'Hello', 'time': '00:00:00,000 --> 00:00:01,000'}
+        ]
+        mock_translator_cls.return_value.translate_srt.return_value = [
+            {'line': 1, 'text': 'Translated', 'time': '00:00:00,000 --> 00:00:01,000'}
+        ]
+
+        runner.run(
+            files=['/test/a.srt', '/test/b.srt', '/test/c.srt'],
+            target_lang='zh-cn',
+            language='en',
+            replace_original=False,
+            whisper_cli_path=Path('whisper-cli.exe'),
+            whisper_model_name='tiny',
+            whisper_model_dir='/models',
+        )
+
+        assert reachable_server.call_count == 1
+
+
+# ---------------------------------------------------------------------------
+# Worker clamping against reported slots
+# ---------------------------------------------------------------------------
+
+class TestWorkerClamping:
+
+    @patch('pipeline_runner.generate_srt_from_list', return_value="srt output")
+    @patch('pipeline_runner.LocalLLMTranslator')
+    @patch('pipeline_runner.parse_srt_from_file')
+    @patch('pathlib.Path.write_text', MagicMock())
+    def test_workers_clamped_to_reported_slots(
+        self, mock_parse, mock_translator_cls, mock_generate,
+        config_manager, callbacks, reachable_server
+    ):
+        """3 workers against a 1-slot server is 1 worker's throughput.
+
+        The requests queue server-side, so the extra workers only make the log
+        claim parallelism the server is not providing.
+        """
+        config_manager.set('ui.max_workers', 3)
+        reachable_server.return_value = ServerInfo(reachable=True, slots=1)
+
+        mock_parse.return_value = [
+            {'line': 1, 'text': 'Hello', 'time': '00:00:00,000 --> 00:00:01,000'}
+        ]
+        mock_translator_cls.return_value.translate_srt.return_value = [
+            {'line': 1, 'text': 'Translated', 'time': '00:00:00,000 --> 00:00:01,000'}
+        ]
+
+        runner = PipelineRunner(
+            config_manager=config_manager,
+            get_port=lambda: 8080,
+            get_current_model=lambda: 'test-model',
+            resolve_whisper_model_path=lambda d, n: n,
+            get_whisper_models=lambda: [],
+            on_log=callbacks['on_log'],
+            on_progress=callbacks['on_progress'],
+            on_done=callbacks['on_done'],
+        )
+        runner.run(
+            files=['/test/a.srt'],
+            target_lang='zh-cn',
+            language='en',
+            replace_original=False,
+            whisper_cli_path=Path('whisper-cli.exe'),
+            whisper_model_name='tiny',
+            whisper_model_dir='',
+        )
+
+        assert mock_translator_cls.call_args[0][0]['max_workers'] == 1
+
+    @patch('pipeline_runner.generate_srt_from_list', return_value="srt output")
+    @patch('pipeline_runner.LocalLLMTranslator')
+    @patch('pipeline_runner.parse_srt_from_file')
+    @patch('pathlib.Path.write_text', MagicMock())
+    def test_workers_untouched_when_slots_unknown(
+        self, mock_parse, mock_translator_cls, mock_generate,
+        config_manager, callbacks, reachable_server
+    ):
+        """An older build reporting no total_slots must not serialize the client."""
+        config_manager.set('ui.max_workers', 3)
+        reachable_server.return_value = ServerInfo(reachable=True, slots=None)
+
+        mock_parse.return_value = [
+            {'line': 1, 'text': 'Hello', 'time': '00:00:00,000 --> 00:00:01,000'}
+        ]
+        mock_translator_cls.return_value.translate_srt.return_value = [
+            {'line': 1, 'text': 'Translated', 'time': '00:00:00,000 --> 00:00:01,000'}
+        ]
+
+        runner = PipelineRunner(
+            config_manager=config_manager,
+            get_port=lambda: 8080,
+            get_current_model=lambda: 'test-model',
+            resolve_whisper_model_path=lambda d, n: n,
+            get_whisper_models=lambda: [],
+            on_log=callbacks['on_log'],
+            on_progress=callbacks['on_progress'],
+            on_done=callbacks['on_done'],
+        )
+        runner.run(
+            files=['/test/a.srt'],
+            target_lang='zh-cn',
+            language='en',
+            replace_original=False,
+            whisper_cli_path=Path('whisper-cli.exe'),
+            whisper_model_name='tiny',
+            whisper_model_dir='',
+        )
+
+        assert mock_translator_cls.call_args[0][0]['max_workers'] == 3
+
+
+# ---------------------------------------------------------------------------
+# Translator reuse across files
+# ---------------------------------------------------------------------------
+
+class TestTranslatorReuse:
+
+    @patch('pipeline_runner.generate_srt_from_list', return_value="srt output")
+    @patch('pipeline_runner.LocalLLMTranslator')
+    @patch('pipeline_runner.parse_srt_from_file')
+    @patch('pathlib.Path.write_text', MagicMock())
+    def test_translator_built_once_for_many_files(
+        self, mock_parse, mock_translator_cls, mock_generate, runner, callbacks
+    ):
+        """One translator for the batch keeps the HTTP connection warm.
+
+        A per-file translator meant a new OpenAI client and a new TCP connection
+        for every file, all pointed at the same local server.
+        """
+        mock_parse.return_value = [
+            {'line': 1, 'text': 'Hello', 'time': '00:00:00,000 --> 00:00:01,000'}
+        ]
+        mock_translator_cls.return_value.translate_srt.return_value = [
+            {'line': 1, 'text': 'Translated', 'time': '00:00:00,000 --> 00:00:01,000'}
+        ]
+
+        runner.run(
+            files=['/test/a.srt', '/test/b.srt', '/test/c.srt'],
+            target_lang='zh-cn',
+            language='en',
+            replace_original=False,
+            whisper_cli_path=Path('whisper-cli.exe'),
+            whisper_model_name='tiny',
+            whisper_model_dir='/models',
+        )
+
+        assert mock_translator_cls.return_value.translate_srt.call_count == 3
+        assert mock_translator_cls.call_count == 1
+
+    @patch('pipeline_runner.generate_srt_from_list', return_value="srt output")
+    @patch('pipeline_runner.LocalLLMTranslator')
+    @patch('pipeline_runner.parse_srt_from_file')
+    @patch('pathlib.Path.write_text', MagicMock())
+    def test_translator_rebuilt_when_model_changes(
+        self, mock_parse, mock_translator_cls, mock_generate,
+        config_manager, callbacks
+    ):
+        """Reuse must not outlive the config it was built from."""
+        mock_parse.return_value = [
+            {'line': 1, 'text': 'Hello', 'time': '00:00:00,000 --> 00:00:01,000'}
+        ]
+        mock_translator_cls.return_value.translate_srt.return_value = [
+            {'line': 1, 'text': 'Translated', 'time': '00:00:00,000 --> 00:00:01,000'}
+        ]
+
+        models = iter(['model-a', 'model-b'])
+        runner = PipelineRunner(
+            config_manager=config_manager,
+            get_port=lambda: 8080,
+            get_current_model=lambda: next(models),
+            resolve_whisper_model_path=lambda d, n: n,
+            get_whisper_models=lambda: [],
+            on_log=callbacks['on_log'],
+            on_progress=callbacks['on_progress'],
+            on_done=callbacks['on_done'],
+        )
+        runner.run(
+            files=['/test/a.srt', '/test/b.srt'],
+            target_lang='zh-cn',
+            language='en',
+            replace_original=False,
+            whisper_cli_path=Path('whisper-cli.exe'),
+            whisper_model_name='tiny',
+            whisper_model_dir='',
+        )
+
+        assert mock_translator_cls.call_count == 2

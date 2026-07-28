@@ -15,6 +15,7 @@ import pytest
 from translation.local_llm_translator import (
     LocalLLMTranslator,
     DEFAULT_BATCH_SIZE,
+    MIN_DYNAMIC_MAX_TOKENS,
 )
 
 
@@ -533,16 +534,18 @@ class TestDynamicMaxTokens:
         fake.complete = _complete
 
         # Large ceiling, small batch: dynamic value must stay well under it.
+        # 20 lines keeps the raw budget above the floor so this test measures
+        # the per-line sizing rather than MIN_DYNAMIC_MAX_TOKENS.
         config = _full_config(
-            max_tokens=16384, batch_size=5, max_workers=1, single_step=True
+            max_tokens=16384, batch_size=20, max_workers=1, single_step=True
         )
         translator = LocalLLMTranslator(config, client=fake)
 
-        translator.translate_srt(_make_srt_data(5), 'zh-cn')
+        translator.translate_srt(_make_srt_data(20), 'zh-cn')
 
         assert captured['max_tokens'] < 16384
-        # 5 lines x 160 tokens (single-step) = 800, floored at 512 -> 800.
-        assert captured['max_tokens'] == 800
+        # 20 lines x 160 tokens (single-step) = 3200, above the floor.
+        assert captured['max_tokens'] == 3200
 
     def test_dynamic_max_tokens_capped_by_user_ceiling(self):
         """The dynamic budget never exceeds the user-configured max_tokens."""
@@ -557,8 +560,17 @@ class TestDynamicMaxTokens:
         config = _full_config(max_tokens=16384, single_step=True)
         translator = LocalLLMTranslator(config, client=FakeLLMClient())
 
-        # 1 line x 160 = 160, floored to MIN_DYNAMIC_MAX_TOKENS (512).
-        assert translator._dynamic_max_tokens(1) == 512
+        # 1 line x 160 = 160, floored to MIN_DYNAMIC_MAX_TOKENS.
+        assert translator._dynamic_max_tokens(1) == MIN_DYNAMIC_MAX_TOKENS
+
+    def test_single_line_floor_leaves_room_for_model_preamble(self):
+        """The floor must exceed what the translation alone needs.
+
+        A single-line request budgeted down to just the answer truncates local
+        models that emit a preamble before the YAML, which surfaced as every
+        single-line call failing with a length stop at exactly the floor.
+        """
+        assert MIN_DYNAMIC_MAX_TOKENS >= 1024
 
     def test_two_step_budgets_double_of_single_step(self):
         """Two-step emits step1+step2, so it needs roughly double the budget."""

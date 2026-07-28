@@ -193,5 +193,100 @@ class TestOpenAIClientComplete:
         assert mock_client.chat.completions.create.call_count == 2
 
 
+def _truncated_response(content):
+    """Build a response that stopped because it hit the token limit."""
+    response = MagicMock()
+    response.choices = [MagicMock()]
+    response.choices[0].message.content = content
+    response.choices[0].finish_reason = 'length'
+    return response
+
+
+class TestTruncatedResponseHandling:
+    """A length stop keeps whatever usable text arrived.
+
+    Local models often emit a preamble before the YAML we asked for, so a
+    request that runs out of budget usually still contains complete entries.
+    Discarding that text made fully translated lines fall back to their
+    untranslated source, and retrying it only repeated an identical failure
+    because generation is deterministic at a fixed temperature.
+    """
+
+    @patch('translation.openai_client.OpenAI')
+    def test_partial_content_is_returned_for_parsing(self, mock_openai):
+        mock_client = MagicMock()
+        mock_openai.return_value = mock_client
+        mock_client.chat.completions.create.return_value = _truncated_response(
+            "- id: 1\n  translation: 完整的一行"
+        )
+
+        result = OpenAIClient(
+            api_url="http://localhost:8080/v1", model="m"
+        ).complete(
+            messages=[{'role': 'user', 'content': 'Test'}],
+            model="m", max_tokens=1024, temperature=0.2,
+        )
+
+        assert result == "- id: 1\n  translation: 完整的一行"
+
+    @patch('translation.openai_client.OpenAI')
+    def test_truncation_is_not_retried(self, mock_openai):
+        mock_client = MagicMock()
+        mock_openai.return_value = mock_client
+        mock_client.chat.completions.create.return_value = _truncated_response(
+            "- id: 1\n  translation: 部分"
+        )
+
+        OpenAIClient(api_url="http://localhost:8080/v1", model="m").complete(
+            messages=[{'role': 'user', 'content': 'Test'}],
+            model="m", max_tokens=1024, temperature=0.2,
+        )
+
+        assert mock_client.chat.completions.create.call_count == 1
+
+    @patch('translation.openai_client.OpenAI')
+    def test_empty_truncated_response_still_raises_without_retrying(
+        self, mock_openai
+    ):
+        """Nothing usable came back, so there is genuinely nothing to parse.
+
+        It still must not retry: the identical prompt would truncate again.
+        """
+        from openai import LengthFinishReasonError
+
+        mock_client = MagicMock()
+        mock_openai.return_value = mock_client
+        mock_client.chat.completions.create.return_value = _truncated_response('   ')
+
+        with pytest.raises(LengthFinishReasonError):
+            OpenAIClient(api_url="http://localhost:8080/v1", model="m").complete(
+                messages=[{'role': 'user', 'content': 'Test'}],
+                model="m", max_tokens=1024, temperature=0.2,
+            )
+
+        assert mock_client.chat.completions.create.call_count == 1
+
+    @patch('translation.openai_client.OpenAI')
+    def test_transient_errors_are_still_retried(self, mock_openai):
+        """Excluding length stops must not disable retries in general."""
+        mock_client = MagicMock()
+        mock_openai.return_value = mock_client
+        mock_client.chat.completions.create.side_effect = [
+            Exception('Connection reset'),
+            MagicMock(choices=[MagicMock(
+                message=MagicMock(content='ok'), finish_reason='stop')]),
+        ]
+
+        result = OpenAIClient(
+            api_url="http://localhost:8080/v1", model="m"
+        ).complete(
+            messages=[{'role': 'user', 'content': 'Test'}],
+            model="m", max_tokens=1024, temperature=0.2,
+        )
+
+        assert result == 'ok'
+        assert mock_client.chat.completions.create.call_count == 2
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "--tb=short"])
