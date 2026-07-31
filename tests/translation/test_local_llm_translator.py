@@ -21,6 +21,7 @@ if PROJECT_ROOT not in sys.path:
 
 # This import will FAIL because the module doesn't exist yet - this is expected in TDD!
 from translation.local_llm_translator import LocalLLMTranslator
+from utils.srt_parser import Cue
 
 
 def _full_config(**overrides):
@@ -192,23 +193,25 @@ class TestSRTFormatTranslation:
         translator = LocalLLMTranslator(config)
 
         srt_data = [
-            {'text': 'Hello', 'time': '00:00:01,000 --> 00:00:02,000', 'line': 1},
-            {'text': 'See you later', 'time': '00:00:03,000 --> 00:00:04,000', 'line': 2},
+            Cue(line=1, start_time=1000, end_time=2000, text='Hello'),
+            Cue(line=2, start_time=3000, end_time=4000, text='See you later'),
         ]
 
         result = translator.translate_srt(srt_data, target_language='French')
 
         # Verify timestamps are preserved
-        assert result[0]['time'] == '00:00:01,000 --> 00:00:02,000'
-        assert result[1]['time'] == '00:00:03,000 --> 00:00:04,000'
+        assert result[0].start_time == 1000
+        assert result[0].end_time == 2000
+        assert result[1].start_time == 3000
+        assert result[1].end_time == 4000
 
         # Verify line numbers are preserved
-        assert result[0]['line'] == 1
-        assert result[1]['line'] == 2
+        assert result[0].line == 1
+        assert result[1].line == 2
 
         # Verify text is translated
-        assert 'Bonjour' in result[0]['text']
-        assert 'tout à l\'heure' in result[1]['text']
+        assert 'Bonjour' in result[0].text
+        assert 'tout à l\'heure' in result[1].text
 
     @patch('translation.openai_client.OpenAI')
     def test_translate_srt_empty_list(self, mock_openai):

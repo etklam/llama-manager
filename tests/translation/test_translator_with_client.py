@@ -5,6 +5,7 @@ These tests verify dependency injection works correctly.
 import pytest
 from translation.local_llm_translator import LocalLLMTranslator
 from translation.llm_client import LLMClient
+from utils.srt_parser import Cue
 
 
 def _full_config(**overrides):
@@ -114,14 +115,15 @@ class TestTranslatorWithInjectedClient:
         translator = LocalLLMTranslator(config, client=fake_client)
 
         srt_data = [
-            {'text': 'Hello', 'time': '00:00:01,000 --> 00:00:02,000', 'line': 1},
+            Cue(line=1, start_time=1000, end_time=2000, text='Hello'),
         ]
 
         result = translator.translate_srt(srt_data, target_language="zh-cn")
 
         assert len(result) == 1
-        assert result[0]['text'] == '意译'
-        assert result[0]['time'] == '00:00:01,000 --> 00:00:02,000'
+        assert result[0].text == '意译'
+        assert result[0].start_time == 1000
+        assert result[0].end_time == 2000
         assert fake_client.call_count == 1
 
     def test_translator_backward_compatibility(self):
@@ -132,10 +134,9 @@ class TestTranslatorWithInjectedClient:
         # Should not raise an error
         translator = LocalLLMTranslator(config)
 
-        # The translator should have created an internal client
+        # The translator should have created an internal client lazily
         assert translator._injected_client is None
         assert translator._openai_client is None  # Not created yet (lazy)
-        assert translator._client is None  # Legacy client also lazy
 
 
 if __name__ == "__main__":

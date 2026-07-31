@@ -9,6 +9,7 @@ from unittest.mock import Mock, MagicMock, patch, call
 import pytest
 
 from pipeline_runner import PipelineRunner, SUPPORTED_MEDIA
+from translation.preflight import PreflightPlan
 from translation.server_probe import ServerInfo
 from whisper_transcription import Cancelled, Completed
 
@@ -29,16 +30,19 @@ def config_manager(tmp_path):
 
 @pytest.fixture(autouse=True)
 def reachable_server():
-    """Make the preflight probe succeed for tests about later stages.
+    """Make the preflight succeed for tests about later stages.
 
-    run() now probes llama-server before touching any file, so without this every
-    test would exercise nothing but the early return. Tests that care about the
-    preflight itself patch probe_server themselves.
+    run() now preflights llama-server before touching any file, so without this
+    every test would exercise nothing but the early return. Tests that care about
+    the preflight itself patch run_preflight themselves.
     """
-    from translation.server_probe import ServerInfo
-    with patch('pipeline_runner.probe_server',
-               return_value=ServerInfo(reachable=True, slots=4)) as probe:
-        yield probe
+    with patch('pipeline_runner.run_preflight',
+               return_value=PreflightPlan(
+                   reachable=True,
+                   workers=4,
+                   info=ServerInfo(reachable=True, slots=4),
+               )) as preflight:
+        yield preflight
 
 
 @pytest.fixture
@@ -161,9 +165,9 @@ class TestMediaFileWhisperThenTranslate:
     def test_media_file_runs_whisper_then_translates(
         self, mock_parse, mock_translator_cls, mock_generate, runner, callbacks
     ):
-        # Mock _run_whisper to return an SRT path immediately
+        # Mock _run_whisper to return the Committed SRT path immediately
         runner._run_whisper = Mock(
-            return_value=Completed(Path('/test/video.srt'))
+            return_value=Path('/test/video.srt')
         )
 
         # Set up translation
@@ -189,6 +193,52 @@ class TestMediaFileWhisperThenTranslate:
         runner._run_whisper.assert_called_once()
         mock_translator.translate_srt.assert_called_once()
         callbacks['on_done'].assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Chunking flag comes from the policy, not a bare config key
+# ---------------------------------------------------------------------------
+
+class TestChunkingFlagFromPolicy:
+
+    def _runner_with_spy(self, config_manager, callbacks, seen):
+        class SpyTranscriber:
+            def transcribe(self, request, cancellation, emit):
+                seen['request'] = request
+                return Completed(Path('/tmp/video.srt'))
+
+        return PipelineRunner(
+            config_manager=config_manager,
+            get_port=lambda: 8080,
+            get_current_model=lambda: 'test-model',
+            resolve_whisper_model_path=lambda d, n: n,
+            get_whisper_models=lambda: [],
+            on_log=callbacks['on_log'],
+            on_progress=callbacks['on_progress'],
+            on_done=callbacks['on_done'],
+            transcriber=SpyTranscriber(),
+        )
+
+    def test_run_whisper_asks_policy_for_flag_when_enabled(
+        self, config_manager, callbacks
+    ):
+        from whisper_policy import set_chunking_enabled
+
+        set_chunking_enabled(config_manager, True)
+        seen = {}
+        runner = self._runner_with_spy(config_manager, callbacks, seen)
+
+        runner._run_whisper('/test/video.mp4', Path('whisper-cli.exe'), 'tiny', 'en')
+
+        assert seen['request'].chunk_long_audio is True
+
+    def test_run_whisper_defaults_flag_off_via_policy(self, config_manager, callbacks):
+        seen = {}
+        runner = self._runner_with_spy(config_manager, callbacks, seen)
+
+        runner._run_whisper('/test/video.mp4', Path('whisper-cli.exe'), 'tiny', 'en')
+
+        assert seen['request'].chunk_long_audio is False
 
 
 # ---------------------------------------------------------------------------
@@ -628,8 +678,11 @@ class TestPreflight:
         Without the preflight this ran the whole batch, spending three tenacity
         retries per batch on a server that was never going to answer.
         """
-        reachable_server.return_value = ServerInfo(
-            reachable=False, error="ConnectError: refused")
+        reachable_server.return_value = PreflightPlan(
+            reachable=False,
+            workers=3,
+            note="llama-server 未回應",
+            info=ServerInfo(reachable=False, error="ConnectError: refused"))
 
         runner.run(
             files=['/test/a.srt', '/test/b.srt'],
@@ -652,8 +705,11 @@ class TestPreflight:
         on_done(stopped=False) makes the pipeline card paint a green "All done!"
         over the error it just showed.
         """
-        reachable_server.return_value = ServerInfo(
-            reachable=False, error="ConnectError: refused")
+        reachable_server.return_value = PreflightPlan(
+            reachable=False,
+            workers=3,
+            note="llama-server 未回應",
+            info=ServerInfo(reachable=False, error="ConnectError: refused"))
 
         runner.run(
             files=['/test/a.srt'],
@@ -680,7 +736,11 @@ class TestPreflight:
         Probing after Whisper would mean waiting out a full transcription before
         learning the server was never up.
         """
-        reachable_server.return_value = ServerInfo(reachable=False, error="down")
+        reachable_server.return_value = PreflightPlan(
+            reachable=False,
+            workers=3,
+            note="llama-server 未回應",
+            info=ServerInfo(reachable=False, error="down"))
         runner._run_whisper = Mock()
 
         runner.run(
@@ -743,7 +803,9 @@ class TestWorkerClamping:
         claim parallelism the server is not providing.
         """
         config_manager.set('ui.max_workers', 3)
-        reachable_server.return_value = ServerInfo(reachable=True, slots=1)
+        reachable_server.return_value = PreflightPlan(
+            reachable=True, workers=1, note="clamped",
+            info=ServerInfo(reachable=True, slots=1))
 
         mock_parse.return_value = [
             {'line': 1, 'text': 'Hello', 'time': '00:00:00,000 --> 00:00:01,000'}
@@ -784,7 +846,9 @@ class TestWorkerClamping:
     ):
         """An older build reporting no total_slots must not serialize the client."""
         config_manager.set('ui.max_workers', 3)
-        reachable_server.return_value = ServerInfo(reachable=True, slots=None)
+        reachable_server.return_value = PreflightPlan(
+            reachable=True, workers=3, note=None,
+            info=ServerInfo(reachable=True, slots=None))
 
         mock_parse.return_value = [
             {'line': 1, 'text': 'Hello', 'time': '00:00:00,000 --> 00:00:01,000'}
@@ -814,6 +878,43 @@ class TestWorkerClamping:
         )
 
         assert mock_translator_cls.call_args[0][0]['max_workers'] == 3
+
+    @patch('pipeline_runner.generate_srt_from_list', return_value="srt output")
+    @patch('pipeline_runner.LocalLLMTranslator')
+    @patch('pipeline_runner.parse_srt_from_file')
+    @patch('pathlib.Path.write_text', MagicMock())
+    def test_clamp_note_logged_once_per_run(
+        self, mock_parse, mock_translator_cls, mock_generate,
+        runner, callbacks, reachable_server
+    ):
+        """The plan formats the note once; the runner logs it once, not per file.
+
+        The note describes the clamp, which is identical for every file in a
+        run, so logging it per file would only pad the pipeline log.
+        """
+        note = "workers 3 → server 只有 1 slot，已調整為 1"
+        reachable_server.return_value = PreflightPlan(
+            reachable=True, workers=1, note=note,
+            info=ServerInfo(reachable=True, slots=1))
+
+        mock_parse.return_value = [
+            {'line': 1, 'text': 'Hello', 'time': '00:00:00,000 --> 00:00:01,000'}
+        ]
+        mock_translator_cls.return_value.translate_srt.return_value = [
+            {'line': 1, 'text': 'Translated', 'time': '00:00:00,000 --> 00:00:01,000'}
+        ]
+
+        runner.run(
+            files=['/test/a.srt', '/test/b.srt'],
+            target_lang='zh-cn',
+            language='en',
+            replace_original=False,
+            whisper_cli_path=Path('whisper-cli.exe'),
+            whisper_model_name='tiny',
+            whisper_model_dir='/models',
+        )
+
+        callbacks['on_log'].assert_called_once_with(note)
 
 
 # ---------------------------------------------------------------------------

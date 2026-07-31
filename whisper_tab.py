@@ -4,26 +4,52 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import threading
 from pathlib import Path
-from typing import Callable, Dict, List, Optional
 
 from tkinterdnd2 import DND_FILES
 
 from whisper_transcription import (
-    CancellationToken,
-    Cancelled,
-    Completed,
-    Failed,
-    TranscriptionEvent,
     TranscriptionRequest,
     WhisperTranscriber,
-    resolve_model_path,
 )
 
+from transcription_runner import TranscriptionPresenter, TranscriptionRunner
+
+from base_registry import BaseModelRegistry
 from constants import SUPPORTED_MEDIA, WHISPER_LANGUAGES
 from ui_helpers import (
     CHANNEL_WHISPER, LogMixin, populate_language_combo, extract_combo_code,
 )
 from file_listbox import FileListbox
+from whisper_policy import chunking_enabled, chunking_label, set_chunking_enabled
+
+
+class _WhisperTabPresenter(TranscriptionPresenter):
+    """Marshals the run loop's presentation onto this tab's widgets.
+
+    The loop runs on a worker thread; every widget update goes through the
+    Tk thread via after(0, ...).
+    """
+
+    def __init__(self, tab):
+        self._tab = tab
+
+    def log(self, level, message):
+        self._tab._log(level, message)
+
+    def status(self, message):
+        self._tab._schedule_ui(
+            lambda: self._tab._progress_label.config(text=message))
+
+    def progress(self, percent):
+        self._tab._schedule_ui(lambda: self._tab._progress_var.set(percent))
+
+    def srt_generated(self, filepath, srt_path):
+        self._tab._schedule_ui(
+            lambda: self._tab._on_srt_generated(srt_path))
+
+    def finished(self, stopped):
+        self._tab._schedule_ui(
+            lambda: self._tab._on_transcription_done(stopped))
 
 
 class WhisperTab(LogMixin, ttk.Frame):
@@ -36,15 +62,17 @@ class WhisperTab(LogMixin, ttk.Frame):
         self._get_whisper_models = get_whisper_models
         self._scan_whisper_models = scan_whisper_models
         self._on_srt_generated = on_srt_generated
-        self._transcriber = transcriber or WhisperTranscriber()
+        self._runner = TranscriptionRunner(
+            transcriber or WhisperTranscriber(), _WhisperTabPresenter(self))
         self._file_list: list = []
-        self._transcribing = False
-        self._stop_requested = False
-        self._active_cancellation: Optional[CancellationToken] = None
 
         self._create_ui()
         self._load_settings()
         self._populate_models()
+
+    def _schedule_ui(self, fn):
+        """Run `fn` on the Tk thread from a worker thread."""
+        self.winfo_toplevel().after(0, fn)
 
     def _create_ui(self):
         self.columnconfigure(0, weight=1)
@@ -112,7 +140,7 @@ class WhisperTab(LogMixin, ttk.Frame):
 
         self._chunk_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(
-            row3, text="Chunk long audio (30 min, anti-repeat)",
+            row3, text=chunking_label(),
             variable=self._chunk_var,
             command=self._on_setting_changed,
         ).pack(side=tk.LEFT, padx=(20, 0))
@@ -188,7 +216,7 @@ class WhisperTab(LogMixin, ttk.Frame):
         self._model_dir_var.set(cm.get("whisper.model_dir", ""))
         self._threads_var.set(cm.get("whisper.threads", 8))
         self._threads_label.config(text=str(self._threads_var.get()))
-        self._chunk_var.set(bool(cm.get("whisper.chunk_long_audio", False)))
+        self._chunk_var.set(chunking_enabled(cm))
 
     def _save_settings(self):
         cm = self._config_manager
@@ -200,7 +228,7 @@ class WhisperTab(LogMixin, ttk.Frame):
         cm.set("whisper.last_model", self._model_var.get())
         cm.set("whisper.language", self._get_language_code())
         cm.set("whisper.threads", int(float(self._threads_var.get())))
-        cm.set("whisper.chunk_long_audio", bool(self._chunk_var.get()))
+        set_chunking_enabled(cm, bool(self._chunk_var.get()))
 
     def _on_setting_changed(self, event=None):
         self._save_settings()
@@ -250,12 +278,9 @@ class WhisperTab(LogMixin, ttk.Frame):
             messagebox.showwarning("Warning", "Please select a model!")
             return
 
-        if self._transcribing:
+        if self._runner.running:
             return
 
-        self._transcribing = True
-        self._stop_requested = False
-        self._active_cancellation = CancellationToken()
         self._start_btn.config(state="disabled")
         self._stop_btn.config(state="normal")
         self._progress_var.set(0)
@@ -267,51 +292,18 @@ class WhisperTab(LogMixin, ttk.Frame):
         thread.start()
 
     def _stop_transcription(self):
-        self._stop_requested = True
-        if self._active_cancellation is not None:
-            self._active_cancellation.cancel()
+        self._runner.stop()
         self._log("WARNING", "Cancelling current transcription...")
 
     def _run_transcription(self):
-        total = len(self._file_list)
+        self._runner.run_files(self._file_list, self._build_request)
 
-        for i, filepath in enumerate(self._file_list):
-            if self._stop_requested:
-                self._log("WARNING", "Transcription stopped by user")
-                break
-
-            self.winfo_toplevel().after(0, lambda f=Path(filepath).name, idx=i:
-                self._progress_label.config(text=f"Processing: {f} ({idx + 1}/{total})"))
-
-            try:
-                outcome = self._transcribe_file(filepath)
-                if isinstance(outcome, Cancelled):
-                    self._stop_requested = True
-                    self._log("WARNING", "Transcription cancelled by user")
-                    break
-                if isinstance(outcome, Failed):
-                    self._log(
-                        "ERROR",
-                        f"Failed: {Path(filepath).name} - "
-                        f"{outcome.stage}: {outcome.message}",
-                    )
-                elif isinstance(outcome, Completed):
-                    srt_path = str(outcome.srt_path)
-                    self._log("SUCCESS", f"Generated: {srt_path}")
-                    if self._on_srt_generated:
-                        self._on_srt_generated(srt_path)
-            except Exception as e:
-                self._log("ERROR", f"Failed: {Path(filepath).name} - {e}")
-
-            pct = ((i + 1) / total) * 100
-            self.winfo_toplevel().after(0, lambda p=pct: self._progress_var.set(p))
-
-        self.winfo_toplevel().after(0, self._on_transcription_done)
-
-    def _transcribe_file(self, filepath):
+    def _build_request(self, filepath):
+        """Build one TranscriptionRequest from the tab's current settings."""
         model_dir = self._model_dir_var.get().strip()
         model_name = self._model_var.get()
-        model_path = self._resolve_model_path(model_dir, model_name)
+        model_path = BaseModelRegistry.resolve_model_path(
+            self._get_whisper_models(), model_dir, model_name)
         language = self._get_language_code()
         threads = int(float(self._threads_var.get()))
 
@@ -319,50 +311,20 @@ class WhisperTab(LogMixin, ttk.Frame):
         self._log("INFO", f"Model: {model_path}")
         self._log("INFO", f"File: {filepath}")
 
-        cancellation = self._active_cancellation
-        if cancellation is None:
-            cancellation = CancellationToken()
-            if self._stop_requested:
-                cancellation.cancel()
-            self._active_cancellation = cancellation
-
-        return self._transcriber.transcribe(
-            TranscriptionRequest(
-                source=Path(filepath),
-                cli_path=Path(self._cli_var.get().strip()),
-                model_path=Path(model_path),
-                language=language,
-                threads=threads,
-                chunk_long_audio=bool(self._chunk_var.get()),
-            ),
-            cancellation=cancellation,
-            emit=self._on_transcription_event,
+        return TranscriptionRequest(
+            source=Path(filepath),
+            cli_path=Path(self._cli_var.get().strip()),
+            model_path=Path(model_path),
+            language=language,
+            threads=threads,
+            chunk_long_audio=bool(self._chunk_var.get()),
         )
 
-    def _on_transcription_event(self, event: TranscriptionEvent):
-        if event.kind == "diagnostic" and event.message:
-            self._log("INFO", event.message)
-            return
-        if event.kind == "progress" and event.total:
-            text = f"{event.stage}: {event.current}/{event.total}"
-        elif event.kind == "started":
-            text = event.stage.capitalize()
-        else:
-            return
-        self.winfo_toplevel().after(
-            0, lambda value=text: self._progress_label.config(text=value))
-
-    def _resolve_model_path(self, model_dir, model_name):
-        return resolve_model_path(
-            model_dir, model_name, self._get_whisper_models)
-
-    def _on_transcription_done(self):
-        self._active_cancellation = None
-        self._transcribing = False
+    def _on_transcription_done(self, stopped: bool):
         self._start_btn.config(state="normal")
         self._stop_btn.config(state="disabled")
 
-        if self._stop_requested:
+        if stopped:
             self._progress_label.config(text="Stopped")
             self._log("INFO", "Transcription stopped")
         else:

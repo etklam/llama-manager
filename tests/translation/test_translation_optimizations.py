@@ -9,6 +9,7 @@ Plan C: Larger default batch size
 import re
 import threading
 import time
+from dataclasses import replace
 
 import pytest
 
@@ -17,6 +18,7 @@ from translation.local_llm_translator import (
     DEFAULT_BATCH_SIZE,
     MIN_DYNAMIC_MAX_TOKENS,
 )
+from utils.srt_parser import Cue
 
 
 def _full_config(**overrides):
@@ -73,24 +75,25 @@ class SingleStepFakeLLMClient(FakeLLMClient):
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _make_srt_data(n: int) -> list[dict]:
-    """Create n fake SRT entries."""
+def _make_srt_data(n: int) -> list[Cue]:
+    """Create n fake SRT entries as Cues."""
     return [
-        {'text': f'Line {i+1} text here', 'time': f'00:00:0{i},000 --> 00:00:0{i+1},000', 'line': i + 1}
+        Cue(line=i + 1, start_time=i * 1000, end_time=(i + 1) * 1000,
+            text=f'Line {i+1} text here')
         for i in range(n)
     ]
 
 
-def _batch_yaml_response(batch: list[dict], *, single_step: bool = False) -> str:
+def _batch_yaml_response(batch: list[Cue], *, single_step: bool = False) -> str:
     """Generate a fake YAML response matching a batch of SRT entries."""
     lines = []
     for j, entry in enumerate(batch):
         lines.append(f"- id: {j + 1}")
         if single_step:
-            lines.append(f"  translation: 翻译{entry['line']}")
+            lines.append(f"  translation: 翻译{entry.line}")
         else:
-            lines.append(f"  step1: 直译{entry['line']}")
-            lines.append(f"  step2: 意译{entry['line']}")
+            lines.append(f"  step1: 直译{entry.line}")
+            lines.append(f"  step2: 意译{entry.line}")
     return "\n".join(lines)
 
 
@@ -274,8 +277,8 @@ class TestSingleStepTranslationMode:
         srt_data = _make_srt_data(4)
         result = translator.translate_srt(srt_data, 'zh-cn')
         assert len(result) == 4
-        assert result[0]['text'] == '翻译1'
-        assert result[1]['text'] == '翻译2'
+        assert result[0].text == '翻译1'
+        assert result[1].text == '翻译2'
 
     # --- Batch prompt tests ---
 
@@ -382,10 +385,10 @@ class TestConcurrentBatchProcessing:
         assert len(result) == 9
         for i, entry in enumerate(result):
             expected_line = i + 1
-            assert entry['line'] == expected_line, (
-                f"Expected line {expected_line}, got {entry['line']}"
+            assert entry.line == expected_line, (
+                f"Expected line {expected_line}, got {entry.line}"
             )
-            assert f'意译' in entry['text']
+            assert f'意译' in entry.text
 
     def test_sequential_fallback_on_batch_failure(self):
         """If a concurrent batch fails, fall back to individual translation."""
@@ -474,7 +477,7 @@ class TestCombinedOptimizations:
         assert len(result) == 30
         # All results should have translated text
         for entry in result:
-            assert '翻译' in entry['text']
+            assert '翻译' in entry.text
         # With concurrency, 2 batches of 0.05s should complete in ~0.1s
         assert elapsed < 0.3, f"Expected fast concurrent execution, took {elapsed:.2f}s"
 
@@ -504,7 +507,9 @@ class TestCombinedOptimizations:
         result = translator.translate_srt(srt_data, 'zh-cn')
 
         for i, entry in enumerate(result):
-            assert entry['time'] == srt_data[i]['time'], (
+            assert (entry.start_time, entry.end_time) == (
+                srt_data[i].start_time, srt_data[i].end_time
+            ), (
                 f"Timestamp mismatch at line {i+1}"
             )
 
@@ -609,7 +614,8 @@ class TestRepetitionCollapsing:
         translator = LocalLLMTranslator(config, client=fake)
 
         srt_data = _make_srt_data(4)
-        srt_data[0]['text'] = 'あ、' * 100
+        srt_data = [replace(cue, text='あ、' * 100) if cue.line == 1 else cue
+                    for cue in srt_data]
         translator.translate_srt(srt_data, 'zh-cn')
 
         # The oversized run must never reach the model verbatim.
@@ -625,10 +631,11 @@ class TestRepetitionCollapsing:
 
         srt_data = _make_srt_data(4)
         original = 'あ、' * 100
-        srt_data[0]['text'] = original
+        srt_data = [replace(cue, text=original) if cue.line == 1 else cue
+                    for cue in srt_data]
         translator.translate_srt(srt_data, 'zh-cn')
 
-        assert srt_data[0]['text'] == original
+        assert srt_data[0].text == original
 
 
 class TestBatchAlignmentByModelId:
@@ -673,15 +680,54 @@ class TestBatchAlignmentByModelId:
             client=fake,
         )
 
-        srt_data = _make_srt_data(4)
-        for i, entry in enumerate(srt_data):
-            entry['text'] = f'src{i + 1}'
+        srt_data = [
+            replace(entry, text=f'src{i + 1}')
+            for i, entry in enumerate(_make_srt_data(4))
+        ]
 
         result = translator.translate_srt(srt_data, 'zh-cn')
 
-        assert [entry['text'] for entry in result] == [
+        assert [entry.text for entry in result] == [
             'TR[src1]', 'TR[src2]', 'TR[src3]', 'TR[src4]'
         ]
+
+    def test_tiny_file_aligns_by_id_on_the_batch_core(self):
+        """Lines below the old simple-path cutoff now run the one batch core.
+
+        A 3-line file previously took the positional simple path, so a
+        reordered response shifted every translation onto the wrong subtitle.
+        The fold sends it through the same by-id machinery: one call, aligned
+        by the id the model echoes back.
+        """
+        fake = FakeLLMClient()
+
+        def _complete(messages, model, max_tokens, temperature):
+            with fake._lock:
+                fake.call_count += 1
+            sources = self._batch_sources(messages)
+            lines = []
+            for out_id, src in reversed(list(enumerate(sources, start=1))):
+                lines.append(f"- id: {out_id}")
+                lines.append(f"  translation: TR[{src}]")
+            return "\n".join(lines)
+
+        fake.complete = _complete
+        translator = LocalLLMTranslator(
+            _full_config(batch_size=10, max_workers=1, single_step=True),
+            client=fake,
+        )
+
+        srt_data = [
+            replace(entry, text=f'src{i + 1}')
+            for i, entry in enumerate(_make_srt_data(3))
+        ]
+
+        result = translator.translate_srt(srt_data, 'zh-cn')
+
+        assert [entry.text for entry in result] == [
+            'TR[src1]', 'TR[src2]', 'TR[src3]'
+        ]
+        assert fake.call_count == 1
 
     def test_dropped_line_is_retried_instead_of_returning_original(self):
         """A line absent from the batch response gets its own retry call."""
@@ -707,18 +753,19 @@ class TestBatchAlignmentByModelId:
             client=fake,
         )
 
-        srt_data = _make_srt_data(4)
-        for i, entry in enumerate(srt_data):
-            entry['text'] = f'src{i + 1}'
+        srt_data = [
+            replace(entry, text=f'src{i + 1}')
+            for i, entry in enumerate(_make_srt_data(4))
+        ]
 
         result = translator.translate_srt(srt_data, 'zh-cn')
 
         # Every line is translated; the dropped one no longer leaks its source.
-        assert [entry['text'] for entry in result] == [
+        assert [entry.text for entry in result] == [
             'TR[src1]', 'TR[src2]', 'TR[src3]', 'TR[src4]'
         ]
         assert all(
-            not entry['text'].startswith('src') for entry in result
+            not entry.text.startswith('src') for entry in result
         )
         # One batch call plus exactly one targeted retry.
         assert fake.call_count == 2
@@ -743,9 +790,10 @@ class TestBatchAlignmentByModelId:
             client=fake,
         )
 
-        srt_data = _make_srt_data(6)
-        for i, entry in enumerate(srt_data):
-            entry['text'] = f'src{i + 1}'
+        srt_data = [
+            replace(entry, text=f'src{i + 1}')
+            for i, entry in enumerate(_make_srt_data(6))
+        ]
 
         result = translator.translate_srt(srt_data, 'zh-cn')
 
@@ -775,29 +823,41 @@ class TestBatchAlignmentByModelId:
         )
 
         srt_data = _make_srt_data(2)
-        srt_data[0]['text'] = 'src1'
-        srt_data[1]['text'] = 'src2'
+        srt_data = [
+            replace(entry, text=text)
+            for entry, text in zip(srt_data, ('src1', 'src2'))
+        ]
 
         result = translator.translate_srt(srt_data, 'zh-cn')
 
-        assert result[0]['text'] == 'TR[src1]'
+        assert result[0].text == 'TR[src1]'
         # The second line must not inherit the duplicate's value.
-        assert result[1]['text'] == 'TR[src2]'
+        assert result[1].text == 'TR[src2]'
 
 
 class TestDuplicateSubtitleDeduplication:
     """Identical subtitle cues are translated once and fanned back out."""
 
     def test_repeated_sentences_only_call_llm_once_per_unique_text(self):
+        """Identical cues shrink to one batch call and fan back out.
+
+        The dedup pre-pass turns 6 cues into 3 unique texts, which the one
+        batch core then translates in a single call (the old per-line simple
+        path cost one call per unique text).
+        """
         fake = FakeLLMClient()
 
         def _complete(messages, model, max_tokens, temperature):
-            import re
             fake.call_count += 1
             fake.messages_list.append(messages)
-            sources = re.findall(r'^\s*source:\s*(.+)$', messages[1]['content'], re.MULTILINE)
-            source = sources[-1]
-            return f"- id: 1\n  translation: TR:{source}"
+            content = messages[1]['content']
+            body = content.split('翻譯:' if '翻譯:' in content else '翻译:')[-1]
+            sources = re.findall(r'^\s*source:\s*(.+)$', body, re.MULTILINE)
+            lines = []
+            for idx, src in enumerate(sources, start=1):
+                lines.append(f"- id: {idx}")
+                lines.append(f"  translation: TR:{src}")
+            return "\n".join(lines)
 
         fake.complete = _complete
         translator = LocalLLMTranslator(
@@ -806,14 +866,15 @@ class TestDuplicateSubtitleDeduplication:
         )
 
         texts = ["Hello", "Hello", "Bye", "Hello", "Bye", "Unique"]
-        srt_data = _make_srt_data(len(texts))
-        for entry, text in zip(srt_data, texts):
-            entry['text'] = text
+        srt_data = [
+            replace(entry, text=text)
+            for entry, text in zip(_make_srt_data(len(texts)), texts)
+        ]
 
         result = translator.translate_srt(srt_data, 'zh-cn')
 
-        assert fake.call_count == 3
-        assert [entry['text'] for entry in result] == [
+        assert fake.call_count == 1
+        assert [entry.text for entry in result] == [
             "TR:Hello", "TR:Hello", "TR:Bye",
             "TR:Hello", "TR:Bye", "TR:Unique",
         ]
@@ -827,20 +888,21 @@ class TestDuplicateSubtitleDeduplication:
             client=fake,
         )
 
-        srt_data = _make_srt_data(8)
-        for entry in srt_data:
-            entry['text'] = "Same sentence"
+        srt_data = [
+            replace(entry, text="Same sentence")
+            for entry in _make_srt_data(8)
+        ]
 
         result = translator.translate_srt(srt_data, 'zh-cn')
 
         assert fake.call_count == 1
         assert len(result) == 8
-        assert all(entry['text'] == "同一句翻譯" for entry in result)
-        assert [entry['time'] for entry in result] == [
-            entry['time'] for entry in srt_data
+        assert all(entry.text == "同一句翻譯" for entry in result)
+        assert [(entry.start_time, entry.end_time) for entry in result] == [
+            (entry.start_time, entry.end_time) for entry in srt_data
         ]
-        assert [entry['line'] for entry in result] == [
-            entry['line'] for entry in srt_data
+        assert [entry.line for entry in result] == [
+            entry.line for entry in srt_data
         ]
 
     def test_whitespace_equivalent_sentences_share_translation(self):
@@ -852,16 +914,18 @@ class TestDuplicateSubtitleDeduplication:
             client=fake,
         )
 
-        srt_data = _make_srt_data(4)
-        srt_data[0]['text'] = "Hello world"
-        srt_data[1]['text'] = "Hello\nworld"
-        srt_data[2]['text'] = "Hello   world"
-        srt_data[3]['text'] = "Hello world"
+        srt_data = [
+            replace(entry, text=text)
+            for entry, text in zip(
+                _make_srt_data(4),
+                ("Hello world", "Hello\nworld", "Hello   world", "Hello world"),
+            )
+        ]
 
         result = translator.translate_srt(srt_data, 'zh-cn')
 
         assert fake.call_count == 1
-        assert all(entry['text'] == "相同翻譯" for entry in result)
+        assert all(entry.text == "相同翻譯" for entry in result)
 
 
 def _long_text(chars: int) -> str:
@@ -918,7 +982,10 @@ class TestLongSourceSoftGuard:
 
     def test_long_line_is_warned_about_and_names_the_line(self):
         srt_data = _make_srt_data(4)
-        srt_data[2]['text'] = _long_text(600)
+        srt_data = [
+            replace(cue, text=_long_text(600)) if cue.line == 3 else cue
+            for cue in srt_data
+        ]
 
         _, logs, _ = self._translate(srt_data)
 
@@ -930,14 +997,45 @@ class TestLongSourceSoftGuard:
     def test_long_line_is_still_translated_not_rejected_or_truncated(self):
         long_text = _long_text(600)
         srt_data = _make_srt_data(4)
-        srt_data[2]['text'] = long_text
+        srt_data = [
+            replace(cue, text=long_text) if cue.line == 3 else cue
+            for cue in srt_data
+        ]
 
         result, _, fake = self._translate(srt_data)
 
         # Soft: the cue reached the model in full and came back translated.
         assert len(result) == 4
-        assert result[2]['text'] == "翻譯3"
+        assert result[2].text == "翻譯3"
         assert long_text in "".join(m[1]['content'] for m in fake.messages_list)
+
+    def test_long_line_warned_even_with_deduplication_disabled(self):
+        """The guard is about context size, not dedup: it fires with dedup off.
+
+        _deduplicate controls the dedup pre-pass (and its recursion), nothing
+        else; the soft length guard is unconditional.
+        """
+        srt_data = _make_srt_data(4)
+        srt_data = [
+            replace(cue, text=_long_text(600)) if cue.line == 3 else cue
+            for cue in srt_data
+        ]
+
+        logs = []
+        fake = _echoing_client()
+        translator = LocalLLMTranslator(
+            _full_config(batch_size=10, max_workers=1, single_step=True),
+            client=fake,
+        )
+        translator.translate_srt(
+            srt_data, 'zh-cn',
+            log_callback=lambda lv, m: logs.append((lv, m)),
+            _deduplicate=False,
+        )
+
+        warnings = self._warnings(logs)
+        assert len(warnings) == 1
+        assert "L3" in warnings[0]
 
     def test_subtitle_sized_lines_produce_no_warning(self):
         result, logs, _ = self._translate(_make_srt_data(4))
@@ -946,9 +1044,10 @@ class TestLongSourceSoftGuard:
         assert len(result) == 4
 
     def test_many_long_lines_are_summarized_in_one_warning(self):
-        srt_data = _make_srt_data(8)
-        for entry in srt_data:
-            entry['text'] = _long_text(600) + f" tail{entry['line']}"
+        srt_data = [
+            replace(entry, text=_long_text(600) + f" tail{entry.line}")
+            for entry in _make_srt_data(8)
+        ]
 
         _, logs, _ = self._translate(srt_data)
 

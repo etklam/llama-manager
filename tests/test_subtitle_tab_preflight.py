@@ -1,15 +1,18 @@
-"""Headless tests for SubtitleTranslationTab's preflight and worker clamping.
+"""Headless tests for SubtitleTranslationTab consuming a PreflightPlan.
 
 The tab is constructed with object.__new__ and its Tk vars replaced by fakes, the
 same approach tests/test_server_tab.py uses: the logic under test is ordinary
 Python, and standing up a real Tk widget tree would make these tests need a
 display.
+
+run_preflight itself (probe → clamp → note) is tested in
+tests/translation/test_preflight.py; here it is patched, because the tab's job is
+to present the plan, not to re-derive it.
 """
 from unittest.mock import Mock, patch
 
-import pytest
-
 from subtitle_tab import SubtitleTranslationTab
+from translation.preflight import PreflightPlan
 from translation.server_probe import ServerInfo
 
 
@@ -52,6 +55,16 @@ def _config_for(*, workers=3, api_url='http://localhost:8080/v1'):
     }
 
 
+def _plan(*, reachable=True, workers=3, note=None, info=None):
+    """A PreflightPlan of the shape run_preflight would produce."""
+    return PreflightPlan(
+        reachable=reachable,
+        workers=workers,
+        note=note,
+        info=info or ServerInfo(reachable=reachable),
+    )
+
+
 def _make_tab(*, workers=3, files=('/test/a.srt',), config=None):
     tab = object.__new__(SubtitleTranslationTab)
     tab._config_manager = FakeConfig(config)
@@ -90,9 +103,12 @@ class TestPreflightBlocksRun:
 
     def test_unreachable_server_does_not_translate(self):
         tab = _make_tab()
-        info = ServerInfo(reachable=False, error="ConnectError: refused")
+        plan = _plan(reachable=False, workers=3,
+                     note="llama-server 未回應",
+                     info=ServerInfo(reachable=False,
+                                     error="ConnectError: refused"))
 
-        with patch('subtitle_tab.probe_server', return_value=info), \
+        with patch('subtitle_tab.run_preflight', return_value=plan), \
              patch('subtitle_tab.messagebox.showerror') as show_error, \
              patch('subtitle_tab.LocalLLMTranslator') as translator_cls:
             tab._preflight_and_translate(_config_for(workers=tab._workers_var.get()))
@@ -109,9 +125,10 @@ class TestPreflightBlocksRun:
         """
         tab = _make_tab()
         tab._translating = True
-        info = ServerInfo(reachable=False, error="down")
+        plan = _plan(reachable=False, workers=3, note="down",
+                     info=ServerInfo(reachable=False, error="down"))
 
-        with patch('subtitle_tab.probe_server', return_value=info), \
+        with patch('subtitle_tab.run_preflight', return_value=plan), \
              patch('subtitle_tab.messagebox.showerror'):
             tab._preflight_and_translate(_config_for(workers=tab._workers_var.get()))
 
@@ -121,14 +138,43 @@ class TestPreflightBlocksRun:
 
     def test_reachable_server_proceeds(self):
         tab = _make_tab()
-        info = ServerInfo(reachable=True, slots=3)
+        plan = _plan(reachable=True, workers=3, note=None)
 
-        with patch('subtitle_tab.probe_server', return_value=info), \
+        with patch('subtitle_tab.run_preflight', return_value=plan), \
              patch('subtitle_tab.LocalLLMTranslator') as translator_cls:
             tab._preflight_and_translate(_config_for(workers=tab._workers_var.get()))
 
         tab._run_translation.assert_called_once()
         translator_cls.assert_called_once()
+
+    def test_asks_for_one_plan_with_the_requested_workers(self):
+        """The tab calls the preflight module with the URL and requested count."""
+        tab = _make_tab(workers=3)
+        plan = _plan(reachable=True, workers=3, note=None)
+
+        with patch('subtitle_tab.run_preflight',
+                   return_value=plan) as preflight, \
+             patch('subtitle_tab.LocalLLMTranslator'):
+            config = _config_for(workers=tab._workers_var.get())
+            tab._preflight_and_translate(config)
+
+        preflight.assert_called_once_with(config['api_url'], 3)
+
+    def test_unreachable_messagebox_shows_the_plan_note(self):
+        """The plan's note is the text the user sees; the tab must not re-derive it."""
+        tab = _make_tab()
+        note = "llama-server 未回應 (http://localhost:8080/props): down"
+        plan = _plan(reachable=False, workers=3, note=note,
+                     info=ServerInfo(reachable=False, error="down"))
+
+        with patch('subtitle_tab.run_preflight', return_value=plan), \
+             patch('subtitle_tab.messagebox.showerror') as show_error, \
+             patch('subtitle_tab.LocalLLMTranslator'):
+            tab._preflight_and_translate(_config_for(workers=tab._workers_var.get()))
+
+        show_error.assert_called_once()
+        assert show_error.call_args[0][1] == note
+        assert any(call.args[1] == note for call in tab._log.call_args_list)
 
 
 class TestWorkerClamping:
@@ -136,9 +182,9 @@ class TestWorkerClamping:
     def test_workers_clamped_to_slots(self):
         """3 workers against a 1-slot server is 1 worker's throughput."""
         tab = _make_tab(workers=3)
-        info = ServerInfo(reachable=True, slots=1)
+        plan = _plan(reachable=True, workers=1, note="clamped")
 
-        with patch('subtitle_tab.probe_server', return_value=info), \
+        with patch('subtitle_tab.run_preflight', return_value=plan), \
              patch('subtitle_tab.LocalLLMTranslator') as translator_cls:
             tab._preflight_and_translate(_config_for(workers=tab._workers_var.get()))
 
@@ -147,9 +193,10 @@ class TestWorkerClamping:
     def test_clamp_is_reported_to_the_user(self):
         """Silently fixing it would leave the mismatched setting in place."""
         tab = _make_tab(workers=3)
-        info = ServerInfo(reachable=True, slots=1)
+        plan = _plan(reachable=True, workers=1,
+                     note="workers 3 → server 只有 1 slot，已調整為 1")
 
-        with patch('subtitle_tab.probe_server', return_value=info), \
+        with patch('subtitle_tab.run_preflight', return_value=plan), \
              patch('subtitle_tab.LocalLLMTranslator'):
             tab._preflight_and_translate(_config_for(workers=tab._workers_var.get()))
 
@@ -157,9 +204,9 @@ class TestWorkerClamping:
 
     def test_workers_kept_when_slots_allow(self):
         tab = _make_tab(workers=3)
-        info = ServerInfo(reachable=True, slots=4)
+        plan = _plan(reachable=True, workers=3, note=None)
 
-        with patch('subtitle_tab.probe_server', return_value=info), \
+        with patch('subtitle_tab.run_preflight', return_value=plan), \
              patch('subtitle_tab.LocalLLMTranslator') as translator_cls:
             tab._preflight_and_translate(_config_for(workers=tab._workers_var.get()))
 
@@ -168,9 +215,9 @@ class TestWorkerClamping:
     def test_unknown_slot_count_leaves_workers_alone(self):
         """An older build reporting no total_slots must not serialize the client."""
         tab = _make_tab(workers=3)
-        info = ServerInfo(reachable=True, slots=None)
+        plan = _plan(reachable=True, workers=3, note=None)
 
-        with patch('subtitle_tab.probe_server', return_value=info), \
+        with patch('subtitle_tab.run_preflight', return_value=plan), \
              patch('subtitle_tab.LocalLLMTranslator') as translator_cls:
             tab._preflight_and_translate(_config_for(workers=tab._workers_var.get()))
 
@@ -187,9 +234,9 @@ class TestWorkerPersistence:
         raising the server's slot count.
         """
         tab = _make_tab(workers=3)
-        info = ServerInfo(reachable=True, slots=1)
+        plan = _plan(reachable=True, workers=1, note="clamped")
 
-        with patch('subtitle_tab.probe_server', return_value=info), \
+        with patch('subtitle_tab.run_preflight', return_value=plan), \
              patch('subtitle_tab.LocalLLMTranslator'):
             config = _config_for(workers=tab._workers_var.get())
             tab._config_manager.set("ui.max_workers", config['max_workers'])

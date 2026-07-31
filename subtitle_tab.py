@@ -13,9 +13,7 @@ from tkinterdnd2 import DND_FILES
 
 from utils.srt_parser import parse_srt_from_file, generate_srt_from_list, output_path_for
 from translation.local_llm_translator import LocalLLMTranslator
-from translation.server_probe import (
-    clamp_workers, probe_server, unreachable_message,
-)
+from translation.preflight import run_preflight
 
 from constants import SUPPORTED_SUBTITLE, TARGET_LANGUAGES, SOURCE_LANGUAGES
 from ui_helpers import (
@@ -369,9 +367,9 @@ class SubtitleTranslationTab(LogMixin, ttk.Frame):
         # time: each batch spends three tenacity attempts with exponential
         # backoff before failing, so a long SRT takes minutes to report what was
         # knowable before the first request.
-        info = probe_server(config['api_url'])
-        if not info.reachable:
-            message = unreachable_message(config['api_url'], info)
+        plan = run_preflight(config['api_url'], config['max_workers'])
+        if not plan.reachable:
+            message = plan.note or "no response"
             self._log("ERROR", message)
             self.winfo_toplevel().after(0, lambda: (
                 messagebox.showerror("Server not reachable", message),
@@ -379,14 +377,15 @@ class SubtitleTranslationTab(LogMixin, ttk.Frame):
             ))
             return
 
-        # Align client concurrency with the server's real slot count. Each worker
-        # holds one request open and llama-server runs at most total_slots of
-        # them at once, so workers beyond that simply queue: throughput equal to
-        # one worker, while the log claims parallelism.
-        workers, note = clamp_workers(config['max_workers'], info)
-        config['max_workers'] = workers
-        if note:
-            self._log("WARNING", note)
+        # Align client concurrency with the server's real slot count, as the
+        # plan decided. Each worker holds one request open and llama-server runs
+        # at most total_slots of them at once, so workers beyond that simply
+        # queue: throughput equal to one worker, while the log claims
+        # parallelism. The plan's note is the user-facing explanation, logged
+        # once.
+        config['max_workers'] = plan.workers
+        if plan.note:
+            self._log("WARNING", plan.note)
 
         self._translator = LocalLLMTranslator(config)
         self._run_translation()

@@ -1,7 +1,6 @@
 """Deep synchronous lifecycle for whisper.cpp transcription."""
 from __future__ import annotations
 
-import math
 import os
 import platform
 import shutil
@@ -14,11 +13,8 @@ from pathlib import Path
 from typing import Callable, List, Optional, Protocol, Union
 
 from constants import VIDEO_EXTENSIONS
-from utils.srt_parser import generate_srt_from_list, parse_srt_from_file
-
-
-DEFAULT_CHUNK_SECONDS = 30 * 60
-_CHUNK_TIME_EPSILON = 0.001
+from utils.srt_parser import Cue, generate_srt_from_list, parse_srt_from_file
+from whisper_policy import ChunkPlan, decide
 
 
 @dataclass(frozen=True)
@@ -453,12 +449,13 @@ class WhisperTranscriber:
                 if cancellation.cancelled:
                     return Cancelled()
                 emit(TranscriptionEvent(stage, "completed"))
-                if duration > DEFAULT_CHUNK_SECONDS + _CHUNK_TIME_EPSILON:
+                plan = decide(duration)
+                if plan.chunked:
                     stage = "chunking"
                     emit(TranscriptionEvent(stage, "started"))
                     self._transcribe_chunks(
                         prepared, duration, workspace, candidate,
-                        request, cancellation, emit)
+                        request, plan, cancellation, emit)
                     if cancellation.cancelled:
                         return Cancelled()
                     emit(TranscriptionEvent(stage, "completed"))
@@ -522,27 +519,23 @@ class WhisperTranscriber:
         workspace: Path,
         candidate: Path,
         request: TranscriptionRequest,
+        plan: ChunkPlan,
         cancellation: CancellationToken,
         emit: Callable[[TranscriptionEvent], None],
     ) -> None:
         chunk_srts: List[Path] = []
         offsets: List[float] = []
-        chunk_count = max(
-            1,
-            math.ceil(
-                (duration - _CHUNK_TIME_EPSILON) / DEFAULT_CHUNK_SECONDS
-            ),
-        )
 
-        for index in range(chunk_count):
+        for index in range(plan.chunk_count):
             if cancellation.cancelled:
                 return
-            start = index * DEFAULT_CHUNK_SECONDS
-            chunk_duration = min(DEFAULT_CHUNK_SECONDS, duration - start)
+            start = index * plan.chunk_seconds
+            chunk_duration = min(plan.chunk_seconds, duration - start)
             audio_path = workspace / f"chunk-{index:03d}.wav"
             srt_path = workspace / f"chunk-{index:03d}.srt"
             emit(TranscriptionEvent(
-                "chunking", "progress", current=index + 1, total=chunk_count))
+                "chunking", "progress", current=index + 1,
+                total=plan.chunk_count))
             try:
                 self._media.render_chunk(
                     prepared, start, chunk_duration, audio_path,
@@ -555,7 +548,8 @@ class WhisperTranscriber:
                 return
 
             emit(TranscriptionEvent(
-                "transcribing", "started", current=index + 1, total=chunk_count))
+                "transcribing", "started", current=index + 1,
+                total=plan.chunk_count))
             try:
                 self._whisper.transcribe(
                     audio_path, srt_path, request, cancellation, emit)
@@ -567,32 +561,23 @@ class WhisperTranscriber:
                 raise _StageFailure(
                     "transcribing", f"chunk {index + 1} produced no SRT")
             emit(TranscriptionEvent(
-                "transcribing", "completed", current=index + 1, total=chunk_count))
+                "transcribing", "completed", current=index + 1,
+                total=plan.chunk_count))
             chunk_srts.append(srt_path)
             offsets.append(start)
 
         emit(TranscriptionEvent("merging", "started"))
         try:
-            merged = []
+            merged: List[Cue] = []
             for srt_path, offset in zip(chunk_srts, offsets):
                 offset_ms = int(round(offset * 1000))
-                for subtitle in parse_srt_from_file(str(srt_path)):
-                    merged.append({
-                        "start_time": subtitle["start_time"] + offset_ms,
-                        "end_time": subtitle["end_time"] + offset_ms,
-                        "text": subtitle["text"],
-                    })
+                for cue in parse_srt_from_file(str(srt_path)):
+                    merged.append(Cue(
+                        start_time=cue.start_time + offset_ms,
+                        end_time=cue.end_time + offset_ms,
+                        text=cue.text,
+                    ))
             candidate.write_text(generate_srt_from_list(merged), encoding="utf-8")
         except Exception as exc:
             raise _StageFailure("merging", str(exc)) from exc
         emit(TranscriptionEvent("merging", "completed"))
-
-
-def resolve_model_path(model_dir, model_name, get_whisper_models_fn=None):
-    if not model_dir or not model_name:
-        return model_name
-    if get_whisper_models_fn:
-        for model in get_whisper_models_fn():
-            if model.get("name") == model_name:
-                return model.get("path", model_name)
-    return str(Path(model_dir) / model_name)

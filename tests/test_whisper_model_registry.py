@@ -228,6 +228,27 @@ class TestGetModelPath:
         assert path is None, f"Should return None for unknown model, got {path}"
 
 
+class TestResolveModelPath:
+    """Whisper flows resolve against the whisper model list through the
+    shared registry lookup."""
+
+    def test_registered_whisper_model_wins_over_dir_fallback(self, whisper_registry, temp_scan_dir):
+        test_file = temp_scan_dir / "ggml-tiny.bin"
+        test_file.write_text("x" * 1024)
+        whisper_registry.add_model(str(test_file))
+
+        path = WhisperModelRegistry.resolve_model_path(
+            whisper_registry.list_models(), str(temp_scan_dir), "tiny")
+
+        assert path == str(test_file), f"Registered path should win, got {path}"
+
+    def test_unregistered_whisper_name_falls_back_to_model_dir(self, whisper_registry):
+        path = WhisperModelRegistry.resolve_model_path(
+            whisper_registry.list_models(), "D:/whisper-models", "ggml-base.bin")
+
+        assert path == str(Path("D:/whisper-models") / "ggml-base.bin"), f"Got {path}"
+
+
 class TestScanMissingDirectory:
 
     def test_scan_handles_missing_directory(self, tmp_path, config_manager):

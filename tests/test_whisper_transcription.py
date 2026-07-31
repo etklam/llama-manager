@@ -16,7 +16,13 @@ from whisper_transcription import (
     TranscriptionRequest,
     WhisperCliAdapter,
     WhisperTranscriber,
-    resolve_model_path,
+)
+from whisper_policy import (
+    CHUNK_SECONDS,
+    chunking_enabled,
+    chunking_label,
+    decide,
+    set_chunking_enabled,
 )
 
 
@@ -94,9 +100,10 @@ def test_chunking_disabled_does_not_probe_duration(tmp_path):
 
 
 def test_short_media_with_chunking_enabled_stays_single_run(tmp_path):
+    # 60s is plainly short; the exact threshold is the policy's to test.
     source = tmp_path / "speech.wav"
     source.write_bytes(b"wav")
-    media = FakeMediaAdapter(duration=1800.0)
+    media = FakeMediaAdapter(duration=60.0)
     whisper = FakeWhisperAdapter()
 
     result = WhisperTranscriber(media, whisper).transcribe(
@@ -118,7 +125,8 @@ def test_short_media_with_chunking_enabled_stays_single_run(tmp_path):
 def test_long_media_is_chunked_and_merged_behind_the_same_interface(tmp_path):
     source = tmp_path / "long.wav"
     source.write_bytes(b"wav")
-    media = FakeMediaAdapter(duration=3600.0)
+    duration = 3600.0
+    media = FakeMediaAdapter(duration=duration)
     whisper = FakeWhisperAdapter()
 
     result = WhisperTranscriber(media, whisper).transcribe(
@@ -132,11 +140,17 @@ def test_long_media_is_chunked_and_merged_behind_the_same_interface(tmp_path):
     )
 
     assert isinstance(result, Completed)
-    assert media.rendered_chunks == [(0.0, 1800.0), (1800.0, 1800.0)]
-    assert len(whisper.calls) == 2
+    plan = decide(duration)
+    assert media.rendered_chunks == [
+        (i * plan.chunk_seconds,
+         min(plan.chunk_seconds, duration - i * plan.chunk_seconds))
+        for i in range(plan.chunk_count)
+    ]
+    assert len(whisper.calls) == plan.chunk_count
     merged = result.srt_path.read_text(encoding="utf-8")
     assert "00:00:01,000 --> 00:00:02,000" in merged
-    assert "00:30:01,000 --> 00:30:02,000" in merged
+    chunk_minutes = int(plan.chunk_seconds // 60)
+    assert f"00:{chunk_minutes:02d}:01,000 --> 00:{chunk_minutes:02d}:02,000" in merged
 
 
 def test_progress_is_reported_as_structured_stage_events(tmp_path):
@@ -218,15 +232,6 @@ def test_failure_identifies_stage_and_preserves_existing_srt(tmp_path):
 
     assert result == Failed("transcribing", "model rejected input")
     assert existing.read_text(encoding="utf-8") == "previous complete result"
-
-
-def test_model_resolution_uses_registry_path_when_available():
-    models = lambda: [{"name": "tiny", "path": "D:/models/tiny.bin"}]
-
-    assert resolve_model_path("D:/models", "tiny", models) == "D:/models/tiny.bin"
-    assert resolve_model_path("D:/models", "other.bin", models) == str(
-        Path("D:/models") / "other.bin"
-    )
 
 
 @patch("whisper_transcription._run_process")
@@ -318,7 +323,8 @@ def test_observer_failure_does_not_change_committed_outcome(tmp_path):
 def test_chunked_timestamps_do_not_wrap_after_24_hours(tmp_path):
     source = tmp_path / "very-long.wav"
     source.write_bytes(b"wav")
-    media = FakeMediaAdapter(duration=25 * 60 * 60)
+    duration = 25 * 60 * 60
+    media = FakeMediaAdapter(duration=duration)
 
     result = WhisperTranscriber(media, FakeWhisperAdapter()).transcribe(
         TranscriptionRequest(
@@ -331,14 +337,17 @@ def test_chunked_timestamps_do_not_wrap_after_24_hours(tmp_path):
     )
 
     assert isinstance(result, Completed)
+    plan = decide(duration)
+    last_start = (plan.chunk_count - 1) * plan.chunk_seconds
     merged = result.srt_path.read_text(encoding="utf-8")
-    assert "24:00:01,000 --> 24:00:02,000" in merged
+    assert f"{int(last_start // 3600):02d}:{int(last_start % 3600 // 60):02d}:01,000" in merged
 
 
 def test_probe_rounding_does_not_create_zero_length_final_chunk(tmp_path):
     source = tmp_path / "long.wav"
     source.write_bytes(b"wav")
-    media = FakeMediaAdapter(duration=3600.0004)
+    duration = 3600.0004
+    media = FakeMediaAdapter(duration=duration)
 
     result = WhisperTranscriber(media, FakeWhisperAdapter()).transcribe(
         TranscriptionRequest(
@@ -351,7 +360,60 @@ def test_probe_rounding_does_not_create_zero_length_final_chunk(tmp_path):
     )
 
     assert isinstance(result, Completed)
-    assert media.rendered_chunks == [(0.0, 1800.0), (1800.0, 1800.0)]
+    plan = decide(duration)
+    assert len(media.rendered_chunks) == plan.chunk_count
+    assert all(chunk_duration > 0 for _, chunk_duration in media.rendered_chunks)
+
+
+class TestChunkingPolicy:
+    """The Chunking Policy is a deep module: callers and tests cross the same
+    seam. The engine tests above execute the plan it returns; here the rule
+    itself is pinned.
+    """
+
+    def test_short_duration_is_never_chunked(self):
+        plan = decide(60.0)
+
+        assert plan.chunked is False
+        assert plan.chunk_count == 1
+        assert plan.chunk_seconds == CHUNK_SECONDS
+
+    def test_threshold_boundary(self):
+        assert decide(30 * 60).chunked is False
+        assert decide(30 * 60 + 0.001).chunked is False
+        assert decide(30 * 60 + 0.002).chunked is True
+
+    def test_chunk_size_and_count_come_from_the_plan(self):
+        plan = decide(3600.0)
+
+        assert plan.chunked is True
+        assert plan.chunk_seconds == 1800.0
+        assert plan.chunk_count == 2
+
+    def test_probe_rounding_yields_no_zero_length_final_chunk(self):
+        plan = decide(3600.0004)
+
+        assert plan.chunked is True
+        assert plan.chunk_count == 2
+
+    def test_day_long_media_chunks_without_wrapping(self):
+        assert decide(25 * 3600.0).chunk_count == 50
+
+    def test_flag_round_trips_through_config(self, tmp_path):
+        from config_manager import ConfigManager
+        cm = ConfigManager(str(tmp_path / "cfg.json"))
+        cm.load()
+
+        assert chunking_enabled(cm) is False
+        set_chunking_enabled(cm, True)
+        assert chunking_enabled(cm) is True
+        set_chunking_enabled(cm, False)
+        assert chunking_enabled(cm) is False
+
+    def test_label_is_derived_from_chunk_seconds(self):
+        assert chunking_label() == (
+            f"Chunk long audio ({CHUNK_SECONDS // 60} min, anti-repeat)"
+        )
 
 
 def test_output_directory_failure_is_returned_as_failed_outcome(tmp_path):

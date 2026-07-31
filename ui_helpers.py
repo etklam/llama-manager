@@ -1,7 +1,6 @@
 import re
-import threading
 from datetime import datetime
-from typing import Any, Callable, List, Optional, Sequence
+from typing import Callable, Optional, Sequence
 import tkinter as tk
 from tkinter import ttk, scrolledtext
 
@@ -147,69 +146,3 @@ class LogMixin:
         self._log_text.config(state="normal")
         self._log_text.delete(1.0, tk.END)
         self._log_text.config(state="disabled")
-
-
-class BatchRunner:
-    """Shared lifecycle shell for batch UI loops (translate/whisper/etc).
-
-    Owns: button toggling, stop flag, file iteration with stop check,
-    per-file exception catching, progress+done callbacks marshalled via
-    schedule_fn. Each caller supplies per_file_fn(file) for the real work.
-    """
-
-    def __init__(self, start_btn, stop_btn, log_fn, schedule_fn):
-        self._start_btn = start_btn
-        self._stop_btn = stop_btn
-        self._log = log_fn
-        self._schedule = schedule_fn
-        self._running = False
-        self._stop_requested = False
-        self._thread: Optional[threading.Thread] = None
-
-    @property
-    def is_running(self) -> bool:
-        return self._running
-
-    def run(self, files: List[str], per_file_fn: Callable[[str], Any],
-            on_progress: Optional[Callable[[int, str], None]] = None,
-            on_done: Optional[Callable[..., None]] = None) -> None:
-        """Run the batch loop synchronously. Caller typically invokes in a thread."""
-        self._running = True
-        self._stop_requested = False
-        self._start_btn.config(state="disabled")
-        self._stop_btn.config(state="normal")
-
-        try:
-            for i, filepath in enumerate(files):
-                if self._stop_requested:
-                    self._log("WARNING", "Stopped by user")
-                    break
-                if on_progress:
-                    on_progress(i, filepath)
-                try:
-                    per_file_fn(filepath)
-                except Exception as e:
-                    self._log("ERROR", f"Failed: {filepath} - {e}")
-        finally:
-            self._running = False
-            stopped = self._stop_requested
-            self._start_btn.config(state="normal")
-            self._stop_btn.config(state="disabled")
-            if on_done:
-                self._schedule(lambda: on_done(stopped=stopped))
-
-    def run_async(self, files: List[str], per_file_fn: Callable[[str], Any],
-                  on_progress=None, on_done=None) -> threading.Thread:
-        """Spawn run() in a daemon thread. Returns the thread handle."""
-        self._thread = threading.Thread(
-            target=self.run,
-            args=(files, per_file_fn),
-            kwargs={"on_progress": on_progress, "on_done": on_done},
-            daemon=True,
-        )
-        self._thread.start()
-        return self._thread
-
-    def stop(self) -> None:
-        self._stop_requested = True
-        self._log("WARNING", "Stopping after current file...")

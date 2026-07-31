@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Optional
 
 # This import will FAIL until ModelRegistry is implemented
+from base_registry import BaseModelRegistry
 from model_registry import ModelRegistry
 from config_manager import ConfigManager
 
@@ -338,6 +339,48 @@ class TestGetModelPathUnknown:
         """Test that get_model_path returns None for empty name."""
         path = model_registry.get_model_path("")
         assert path is None, f"Should return None for empty name, got {path}"
+
+
+# Test: resolve_model_path unifies the server and whisper lookups
+class TestResolveModelPath:
+    """The registry family owns resolution: server and whisper flows cross
+    the same seam, so both flavors of the lookup are pinned here."""
+
+    def test_registered_model_wins_over_dir_fallback(self, model_registry, temp_scan_dir):
+        test_file = temp_scan_dir / "test-model.gguf"
+        test_file.write_text("x" * 1024)
+        model_registry.add_model(str(test_file))
+
+        path = BaseModelRegistry.resolve_model_path(
+            model_registry.list_models(), str(temp_scan_dir), "test-model")
+
+        assert path == str(test_file), f"Registered path should win, got {path}"
+
+    def test_unregistered_name_falls_back_to_model_dir(self, model_registry):
+        path = BaseModelRegistry.resolve_model_path(
+            model_registry.list_models(), "D:/models", "other.gguf")
+
+        assert path == str(Path("D:/models") / "other.gguf"), f"Got {path}"
+
+    def test_empty_model_dir_passes_name_through(self, model_registry):
+        path = BaseModelRegistry.resolve_model_path(
+            model_registry.list_models(), "", "tiny")
+
+        assert path == "tiny", f"Got {path}"
+
+    def test_empty_name_passes_through(self, model_registry):
+        path = BaseModelRegistry.resolve_model_path(
+            model_registry.list_models(), "D:/models", "")
+
+        assert path == "", f"Got {path}"
+
+    def test_whisper_model_list_resolves_through_the_same_lookup(self):
+        models = [{"name": "tiny", "path": "D:/models/tiny.bin"}]
+
+        assert BaseModelRegistry.resolve_model_path(
+            models, "D:/models", "tiny") == "D:/models/tiny.bin"
+        assert BaseModelRegistry.resolve_model_path(
+            models, "D:/models", "base") == str(Path("D:/models") / "base")
 
 
 # Test 11: scan handles missing scan directory gracefully

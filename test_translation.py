@@ -8,7 +8,7 @@ Tests the translation functionality with real LLM API
 import sys
 import json
 from pathlib import Path
-from utils.srt_parser import parse_srt_from_file, generate_srt_from_list
+from utils.srt_parser import Cue, parse_srt_from_file, generate_srt_from_list
 from translation.local_llm_translator import LocalLLMTranslator
 
 # Fix Windows console encoding
@@ -49,7 +49,7 @@ def test_srt_parsing():
     print(f"✓ Parsed {len(subtitles)} subtitle blocks")
 
     for sub in subtitles:
-        print(f"  Line {sub['line']}: {sub['text'][:50]}...")
+        print(f"  Line {sub.line}: {sub.text[:50]}...")
 
     test_file.unlink()
     print("✓ Test file cleaned up\n")
@@ -63,24 +63,8 @@ def test_srt_generation():
     print("=" * 60)
 
     test_subtitles = [
-        {
-            'line': 1,
-            'start_time': 1000,
-            'end_time': 3000,
-            'text': 'Test subtitle 1',
-            'time': '00:00:01,000 --> 00:00:03,000',
-            'startraw': '00:00:01,000',
-            'endraw': '00:00:03,000'
-        },
-        {
-            'line': 2,
-            'start_time': 3500,
-            'end_time': 6000,
-            'text': 'Test subtitle 2',
-            'time': '00:00:03,500 --> 00:00:06,000',
-            'startraw': '00:00:03,500',
-            'endraw': '00:00:06,000'
-        }
+        Cue(line=1, start_time=1000, end_time=3000, text='Test subtitle 1'),
+        Cue(line=2, start_time=3500, end_time=6000, text='Test subtitle 2'),
     ]
 
     srt_content = generate_srt_from_list(test_subtitles)
@@ -152,7 +136,7 @@ def test_srt_translation(translator, subtitles):
         print(f"✓ Translated {len(translated_srt)} blocks")
 
         for i, sub in enumerate(translated_srt, 1):
-            print(f"  Block {i}: {sub['text'][:50]}...")
+            print(f"  Block {i}: {sub.text[:50]}...")
 
         print()
 

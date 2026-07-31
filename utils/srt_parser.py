@@ -9,10 +9,35 @@ Adapted from pyvideotrans for use in llama-manager.
 
 import re
 import copy
+from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Dict, Optional
+from typing import List, Optional
 
 from constants import TARGET_LANGUAGES
+
+
+@dataclass(frozen=True)
+class Cue:
+    """One subtitle entry crossing the transcribe/translate seam.
+
+    parse_srt_* returns Cues and generate_srt_from_list consumes them, so the
+    element representation is the same on both sides of the seam: callers and
+    tests never guess a key set. Times are milliseconds from the start of the
+    media; the SRT timestamp strings ("HH:MM:SS,mmm --> ...") are derived only
+    at generation time.
+
+    Attributes:
+        start_time: Start of the cue, in milliseconds.
+        end_time: End of the cue, in milliseconds.
+        text: Subtitle text; may span lines for multi-line cues.
+        line: 1-based sequence number from the parsed SRT, or 0 when the cue
+            was built without one (e.g. a chunk-merge result).
+    """
+
+    start_time: int
+    end_time: int
+    text: str
+    line: int = 0
 
 
 # --- Repetition compression -------------------------------------------------
@@ -164,25 +189,22 @@ def _ms_to_time_string(*, ms: int = 0, seconds: Optional[int] = None, sepflag: s
     return f"{hours:02}:{minutes:02}:{seconds:02}{sepflag}{milliseconds:03}"
 
 
-def parse_srt_from_string(srt_string: str) -> List[Dict]:
+def parse_srt_from_string(srt_string: str) -> List[Cue]:
     """
     Parse SRT content from a string.
 
-    This function parses SRT subtitle format and returns a list of subtitle
-    dictionaries. It handles various time formats and skips malformed entries.
+    This function parses SRT subtitle format and returns a list of Cue
+    objects. It handles various time formats and skips malformed entries.
 
     Args:
         srt_string: SRT content as a string
 
     Returns:
-        List of subtitle dictionaries, each containing:
+        List of Cue objects, each containing:
         - line: Sequential line number (int)
         - start_time: Start time in milliseconds (int)
         - end_time: End time in milliseconds (int)
         - text: Subtitle text (str)
-        - time: Full time string "HH:MM:SS,mmm --> HH:MM:SS,mmm" (str)
-        - startraw: Start time string "HH:MM:SS,mmm" (str)
-        - endraw: End time string "HH:MM:SS,mmm" (str)
     """
     if not srt_string.strip():
         return []
@@ -245,23 +267,19 @@ def parse_srt_from_string(srt_string: str) -> List[Dict]:
             text = ('\n'.join(text_lines)).strip()
             text = re.sub(r'\n{2,}', '\n', text, flags=re.I | re.S).strip()
 
-            it = {
-                "line": len(srt_list) + 1,
-                "start_time": int(start_time),
-                "end_time": int(end_time),
-                "text": text if text else "",
-            }
-            it['startraw'] = _ms_to_time_string(ms=it['start_time'])
-            it['endraw'] = _ms_to_time_string(ms=it['end_time'])
-            it["time"] = f"{it['startraw']} --> {it['endraw']}"
-            srt_list.append(it)
+            srt_list.append(Cue(
+                line=len(srt_list) + 1,
+                start_time=int(start_time),
+                end_time=int(end_time),
+                text=text if text else "",
+            ))
         else:
             i += 1
 
     return srt_list
 
 
-def parse_srt_from_file(srt_file: str) -> List[Dict]:
+def parse_srt_from_file(srt_file: str) -> List[Cue]:
     """
     Parse SRT content from a file.
 
@@ -272,7 +290,7 @@ def parse_srt_from_file(srt_file: str) -> List[Dict]:
         srt_file: Path to the SRT file
 
     Returns:
-        List of subtitle dictionaries (see parse_srt_from_string)
+        List of Cue objects (see parse_srt_from_string)
 
     Raises:
         FileNotFoundError: If the file doesn't exist
@@ -301,18 +319,16 @@ def parse_srt_from_file(srt_file: str) -> List[Dict]:
     return parse_srt_from_string(content)
 
 
-def generate_srt_from_list(subtitle_list: List[Dict]) -> str:
+def generate_srt_from_list(subtitle_list: List[Cue]) -> str:
     """
-    Generate SRT format string from a list of subtitle dictionaries.
+    Generate SRT format string from a list of Cue objects.
 
-    This function converts a list of subtitle dictionaries back into
-    SRT format string. It handles various input formats:
-    - With 'time' field: "00:00:01,000 --> 00:00:02,000"
-    - With 'startraw' and 'endraw' fields
-    - With 'start_time' and 'end_time' fields (milliseconds)
+    This function converts a list of Cue objects back into an SRT format
+    string. Timestamps are derived from each cue's millisecond times and
+    entries are numbered sequentially from 1.
 
     Args:
-        subtitle_list: List of subtitle dictionaries
+        subtitle_list: List of Cue objects
 
     Returns:
         SRT format string
@@ -321,31 +337,10 @@ def generate_srt_from_list(subtitle_list: List[Dict]) -> str:
         return ""
 
     txt = ""
-    line = 0
-
-    for it in subtitle_list:
-        line += 1
-
-        if "startraw" not in it:
-            # Check for complete time field
-            if 'time' in it:
-                startraw, endraw = it['time'].strip().split(" --> ")
-                startraw = format_time(startraw.strip().replace('.', ','), ',')
-                endraw = format_time(endraw.strip().replace('.', ','), ',')
-            elif 'start_time' in it and 'end_time' in it:
-                # Use millisecond values
-                startraw = _ms_to_time_string(ms=it['start_time'])
-                endraw = _ms_to_time_string(ms=it['end_time'])
-            else:
-                # Default to 00:00:00,000 if no time information
-                startraw = "00:00:00,000"
-                endraw = "00:00:00,000"
-        else:
-            # Use existing raw time strings
-            startraw = it['startraw']
-            endraw = it['endraw']
-
-        txt += f"{line}\n{startraw} --> {endraw}\n{it['text']}\n\n"
+    for line, cue in enumerate(subtitle_list, start=1):
+        startraw = _ms_to_time_string(ms=cue.start_time)
+        endraw = _ms_to_time_string(ms=cue.end_time)
+        txt += f"{line}\n{startraw} --> {endraw}\n{cue.text}\n\n"
 
     return txt.strip()
 

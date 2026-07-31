@@ -14,34 +14,23 @@ import logging
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import replace
 from pathlib import Path
 from typing import Callable, List, Dict, Optional, TYPE_CHECKING
 
-from openai import LengthFinishReasonError, RateLimitError
-from tenacity import (
-    retry,
-    stop_after_attempt,
-    wait_exponential,
-    retry_if_exception_type,
-    before_sleep_log,
-    RetryError
-)
+from tenacity import RetryError
 
 # Import LLMClient port for type checking
 if TYPE_CHECKING:
     from translation.llm_client import LLMClient
 
 from translation.prompt_builder import build_translation_prompt
-from utils.srt_parser import collapse_repeats
+from utils.srt_parser import Cue, collapse_repeats
 
 logger = logging.getLogger(__name__)
 
 # Constants
-RETRY_NUMS = 3
-RETRY_DELAY = 1  # Initial delay for exponential backoff
 DEFAULT_MAX_TOKENS = 4096
-DEFAULT_TEMPERATURE = 0.3
-DEFAULT_API_URL = "http://localhost:8080/v1"
 DEFAULT_BATCH_SIZE = 15  # Larger batch reduces API call overhead
 DEFAULT_MAX_WORKERS = 3
 
@@ -65,6 +54,17 @@ MIN_DYNAMIC_MAX_TOKENS = 1024
 # beyond that is long-form text on the wrong path. Exceeding it only logs a
 # warning — see translate_srt — never rejects or truncates the line.
 LONG_SOURCE_WARN_CHARS = 500
+
+
+def _rebuild_cue(entry: Cue, text: str, fallback_line: int = 0) -> Cue:
+    """Build the translated cue: same timing, new text.
+
+    Every reconstruction site in translate_srt collapses onto this one
+    conversion. Only the text differs from the source cue; start/end times
+    travel untouched, and the line number falls back to the caller's position
+    when the source cue carried none.
+    """
+    return replace(entry, text=text, line=entry.line or fallback_line)
 
 
 class LocalLLMTranslator:
@@ -127,7 +127,6 @@ class LocalLLMTranslator:
         # Store injected client or create OpenAIClient lazily
         self._injected_client = client
         self._openai_client = None  # OpenAIClient instance (will be created lazily if needed)
-        self._client = None
 
     def _get_llm_client(self) -> 'LLMClient':
         """
@@ -234,7 +233,12 @@ class LocalLLMTranslator:
     def _call_api(self, messages: List[Dict[str, str]],
                   max_tokens: Optional[int] = None) -> str:
         """
-        Call the LLM API via the client port with retry logic.
+        Call the LLM API via the client port.
+
+        Retry semantics belong to the client adapter: OpenAIClient's tenacity
+        decorator owns the retry loop and, once exhausted, raises RetryError.
+        This is the one place the translator unwraps that envelope so callers
+        of the port see the underlying failure, not tenacity's wrapper.
 
         Args:
             messages: List of message dictionaries
@@ -246,7 +250,9 @@ class LocalLLMTranslator:
 
         Raises:
             RuntimeError: If the API call fails or returns invalid response
-            LengthFinishReasonError: If the response was truncated due to length
+            LengthFinishReasonError: If the client reports a truncated
+                response with no usable content (the adapter does not retry a
+                length stop, so this propagates unwrapped)
         """
         # Use the LLMClient port (injected or created)
         client = self._get_llm_client()
@@ -262,7 +268,8 @@ class LocalLLMTranslator:
             logger.debug(f'[LocalLLM] Response: {response}')
 
         except RetryError as e:
-            # Tenacity wraps exceptions in RetryError
+            # Tenacity wraps the final failure in RetryError once the adapter
+            # exhausts its retries; surface that underlying exception.
             if e.last_attempt.exception():
                 logger.error(f'[LocalLLM] API call failed after retries: {e.last_attempt.exception()}')
                 raise e.last_attempt.exception()
@@ -437,14 +444,9 @@ class LocalLLMTranslator:
 
         messages = self._build_single_prompt(text, target_language, context)
 
-        try:
-            raw_result = self._call_api(
-                messages, max_tokens=self._dynamic_max_tokens(1)
-            )
-        except RetryError as e:
-            if e.last_attempt.exception():
-                raise e.last_attempt.exception()
-            raise
+        raw_result = self._call_api(
+            messages, max_tokens=self._dynamic_max_tokens(1)
+        )
 
         # Parse YAML result
         parsed = self._parse_yaml_result(raw_result)
@@ -504,12 +506,12 @@ class LocalLLMTranslator:
 
     def translate_srt(
         self,
-        srt_data: List[Dict],
+        srt_data: List[Cue],
         target_language: str,
         progress_callback: Optional[Callable] = None,
         log_callback: Optional[Callable] = None,
         _deduplicate: bool = True
-    ) -> List[Dict]:
+    ) -> List[Cue]:
         """
         Translate SRT subtitle format while preserving timestamps.
 
@@ -521,13 +523,13 @@ class LocalLLMTranslator:
         with automatic fallback to individual translation on batch failure.
 
         Args:
-            srt_data: List of subtitle dictionaries
+            srt_data: List of Cue objects (see utils.srt_parser)
             target_language: Target language name
             progress_callback: Optional fn(current, total, status)
             log_callback: Optional fn(level, message)
 
         Returns:
-            List of subtitle dictionaries with translated text (step2/意译)
+            List of Cue objects with translated text (step2/意译)
         """
         if not isinstance(srt_data, list):
             raise ValueError("srt_data must be a list")
@@ -541,16 +543,15 @@ class LocalLLMTranslator:
 
         # Collapse pathological repetition (e.g. "あ、あ、あ、..." x100) in each
         # cue's source before translating. Such runs burn tokens and can hang
-        # the model. We copy each entry so the caller's dicts stay untouched and
+        # the model. We copy each Cue so the caller's objects stay untouched and
         # only the text field is normalized; timestamps/line numbers are kept.
         collapsed_count = 0
-        normalized: List[Dict] = []
+        normalized: List[Cue] = []
         for entry in srt_data:
-            text = entry.get('text', '')
-            new_text = collapse_repeats(text)
-            if new_text != text:
+            new_text = collapse_repeats(entry.text)
+            if new_text != entry.text:
                 collapsed_count += 1
-                entry = {**entry, 'text': new_text}
+                entry = replace(entry, text=new_text)
             normalized.append(entry)
         if collapsed_count:
             _log("INFO", f"Collapsed repeated runs in {collapsed_count} line(s)")
@@ -562,33 +563,34 @@ class LocalLLMTranslator:
         # or truncating would silently lose subtitle content — but the warning
         # names the lines to look at when a result comes back mangled or when
         # the request trips the context limit. Long-form input belongs on the
-        # chat endpoint with its larger context, not here.
-        if _deduplicate:
-            long_lines = [
-                entry.get('line', idx + 1)
-                for idx, entry in enumerate(srt_data)
-                if len(entry.get('text', '')) > LONG_SOURCE_WARN_CHARS
-            ]
-            if long_lines:
-                shown = ', '.join(f"L{n}" for n in long_lines[:5])
-                if len(long_lines) > 5:
-                    shown += f", +{len(long_lines) - 5} more"
-                _log("WARNING",
-                     f"{len(long_lines)} line(s) exceed "
-                     f"{LONG_SOURCE_WARN_CHARS} chars ({shown}); this path is "
-                     "tuned for short context — use chat mode for long-form text")
+        # chat endpoint with its larger context, not here. The guard is about
+        # context size, not dedup: it fires whether or not the dedup pre-pass
+        # runs, so it is not gated on _deduplicate.
+        long_lines = [
+            entry.line or (idx + 1)
+            for idx, entry in enumerate(srt_data)
+            if len(entry.text) > LONG_SOURCE_WARN_CHARS
+        ]
+        if long_lines:
+            shown = ', '.join(f"L{n}" for n in long_lines[:5])
+            if len(long_lines) > 5:
+                shown += f", +{len(long_lines) - 5} more"
+            _log("WARNING",
+                 f"{len(long_lines)} line(s) exceed "
+                 f"{LONG_SOURCE_WARN_CHARS} chars ({shown}); this path is "
+                 "tuned for short context — use chat mode for long-form text")
 
         # Translate identical cues only once, then fan the result back out to
         # every original timestamp. Exact text after whitespace normalization is
         # the cache key; repetition compression above runs first, so pathological
         # variants such as 100x "あ、" also converge to the same short key.
         if _deduplicate and len(srt_data) > 1:
-            unique_entries: List[Dict] = []
+            unique_entries: List[Cue] = []
             unique_index: Dict[str, int] = {}
             entry_keys: List[str] = []
 
             for entry in srt_data:
-                key = re.sub(r'\s+', ' ', entry.get('text', '')).strip()
+                key = re.sub(r'\s+', ' ', entry.text).strip()
                 entry_keys.append(key)
                 if key not in unique_index:
                     unique_index[key] = len(unique_entries)
@@ -623,33 +625,28 @@ class LocalLLMTranslator:
 
                 translated_by_key = {}
                 for idx, entry in enumerate(unique_entries):
-                    key = re.sub(r'\s+', ' ', entry.get('text', '')).strip()
+                    key = re.sub(r'\s+', ' ', entry.text).strip()
                     if idx < len(unique_translated):
-                        translated_by_key[key] = unique_translated[idx].get(
-                            'text', entry.get('text', '')
-                        )
+                        translated_by_key[key] = unique_translated[idx].text
                     else:
-                        translated_by_key[key] = entry.get('text', '')
+                        translated_by_key[key] = entry.text
 
                 return [
-                    {
-                        'text': translated_by_key.get(
-                            key, entry.get('text', '')
-                        ),
-                        'time': entry.get('time', ''),
-                        'line': entry.get('line', idx + 1),
-                    }
+                    _rebuild_cue(
+                        entry,
+                        translated_by_key.get(key, entry.text),
+                        fallback_line=idx + 1,
+                    )
                     for idx, (entry, key) in enumerate(zip(srt_data, entry_keys))
                 ]
 
+        # One batch core feeds every code path. There is no separate simple
+        # path for tiny files and no sequential branch for max_workers <= 1:
+        # both are just small pools over the same _translate_batch_lines
+        # machinery, so batch reconstruction / by-id alignment exists exactly
+        # once. A 1-worker pool is sequential by construction.
+        workers = 1 if self.max_workers <= 1 else self.max_workers
         batch_size = max(1, self._config.get('batch_size', DEFAULT_BATCH_SIZE))
-
-        # Use individual translation for tiny files
-        if len(srt_data) <= 3:
-            _log("INFO", f"Short file ({len(srt_data)} lines), translating individually")
-            return self._translate_srt_simple(
-                srt_data, target_language, progress_callback, log_callback
-            )
 
         # Split into batches
         batches = [
@@ -659,59 +656,50 @@ class LocalLLMTranslator:
         total_batches = len(batches)
         _log("INFO", f"Batching {len(srt_data)} lines in "
              f"{total_batches} groups of {batch_size} "
-             f"(workers={self.max_workers}, single_step={self.single_step})")
+             f"(workers={workers}, single_step={self.single_step})")
 
         overall_start = time.time()
 
-        # Submit all batches concurrently
-        batch_results: Dict[int, List[Dict]] = {}
+        # Submit all batches concurrently. log_callback is safe to pass
+        # through: the UI marshals it via log_bus.emit -> root.after(0, ...)
+        # rather than touching Tk directly, so per-line logs stay visible with
+        # workers>1.
+        batch_results: Dict[int, List[Cue]] = {}
         batch_errors: Dict[int, Exception] = {}
-
-        if self.max_workers <= 1:
-            # Sequential mode (no concurrency)
+        done_lines = 0
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {}
             for batch_idx, batch in enumerate(batches):
-                self._process_single_batch(
-                    batch_idx, batch, batches, srt_data, target_language,
-                    log_callback, progress_callback, batch_results, batch_errors
+                future = executor.submit(
+                    self._translate_batch_lines,
+                    batch, target_language, log_callback
                 )
-        else:
-            # Concurrent mode. log_callback is safe to pass through: the UI
-            # marshals it via log_bus.emit -> root.after(0, ...) rather than
-            # touching Tk directly, so per-line logs stay visible with workers>1.
-            done_lines = 0
-            with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-                futures = {}
-                for batch_idx, batch in enumerate(batches):
-                    future = executor.submit(
-                        self._translate_batch_lines,
-                        batch, target_language, log_callback
+                futures[future] = batch_idx
+
+            for future in as_completed(futures):
+                batch_idx = futures[future]
+                batch = batches[batch_idx]
+                batch_start_global = batch_idx * batch_size + 1
+                batch_end_global = batch_start_global + len(batch) - 1
+                try:
+                    batch_results[batch_idx] = future.result()
+                    _log("SUCCESS", f"Batch {batch_idx+1} done "
+                         f"({batch_start_global}-{batch_end_global})")
+                except Exception as e:
+                    batch_errors[batch_idx] = e
+                    _log("WARNING", f"Batch {batch_idx+1} failed ({e}), "
+                         "falling back to individual translation")
+
+                # Report line-level progress as each batch completes so the
+                # UI progress bar / ETA advances smoothly, not once at the end.
+                done_lines += len(batch)
+                if progress_callback:
+                    elapsed = time.time() - overall_start
+                    rate = done_lines / elapsed if elapsed > 0 else 0.0
+                    progress_callback(
+                        done_lines, len(srt_data),
+                        f"{rate:.1f} lines/s"
                     )
-                    futures[future] = batch_idx
-
-                for future in as_completed(futures):
-                    batch_idx = futures[future]
-                    batch = batches[batch_idx]
-                    batch_start_global = batch_idx * batch_size + 1
-                    batch_end_global = batch_start_global + len(batch) - 1
-                    try:
-                        batch_results[batch_idx] = future.result()
-                        _log("SUCCESS", f"Batch {batch_idx+1} done "
-                             f"({batch_start_global}-{batch_end_global})")
-                    except Exception as e:
-                        batch_errors[batch_idx] = e
-                        _log("WARNING", f"Batch {batch_idx+1} failed ({e}), "
-                             "falling back to individual translation")
-
-                    # Report line-level progress as each batch completes so the
-                    # UI progress bar / ETA advances smoothly, not once at the end.
-                    done_lines += len(batch)
-                    if progress_callback:
-                        elapsed = time.time() - overall_start
-                        rate = done_lines / elapsed if elapsed > 0 else 0.0
-                        progress_callback(
-                            done_lines, len(srt_data),
-                            f"{rate:.1f} lines/s"
-                        )
 
         # Reconstruct results in order, with fallback for failed batches
         all_translated = []
@@ -724,7 +712,7 @@ class LocalLLMTranslator:
                 # Fall back to individual translation
                 for i, entry in enumerate(batch):
                     line_num = batch_start_global + i
-                    text = entry.get('text', '').strip().replace("\n", " ")
+                    text = entry.text.strip().replace("\n", " ")
                     if text:
                         try:
                             translated = self.translate(text, target_language)
@@ -733,11 +721,9 @@ class LocalLLMTranslator:
                     else:
                         translated = text
                     _log("INFO", f"  L{line_num}: \"{text[:60]}\" -> \"{translated[:60]}\"")
-                    all_translated.append({
-                        'text': translated,
-                        'time': entry.get('time', ''),
-                        'line': entry.get('line', line_num)
-                    })
+                    all_translated.append(
+                        _rebuild_cue(entry, translated, fallback_line=line_num)
+                    )
 
         total_elapsed = time.time() - overall_start
         rate = len(all_translated) / total_elapsed if total_elapsed > 0 else float('inf')
@@ -745,50 +731,9 @@ class LocalLLMTranslator:
              f"{total_elapsed:.1f}s ({rate:.1f} lines/s)")
         return all_translated
 
-    def _process_single_batch(
-        self,
-        batch_idx: int,
-        batch: List[Dict],
-        batches: List[List[Dict]],
-        srt_data: List[Dict],
-        target_language: str,
-        log_callback: Optional[Callable],
-        progress_callback: Optional[Callable],
-        batch_results: Dict[int, List[Dict]],
-        batch_errors: Dict[int, Exception]
-    ):
-        """Process a single batch sequentially (used when max_workers <= 1)."""
-        batch_size = len(batch)
-        batch_start_global = batch_idx * max(1, self._config.get('batch_size', DEFAULT_BATCH_SIZE)) + 1
-        batch_end_global = batch_start_global + batch_size - 1
-
-        def _log(level, msg):
-            if log_callback:
-                log_callback(level, msg)
-
-        if progress_callback:
-            progress_callback(
-                batch_start_global, len(srt_data),
-                f"batch {batch_idx+1}/{len(batches)} L{batch_start_global}-{batch_end_global}"
-            )
-
-        _log("INFO", f"Batch {batch_idx+1}/{len(batches)}: "
-             f"lines {batch_start_global}-{batch_end_global} ({batch_size} lines)")
-
-        batch_t0 = time.time()
-        try:
-            batch_result = self._translate_batch_lines(
-                batch, target_language, log_callback
-            )
-            elapsed = time.time() - batch_t0
-            batch_results[batch_idx] = batch_result
-            _log("SUCCESS", f"Batch {batch_idx+1} done ({elapsed:.1f}s)")
-        except Exception as e:
-            batch_errors[batch_idx] = e
-
-    def _build_batch_yaml(self, batch: List[Dict]) -> str:
+    def _build_batch_yaml(self, batch: List[Cue]) -> str:
         """
-        Build YAML input for batch translation from subtitle entries.
+        Build YAML input for batch translation from subtitle cues.
 
         Format:
             - id: 1
@@ -798,17 +743,17 @@ class LocalLLMTranslator:
         """
         yaml_lines = []
         for j, entry in enumerate(batch):
-            text = entry.get('text', '').strip().replace("\n", " ")
+            text = entry.text.strip().replace("\n", " ")
             yaml_lines.append(f"- id: {j+1}")
             yaml_lines.append(f"  source: {text}")
         return "\n".join(yaml_lines)
 
     def _translate_batch_lines(
         self,
-        batch: List[Dict],
+        batch: List[Cue],
         target_language: str,
         log_callback: Optional[Callable] = None
-    ) -> List[Dict]:
+    ) -> List[Cue]:
         """Translate a batch of subtitle lines using YAML two-step format."""
         def _log(level, msg):
             if log_callback:
@@ -819,16 +764,12 @@ class LocalLLMTranslator:
 
         messages = self._build_batch_prompt(yaml_input, target_language)
 
-        try:
-            raw_result = self._call_api(
-                messages, max_tokens=self._dynamic_max_tokens(len(batch))
-            )
-        except LengthFinishReasonError:
-            raise  # Let caller fall back to individual
-        except RetryError as e:
-            if e.last_attempt.exception():
-                raise e.last_attempt.exception()
-            raise
+        # Any exception — including a LengthFinishReasonError the client
+        # raised because nothing usable came back — propagates to the executor
+        # loop, which falls back to per-line translation.
+        raw_result = self._call_api(
+            messages, max_tokens=self._dynamic_max_tokens(len(batch))
+        )
 
         # Parse YAML result
         parsed = self._parse_yaml_result(raw_result)
@@ -864,20 +805,16 @@ class LocalLLMTranslator:
                 final_text = matched.get('step2', '') or matched.get('step1', '')
                 s1 = matched.get('step1', '')[:60]
                 s2 = matched.get('step2', '')[:60]
-                _log("INFO", f"  L{entry.get('line', '?')}: "
+                _log("INFO", f"  L{entry.line or '?'}: "
                      f"直译=\"{s1}\" -> 意译=\"{s2}\"")
             if not final_text:
                 # The model returned no usable text for this line. Emitting the
                 # source verbatim is precisely the "not translated" symptom, so
                 # mark it for a targeted individual retry below.
                 missing_positions.append(j)
-                final_text = entry.get('text', '')
-                _log("WARNING", f"  L{entry.get('line', '?')}: missing parsed result")
-            result.append({
-                'text': final_text,
-                'time': entry.get('time', ''),
-                'line': entry.get('line', 0)
-            })
+                final_text = entry.text
+                _log("WARNING", f"  L{entry.line or '?'}: missing parsed result")
+            result.append(_rebuild_cue(entry, final_text))
 
         # Retranslate any dropped/garbled lines one at a time rather than
         # leaving the untranslated source in the output. This is bounded by the
@@ -885,40 +822,39 @@ class LocalLLMTranslator:
         # missed, so a well-behaved model incurs no extra calls.
         for j in missing_positions:
             entry = batch[j]
-            src = entry.get('text', '').strip().replace("\n", " ")
+            src = entry.text.strip().replace("\n", " ")
             if not src:
                 continue
             try:
                 retry_text = self.translate(src, target_language)
             except Exception as e:
-                _log("WARNING", f"  L{entry.get('line', '?')}: retry failed ({e}), keeping original")
+                _log("WARNING", f"  L{entry.line or '?'}: retry failed ({e}), keeping original")
                 continue
             if retry_text and retry_text.strip():
-                _log("INFO", f"  L{entry.get('line', '?')}: retried -> \"{retry_text[:60]}\"")
-                result[j]['text'] = retry_text
+                _log("INFO", f"  L{entry.line or '?'}: retried -> \"{retry_text[:60]}\"")
+                result[j] = _rebuild_cue(entry, retry_text)
 
         return result
 
     def _reconstruct_batch(
         self,
-        batch: List[Dict],
+        batch: List[Cue],
         translations: List[str],
         log_fn: Callable
-    ) -> List[Dict]:
+    ) -> List[Cue]:
         """Reconstruct batch results from simple numbered translations."""
         for j, entry in enumerate(batch):
-            src = entry.get('text', '').strip().replace("\n", " ")
+            src = entry.text.strip().replace("\n", " ")
             tgt = translations[j] if j < len(translations) else ''
-            log_fn("INFO", f"  L{entry.get('line', '?')}: \"{src[:60]}\" -> \"{tgt[:60]}\"")
+            log_fn("INFO", f"  L{entry.line or '?'}: \"{src[:60]}\" -> \"{tgt[:60]}\"")
 
-        result = []
-        for j, entry in enumerate(batch):
-            result.append({
-                'text': translations[j] if j < len(translations) else entry.get('text', ''),
-                'time': entry.get('time', ''),
-                'line': entry.get('line', 0)
-            })
-        return result
+        return [
+            _rebuild_cue(
+                entry,
+                translations[j] if j < len(translations) else entry.text,
+            )
+            for j, entry in enumerate(batch)
+        ]
 
     def _build_batch_prompt(
         self, yaml_text: str, target_language: str
@@ -945,42 +881,6 @@ class LocalLLMTranslator:
             system_message,
             {'role': 'user', 'content': user_content}
         ]
-
-    def _translate_srt_simple(
-        self,
-        srt_data: List[Dict],
-        target_language: str,
-        progress_callback: Optional[Callable] = None,
-        log_callback: Optional[Callable] = None
-    ) -> List[Dict]:
-        """Translate short SRT files line by line using single-text translation."""
-        def _log(level, msg):
-            if log_callback:
-                log_callback(level, msg)
-
-        results = []
-        for i, entry in enumerate(srt_data):
-            if progress_callback:
-                progress_callback(i + 1, len(srt_data), f"line {i+1}")
-
-            text = entry.get('text', '').strip().replace("\n", " ")
-            if text:
-                try:
-                    translated = self.translate(text, target_language)
-                except Exception as e:
-                    _log("WARNING", f"Line {i+1} failed: {e}, keeping original")
-                    translated = text
-            else:
-                translated = text
-
-            _log("INFO", f"  L{i+1}: \"{text[:60]}\" -> \"{translated[:60]}\"")
-            results.append({
-                'text': translated,
-                'time': entry.get('time', ''),
-                'line': entry.get('line', i + 1)
-            })
-
-        return results
 
     @staticmethod
     def _parse_numbered_result(raw: str, expected_count: int) -> List[str]:

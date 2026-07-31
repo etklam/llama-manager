@@ -63,8 +63,28 @@ class BaseModelRegistry:
         self.config_manager.set(self.config_key, {"models": models_data})
         return model_info
 
-    def get_model_path(self, name: str) -> Optional[str]:
-        for model in self.list_models():
+    @staticmethod
+    def find_model_path(models: list, name: str) -> Optional[str]:
+        """Return the stored path of the named model in a model list, or None."""
+        for model in models:
             if model.get("name") == name:
                 return model.get("path")
         return None
+
+    def get_model_path(self, name: str) -> Optional[str]:
+        """Return the stored path of the named model, or None."""
+        return self.find_model_path(self.list_models(), name)
+
+    @staticmethod
+    def resolve_model_path(models: list, model_dir: str, model_name: str) -> str:
+        """Resolve a model name to a path against a model list.
+
+        A registered model wins; otherwise the name is treated as a file
+        inside model_dir. An empty dir or name passes through unchanged.
+        """
+        if not model_dir or not model_name:
+            return model_name
+        found = BaseModelRegistry.find_model_path(models, model_name)
+        if found:
+            return found
+        return str(Path(model_dir) / model_name)

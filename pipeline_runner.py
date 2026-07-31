@@ -1,31 +1,41 @@
 """PipelineRunner - Orchestrates Whisper speech-to-text followed by subtitle translation."""
 from __future__ import annotations
 
-import threading
 from pathlib import Path
 from typing import Callable, Dict, List, Optional
 
 from whisper_transcription import (
-    CancellationToken,
-    Cancelled,
-    Completed,
-    Failed,
-    TranscriptionEvent,
     TranscriptionRequest,
     WhisperTranscriber,
 )
+from transcription_runner import TranscriptionPresenter, TranscriptionRunner
 from translation.local_llm_translator import LocalLLMTranslator
-from translation.server_probe import (
-    ServerInfo,
-    clamp_workers,
-    probe_server,
-    unreachable_message,
-)
+from translation.preflight import PreflightPlan, run_preflight
 from utils.srt_parser import parse_srt_from_file, generate_srt_from_list, output_path_for
 from config_manager import ConfigManager
 
 from constants import SUPPORTED_MEDIA
 from config_helpers import api_url_for_port, build_translation_config
+from whisper_policy import chunking_enabled
+
+
+class _PipelinePresenter(TranscriptionPresenter):
+    """Routes the run loop's presentation to the pipeline's text channels."""
+
+    def __init__(self, on_log: Callable[[str], None],
+                 on_progress: Callable[[str], None]):
+        self._on_log = on_log
+        self._on_progress = on_progress
+
+    def log(self, level, message):
+        # Errors also take over the status line so a failed file is visible
+        # at a glance, matching the pipeline's own Error: lines.
+        if level == "ERROR":
+            self._on_progress(f"Error: {message}")
+        self._on_log(message)
+
+    def status(self, message):
+        self._on_progress(message)
 
 
 class PipelineRunner:
@@ -64,9 +74,16 @@ class PipelineRunner:
         self._on_done = on_done
         self._transcriber = transcriber or WhisperTranscriber()
 
+        # The whisper step goes through the shared transcription run loop,
+        # which owns the stop flag and cancellation token for its part of the
+        # run; this class keeps its own flag for the pipeline loop itself.
+        self._whisper_runner = TranscriptionRunner(
+            self._transcriber,
+            _PipelinePresenter(self._on_log, self._on_progress),
+        )
+
         self._running = False
         self._stop_requested = False
-        self._active_cancellation: Optional[CancellationToken] = None
 
         # Translator reused across files in a batch. Rebuilding it per file also
         # rebuilt the OpenAI client and its connection pool, so every file paid
@@ -75,13 +92,10 @@ class PipelineRunner:
         self._translator: Optional[LocalLLMTranslator] = None
         self._translator_config: Optional[Dict] = None
 
-        # What the preflight probe found, set once per run() and used to size the
-        # worker pool. None means "not probed yet", which leaves the configured
-        # worker count untouched.
-        self._server_info: Optional[ServerInfo] = None
-        # Logged once rather than per file: the clamp is identical for every file
-        # in a run, and the pipeline log is already dense.
-        self._last_clamp_note: Optional[str] = None
+        # The preflight plan for this run, set once in run() and used to size
+        # the worker pool per file. None means "not preflighted yet", which
+        # leaves the configured worker count untouched.
+        self._preflight_plan: Optional[PreflightPlan] = None
 
     @property
     def running(self) -> bool:
@@ -89,8 +103,7 @@ class PipelineRunner:
 
     def stop(self) -> None:
         self._stop_requested = True
-        if self._active_cancellation is not None:
-            self._active_cancellation.cancel()
+        self._whisper_runner.stop()
 
     def run(
         self,
@@ -112,24 +125,24 @@ class PipelineRunner:
         Calls on_done(stopped: bool) when finished.
         """
         self._running = True
-        self._active_cancellation = CancellationToken()
-        self._server_info = None
-        self._last_clamp_note = None
-        if self._stop_requested:
-            self._active_cancellation.cancel()
+        self._preflight_plan = None
+        # A stop requested before run() is honored by the run loop: its first
+        # transcribe_file creates a fresh token and cancels it immediately.
 
         model_path = self._resolve_whisper_model_path(whisper_model_dir, whisper_model_name)
 
         try:
-            # Probe once per run, before any transcription. The caller checks
-            # that the server process is up, but a process that is still loading
-            # a model answers nothing: without this, the failure only surfaces
-            # after Whisper has finished, as a retry storm during translation.
-            # The slot count also sizes the translator's worker pool.
+            # Preflight once per run, before any transcription. The caller
+            # checks that the server process is up, but a process that is still
+            # loading a model answers nothing: without this, the failure only
+            # surfaces after Whisper has finished, as a retry storm during
+            # translation. The probe's slot count also sizes the translator's
+            # worker pool.
             api_url = api_url_for_port(self._get_port())
-            info = probe_server(api_url)
-            if not info.reachable:
-                message = unreachable_message(api_url, info)
+            requested_workers = self._config_manager.get('ui.max_workers', 3)
+            plan = run_preflight(api_url, requested_workers)
+            if not plan.reachable:
+                message = plan.note or "no response"
                 self._on_progress(f"Error: {message}")
                 self._on_log(message)
                 # Report this as a stop, not a clean finish: on_done only carries
@@ -137,7 +150,10 @@ class PipelineRunner:
                 # a run that translated nothing.
                 self._stop_requested = True
                 return
-            self._server_info = info
+            self._preflight_plan = plan
+            # The plan formats its note once; log it here once, not per file.
+            if plan.note:
+                self._on_log(plan.note)
 
             for i, filepath in enumerate(files):
                 if self._stop_requested:
@@ -153,34 +169,23 @@ class PipelineRunner:
                         self._on_progress(
                             f"[{i+1}/{len(files)}] Whisper: {Path(filepath).name}"
                         )
-                        outcome = self._run_whisper(
+                        srt_path = self._run_whisper(
                             filepath, whisper_cli_path, model_path, language
                         )
-                        if isinstance(outcome, Cancelled):
-                            self._stop_requested = True
-                            break
-                        if isinstance(outcome, Failed):
+                        if srt_path is not None and not self._stop_requested:
                             self._on_progress(
-                                f"Error: {Path(filepath).name} - "
-                                f"{outcome.stage}: {outcome.message}"
+                                f"[{i+1}/{len(files)}] Translating: {Path(srt_path).name}"
                             )
-                            self._on_log(
-                                f"Whisper failed ({outcome.stage}): {outcome.message}"
-                            )
-                            continue
-                        if not isinstance(outcome, Completed) or self._stop_requested:
-                            continue
-                        srt_path = str(outcome.srt_path)
-                        self._on_progress(
-                            f"[{i+1}/{len(files)}] Translating: {Path(srt_path).name}"
-                        )
-                        self._translate_file(srt_path, target_lang, replace_original)
+                            self._translate_file(
+                                str(srt_path), target_lang, replace_original)
+                        elif self._stop_requested:
+                            break
                 except Exception as e:
                     self._on_progress(f"Error: {Path(filepath).name} - {e}")
                     self._on_log(f"Error: {Path(filepath).name} - {e}")
         finally:
             stopped = self._stop_requested
-            self._active_cancellation = None
+            self._whisper_runner.reset()
             self._running = False
             self._on_done(stopped=stopped)
             self._stop_requested = False
@@ -195,32 +200,36 @@ class PipelineRunner:
         cli_path: Path,
         model_path: str,
         language: str,
-    ):
-        threads = self._config_manager.get("whisper.threads", 8)
-        chunk_enabled = bool(self._config_manager.get("whisper.chunk_long_audio", False))
-        cancellation = self._active_cancellation or CancellationToken()
-        return self._transcriber.transcribe(
-            TranscriptionRequest(
-                source=Path(filepath),
-                cli_path=Path(cli_path),
-                model_path=Path(model_path),
-                language=language,
-                threads=threads,
-                chunk_long_audio=chunk_enabled,
-            ),
-            cancellation=cancellation,
-            emit=self._on_whisper_event,
-        )
+    ) -> Optional[Path]:
+        """Run the whisper step for one media file through the shared loop.
 
-    def _on_whisper_event(self, event: TranscriptionEvent) -> None:
-        if event.kind == "diagnostic" and event.message:
-            self._on_log(f"  {event.message}")
-        elif event.kind == "progress" and event.total:
-            self._on_progress(
-                f"Whisper {event.stage}: {event.current}/{event.total}"
-            )
-        elif event.kind == "started":
-            self._on_progress(f"Whisper: {event.stage}")
+        Event routing, outcome handling, and cancellation all live in the
+        TranscriptionRunner; this returns the Committed SRT path, or None
+        when the file failed or the run was cancelled.
+        """
+        return self._whisper_runner.transcribe_file(
+            filepath,
+            lambda f: self._build_whisper_request(
+                f, cli_path, model_path, language),
+        ).srt_path
+
+    def _build_whisper_request(
+        self,
+        filepath: str,
+        cli_path: Path,
+        model_path: str,
+        language: str,
+    ) -> TranscriptionRequest:
+        threads = self._config_manager.get("whisper.threads", 8)
+        chunk_enabled = chunking_enabled(self._config_manager)
+        return TranscriptionRequest(
+            source=Path(filepath),
+            cli_path=Path(cli_path),
+            model_path=Path(model_path),
+            language=language,
+            threads=threads,
+            chunk_long_audio=chunk_enabled,
+        )
 
     # ------------------------------------------------------------------
     # Translation step
@@ -263,15 +272,11 @@ class PipelineRunner:
         if not config.get('model'):
             raise RuntimeError("No model loaded - select a model on the Server tab")
 
-        # Align workers with the slot count the probe reported. Workers past that
-        # only queue on the server, so the extra concurrency buys nothing while
-        # the log reports it as parallel work.
-        if self._server_info is not None:
-            workers, note = clamp_workers(config['max_workers'], self._server_info)
-            config['max_workers'] = workers
-            if note and note != self._last_clamp_note:
-                self._on_log(note)
-                self._last_clamp_note = note
+        # Align workers with the plan's decision. Workers past the server's slot
+        # count only queue, so the extra concurrency buys nothing while the log
+        # reports it as parallel work.
+        if self._preflight_plan is not None:
+            config['max_workers'] = self._preflight_plan.workers
 
         self._on_progress(f"Translating {len(subtitles)} lines: {Path(srt_path).name}")
 

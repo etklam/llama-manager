@@ -7,6 +7,7 @@ from pathlib import Path
 
 from tkinterdnd2 import DND_FILES
 
+from base_registry import BaseModelRegistry
 from pipeline_runner import PipelineRunner
 from constants import (
     SUPPORTED_MEDIA, SUPPORTED_SUBTITLE, WHISPER_LANGUAGES, TARGET_LANGUAGES,
@@ -201,6 +202,5 @@ class PipelineCard(ttk.LabelFrame):
             self._pipe_status_label.config(text="All done!", foreground="green")
 
     def _resolve_whisper_model_path(self, model_dir, model_name):
-        from whisper_transcription import resolve_model_path
-        return resolve_model_path(
-            model_dir, model_name, self._get_whisper_models)
+        return BaseModelRegistry.resolve_model_path(
+            self._get_whisper_models(), model_dir, model_name)

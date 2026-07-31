@@ -8,6 +8,7 @@ translation rather than an id-derived artifact.
 import re
 
 from translation.local_llm_translator import LocalLLMTranslator
+from utils.srt_parser import Cue
 
 
 def _cfg(**kw):
@@ -55,16 +56,16 @@ class ReorderClient:
 
 
 def _srt(n):
-    return [{'text': f'src{i+1}', 'time': f'00:00:0{i} --> 00:00:0{i+1}',
-             'line': i + 1} for i in range(n)]
+    return [Cue(line=i + 1, start_time=i * 1000, end_time=(i + 1) * 1000,
+                text=f'src{i+1}') for i in range(n)]
 
 
 print("=== Case 1: model drops the 2nd line ===")
 t = LocalLLMTranslator(_cfg(), client=DropOneClient())
 for e in t.translate_srt(_srt(4), 'zh-cn'):
-    print(e['line'], repr(e['text']))
+    print(e.line, repr(e.text))
 
 print("\n=== Case 2: model reorders ids ===")
 t = LocalLLMTranslator(_cfg(), client=ReorderClient())
 for e in t.translate_srt(_srt(4), 'zh-cn'):
-    print(e['line'], repr(e['text']))
+    print(e.line, repr(e.text))

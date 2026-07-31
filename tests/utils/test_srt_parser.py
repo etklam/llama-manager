@@ -9,12 +9,12 @@ until the implementation is created.
 """
 
 import pytest
-from typing import List, Dict
 from pathlib import Path
 
 
 # This import will FAIL because the module doesn't exist yet
 from utils.srt_parser import (
+    Cue,
     parse_srt_from_file,
     parse_srt_from_string,
     generate_srt_from_list,
@@ -101,26 +101,28 @@ class TestParseSrtFromFile:
         # Verify structure
         assert isinstance(result, list)
         assert len(result) == 3
+        assert all(isinstance(entry, Cue) for entry in result)
 
         # Verify first subtitle
-        assert result[0]['line'] == 1
-        assert result[0]['start_time'] == 1000  # 00:00:01,000 in milliseconds
-        assert result[0]['end_time'] == 3000
-        assert result[0]['text'] == "Hello world"
-        assert 'time' in result[0]
-        assert result[0]['time'] == "00:00:01,000 --> 00:00:03,000"
+        assert result[0].line == 1
+        assert result[0].start_time == 1000  # 00:00:01,000 in milliseconds
+        assert result[0].end_time == 3000
+        assert result[0].text == "Hello world"
+        # The timestamp string is derived from ms at generation time
+        assert generate_srt_from_list(result[:1]).startswith(
+            "1\n00:00:01,000 --> 00:00:03,000\nHello world")
 
         # Verify second subtitle
-        assert result[1]['line'] == 2
-        assert result[1]['start_time'] == 3500
-        assert result[1]['end_time'] == 6000
-        assert result[1]['text'] == "This is a test subtitle"
+        assert result[1].line == 2
+        assert result[1].start_time == 3500
+        assert result[1].end_time == 6000
+        assert result[1].text == "This is a test subtitle"
 
         # Verify third subtitle
-        assert result[2]['line'] == 3
-        assert result[2]['start_time'] == 7000
-        assert result[2]['end_time'] == 10000
-        assert result[2]['text'] == "Multiline subtitle\nwith two lines"
+        assert result[2].line == 3
+        assert result[2].start_time == 7000
+        assert result[2].end_time == 10000
+        assert result[2].text == "Multiline subtitle\nwith two lines"
 
     def test_parse_srt_from_file_with_gbk_encoding(self, tmp_path):
         """Test parsing SRT file with GBK encoding."""
@@ -132,7 +134,7 @@ class TestParseSrtFromFile:
         # Should handle GBK encoding
         result = parse_srt_from_file(str(srt_file))
         assert len(result) == 1
-        assert result[0]['text'] == "中文字幕"
+        assert result[0].text == "中文字幕"
 
     def test_parse_srt_from_file_not_found(self, tmp_path):
         """Test parsing non-existent file raises appropriate error."""
@@ -152,11 +154,10 @@ class TestParseSrtFromString:
         assert len(result) == 3
 
         # Verify structure
-        assert result[0]['line'] == 1
-        assert result[0]['start_time'] == 1000
-        assert result[0]['end_time'] == 3000
-        assert result[0]['text'] == "Hello world"
-        assert 'time' in result[0]
+        assert result[0].line == 1
+        assert result[0].start_time == 1000
+        assert result[0].end_time == 3000
+        assert result[0].text == "Hello world"
 
     def test_parse_srt_from_string_with_whitespace(self):
         """Test parsing SRT string with extra whitespace."""
@@ -174,28 +175,18 @@ class TestParseSrtFromString:
         """
         result = parse_srt_from_string(srt_with_whitespace)
         assert len(result) == 2
-        assert result[0]['text'] == "Test subtitle"
-        assert result[1]['text'] == "Another test"
+        assert result[0].text == "Test subtitle"
+        assert result[1].text == "Another test"
 
 
 class TestGenerateSrtFromList:
-    """Test generating SRT format from list of subtitle dicts."""
+    """Test generating SRT format from a list of Cue objects."""
 
     def test_generate_srt_from_list(self):
-        """Test generating SRT string from list of subtitle dicts."""
+        """Test generating SRT string from a list of Cues."""
         subtitle_list = [
-            {
-                'line': 1,
-                'start_time': 1000,
-                'end_time': 3000,
-                'text': 'First subtitle'
-            },
-            {
-                'line': 2,
-                'start_time': 4000,
-                'end_time': 6000,
-                'text': 'Second subtitle'
-            }
+            Cue(line=1, start_time=1000, end_time=3000, text='First subtitle'),
+            Cue(line=2, start_time=4000, end_time=6000, text='Second subtitle')
         ]
 
         result = generate_srt_from_list(subtitle_list)
@@ -205,42 +196,23 @@ class TestGenerateSrtFromList:
         assert '1\n00:00:01,000 --> 00:00:03,000\nFirst subtitle' in result
         assert '2\n00:00:04,000 --> 00:00:06,000\nSecond subtitle' in result
 
-    def test_generate_srt_from_list_with_raw_times(self):
-        """Test generating SRT when raw time strings are provided."""
+    def test_generate_srt_from_list_numbers_by_position(self):
+        """Entries are numbered by position, not by their line field."""
         subtitle_list = [
-            {
-                'line': 1,
-                'startraw': '00:00:01,500',
-                'endraw': '00:00:03,500',
-                'text': 'Subtitle with raw times'
-            }
+            Cue(line=7, start_time=1000, end_time=3000, text='First'),
+            Cue(line=3, start_time=4000, end_time=6000, text='Second'),
         ]
 
         result = generate_srt_from_list(subtitle_list)
-        assert '1\n00:00:01,500 --> 00:00:03,500\nSubtitle with raw times' in result
 
-    def test_generate_srt_from_list_with_time_field(self):
-        """Test generating SRT when complete time field is provided."""
-        subtitle_list = [
-            {
-                'line': 1,
-                'time': '00:00:01,000 --> 00:00:02,000',
-                'text': 'Subtitle with time field'
-            }
-        ]
-
-        result = generate_srt_from_list(subtitle_list)
-        assert '1\n00:00:01,000 --> 00:00:02,000\nSubtitle with time field' in result
+        assert result.startswith('1\n00:00:01,000 --> 00:00:03,000\nFirst')
+        assert '2\n00:00:04,000 --> 00:00:06,000\nSecond' in result
 
     def test_generate_srt_from_list_multiline_text(self):
         """Test generating SRT with multiline subtitle text."""
         subtitle_list = [
-            {
-                'line': 1,
-                'start_time': 1000,
-                'end_time': 4000,
-                'text': 'Line 1\nLine 2\nLine 3'
-            }
+            Cue(line=1, start_time=1000, end_time=4000,
+                text='Line 1\nLine 2\nLine 3')
         ]
 
         result = generate_srt_from_list(subtitle_list)
@@ -278,10 +250,10 @@ class TestMalformedSrt:
 
         # Should only parse the valid subtitle
         assert len(result) == 1
-        assert result[0]['line'] == 1
-        assert result[0]['start_time'] == 3000
-        assert result[0]['end_time'] == 5000
-        assert result[0]['text'] == "This one is valid"
+        assert result[0].line == 1
+        assert result[0].start_time == 3000
+        assert result[0].end_time == 5000
+        assert result[0].text == "This one is valid"
 
     def test_srt_with_missing_timestamps(self):
         """Test SRT with missing end timestamp."""
@@ -296,7 +268,7 @@ Valid subtitle
         result = parse_srt_from_string(malformed_srt)
         # Should skip the malformed entry and parse the valid one
         assert len(result) == 1
-        assert result[0]['text'] == "Valid subtitle"
+        assert result[0].text == "Valid subtitle"
 
     def test_srt_with_invalid_time_format(self):
         """Test SRT with completely invalid time format."""
@@ -310,7 +282,7 @@ Valid subtitle
 """
         result = parse_srt_from_string(invalid_srt)
         assert len(result) == 1
-        assert result[0]['text'] == "Valid subtitle"
+        assert result[0].text == "Valid subtitle"
 
 
 class TestMultilineText:
@@ -323,20 +295,16 @@ class TestMultilineText:
         assert len(result) == 2
 
         # First subtitle has 3 lines
-        assert result[0]['text'] == "Line 1\nLine 2\nLine 3"
+        assert result[0].text == "Line 1\nLine 2\nLine 3"
 
         # Second subtitle has 2 lines
-        assert result[1]['text'] == "Another multiline\nsubtitle block"
+        assert result[1].text == "Another multiline\nsubtitle block"
 
     def test_multiline_text_converted_to_single_line_in_srt(self):
         """Test that multiline text is preserved when generating SRT."""
         subtitle_list = [
-            {
-                'line': 1,
-                'start_time': 1000,
-                'end_time': 4000,
-                'text': 'Line 1\nLine 2\nLine 3'
-            }
+            Cue(line=1, start_time=1000, end_time=4000,
+                text='Line 1\nLine 2\nLine 3')
         ]
 
         result = generate_srt_from_list(subtitle_list)
@@ -400,59 +368,49 @@ class TestTimeFormatParsing:
         assert len(result) == 3
 
         # First: standard format
-        assert result[0]['start_time'] == 1000
-        assert result[0]['end_time'] == 2000
+        assert result[0].start_time == 1000
+        assert result[0].end_time == 2000
 
         # Second: non-standard format (0:0:5.500)
-        assert result[1]['start_time'] == 5500
-        assert result[1]['end_time'] == 7500
+        assert result[1].start_time == 5500
+        assert result[1].end_time == 7500
 
         # Third: padded hours (001:02:03,999)
-        assert result[2]['start_time'] == 3723999
-        assert result[2]['end_time'] == 3725999
+        assert result[2].start_time == 3723999
+        assert result[2].end_time == 3725999
 
 
 class TestSrtStructure:
     """Test the structure and required fields of parsed SRT."""
 
     def test_parsed_srt_has_required_fields(self):
-        """Test that parsed SRT entries have all required fields."""
+        """Test that parsed SRT entries are Cue objects with all fields."""
         result = parse_srt_from_string(SAMPLE_SRT_CONTENT)
 
         for entry in result:
-            # Required fields
-            assert 'line' in entry
-            assert 'start_time' in entry
-            assert 'end_time' in entry
-            assert 'text' in entry
-            assert 'time' in entry
-
-            # Optional fields (should be present)
-            assert 'startraw' in entry
-            assert 'endraw' in entry
-
-            # Verify data types
-            assert isinstance(entry['line'], int)
-            assert isinstance(entry['start_time'], int)
-            assert isinstance(entry['end_time'], int)
-            assert isinstance(entry['text'], str)
-            assert isinstance(entry['time'], str)
+            assert isinstance(entry, Cue)
+            assert isinstance(entry.line, int)
+            assert isinstance(entry.start_time, int)
+            assert isinstance(entry.end_time, int)
+            assert isinstance(entry.text, str)
+            assert entry.line >= 1
+            assert entry.start_time >= 0
+            assert entry.end_time >= entry.start_time
 
     def test_line_numbers_are_sequential(self):
         """Test that line numbers are sequential starting from 1."""
         result = parse_srt_from_string(SAMPLE_SRT_CONTENT)
 
         for i, entry in enumerate(result, start=1):
-            assert entry['line'] == i
+            assert entry.line == i
 
-    def test_time_values_are_consistent(self):
-        """Test that time values are consistent across different fields."""
+    def test_timestamps_are_derived_from_ms_at_generation(self):
+        """The SRT timestamp string is derived at generation, not stored."""
         result = parse_srt_from_string(SAMPLE_SRT_CONTENT)
 
-        for entry in result:
-            # The 'time' field should match startraw and endraw
-            expected_time = f"{entry['startraw']} --> {entry['endraw']}"
-            assert entry['time'] == expected_time
+        generated = generate_srt_from_list(result[:1])
+        assert generated.startswith(
+            "1\n00:00:01,000 --> 00:00:03,000\nHello world")
 
 
 class TestEdgeCases:
@@ -471,9 +429,9 @@ More special chars: @#$%^&*()
         result = parse_srt_from_string(srt_with_special)
 
         # HTML tags should be preserved
-        assert '<i>HTML</i>' in result[0]['text']
-        assert '& "quotes"' in result[0]['text']
-        assert '@#$%^&*()' in result[1]['text']
+        assert '<i>HTML</i>' in result[0].text
+        assert '& "quotes"' in result[0].text
+        assert '@#$%^&*()' in result[1].text
 
     def test_srt_with_unicode_characters(self):
         """Test SRT with Unicode characters."""
@@ -487,8 +445,8 @@ Emojis: 😀 🎉 🚀
 """
         result = parse_srt_from_string(srt_unicode)
 
-        assert '中文 日本語 한국어' in result[0]['text']
-        assert '😀 🎉 🚀' in result[1]['text']
+        assert '中文 日本語 한국어' in result[0].text
+        assert '😀 🎉 🚀' in result[1].text
 
     def test_srt_with_very_long_timestamp(self):
         """Test SRT with very long timestamps (e.g., for long videos)."""
@@ -498,8 +456,8 @@ Long video subtitle
 """
         result = parse_srt_from_string(srt_long_time)
 
-        assert result[0]['start_time'] == 37845123  # 10h 30m 45s 123ms
-        assert result[0]['end_time'] == 37850456
+        assert result[0].start_time == 37845123  # 10h 30m 45s 123ms
+        assert result[0].end_time == 37850456
 
     def test_srt_with_consecutive_blank_lines(self):
         """Test SRT with consecutive blank lines between entries."""
@@ -516,8 +474,8 @@ Second
         result = parse_srt_from_string(srt_blank_lines)
 
         assert len(result) == 2
-        assert result[0]['text'] == "First"
-        assert result[1]['text'] == "Second"
+        assert result[0].text == "First"
+        assert result[1].text == "Second"
 
 
 class TestRoundTrip:
@@ -537,15 +495,33 @@ class TestRoundTrip:
         # Parse again
         reparsed = parse_srt_from_string(generated)
 
-        # Should have same number of entries
-        assert len(parsed) == len(reparsed)
+        # Cue equality covers line, times, and text
+        assert parsed == reparsed
 
-        # Each entry should have the same key data
-        for i in range(len(parsed)):
-            assert parsed[i]['line'] == reparsed[i]['line']
-            assert parsed[i]['start_time'] == reparsed[i]['start_time']
-            assert parsed[i]['end_time'] == reparsed[i]['end_time']
-            assert parsed[i]['text'] == reparsed[i]['text']
+    def test_round_trip_from_hand_built_cues(self):
+        """Cues built by hand survive generate -> parse unchanged."""
+        cues = [
+            Cue(line=1, start_time=1000, end_time=3000, text="First cue"),
+            Cue(line=2, start_time=3500, end_time=6000,
+                text="Second cue\nwith two lines"),
+        ]
+
+        generated = generate_srt_from_list(cues)
+        reparsed = parse_srt_from_string(generated)
+
+        assert reparsed == cues
+
+    def test_round_trip_preserves_unicode(self):
+        """Unicode and special characters survive the round trip."""
+        original = """1
+00:00:01,000 --> 00:00:02,000
+中文 日本語 한국어 😀
+"""
+        parsed = parse_srt_from_string(original)
+        generated = generate_srt_from_list(parsed)
+        reparsed = parse_srt_from_string(generated)
+
+        assert reparsed == parsed
 
 
 class TestOutputPathFor:

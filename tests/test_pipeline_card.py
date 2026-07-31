@@ -1,4 +1,5 @@
-"""Headless tests for PipelineCard log routing."""
+"""Headless tests for PipelineCard log routing and model resolution."""
+from pathlib import Path
 from unittest.mock import Mock
 
 from pipeline_card import PipelineCard
@@ -35,3 +36,12 @@ def test_pipeline_error_updates_status_in_red_without_duplicate_log():
         text="Error: llama-server not reachable", foreground="red")
     card._on_log.assert_called_once()
     card._on_debug_log.assert_not_called()
+
+
+def test_resolve_whisper_model_path_uses_the_shared_registry_lookup():
+    card = object.__new__(PipelineCard)
+    card._get_whisper_models = lambda: [{"name": "tiny", "path": "D:/models/tiny.bin"}]
+
+    assert card._resolve_whisper_model_path("D:/models", "tiny") == "D:/models/tiny.bin"
+    assert card._resolve_whisper_model_path("D:/models", "other.bin") == str(
+        Path("D:/models") / "other.bin")

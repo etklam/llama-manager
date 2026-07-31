@@ -1,13 +1,26 @@
-"""Tests for BatchRunner: the shared batch run-loop shell."""
+"""Tests for TranscriptionRunner: the shared transcription run-loop.
+
+Replaces the tests of the superseded BatchRunner shell. The interface is the
+test surface: outcome handling (Cancelled/Failed/Completed), event routing
+(including the committing/completed stages), and the batch loop with its stop
+semantics all live here, exercised through a fake transcriber and a mock
+presenter — no Tkinter anywhere.
+"""
 from __future__ import annotations
 
-import threading
-import time
+from pathlib import Path
 from unittest.mock import MagicMock, call
 
 import pytest
 
-from ui_helpers import BatchRunner
+from transcription_runner import TranscriptionBatchReport, TranscriptionRunner
+from whisper_transcription import (
+    Cancelled,
+    Completed,
+    Failed,
+    TranscriptionEvent,
+    TranscriptionRequest,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -15,24 +28,35 @@ from ui_helpers import BatchRunner
 # ---------------------------------------------------------------------------
 
 @pytest.fixture
-def widgets():
-    """Mock tkinter start/stop buttons + schedule fn."""
-    return {
-        'start_btn': MagicMock(),
-        'stop_btn': MagicMock(),
-        'log': MagicMock(),
-        'schedule': MagicMock(),   # replaces tk after(0, fn)
-    }
+def transcriber():
+    return MagicMock()
 
 
 @pytest.fixture
-def runner(widgets):
-    return BatchRunner(
-        start_btn=widgets['start_btn'],
-        stop_btn=widgets['stop_btn'],
-        log_fn=widgets['log'],
-        schedule_fn=widgets['schedule'],
+def presenter():
+    return MagicMock()
+
+
+@pytest.fixture
+def runner(transcriber, presenter):
+    return TranscriptionRunner(transcriber, presenter)
+
+
+def _request(filepath):
+    return TranscriptionRequest(
+        source=Path(filepath),
+        cli_path=Path("whisper-cli.exe"),
+        model_path=Path("model.bin"),
     )
+
+
+def _completed(filepath):
+    return Completed(Path(filepath).with_suffix(".srt"))
+
+
+def _log_calls(presenter, level):
+    return [c.args[1] for c in presenter.log.call_args_list
+            if len(c.args) >= 2 and c.args[0] == level]
 
 
 # ---------------------------------------------------------------------------
@@ -42,154 +66,285 @@ def runner(widgets):
 class TestConstruction:
 
     def test_not_running_initially(self, runner):
-        assert runner.is_running is False
+        assert runner.running is False
 
-    def test_stop_flag_false_initially(self, runner):
-        assert runner._stop_requested is False
+    def test_not_stopped_initially(self, runner):
+        assert runner.stopped is False
+
+    def test_reset_clears_run_state(self, runner):
+        runner.stop()
+        runner.reset()
+        assert runner.stopped is False
+        assert runner.running is False
 
 
 # ---------------------------------------------------------------------------
-# run() iterates files, calls per_file_fn once per file
+# transcribe_file: one file, request building, outcome handling
 # ---------------------------------------------------------------------------
 
-class TestRunIteratesFiles:
+class TestTranscribeFile:
 
-    def test_calls_per_file_fn_once_per_file(self, runner):
-        per_file = MagicMock()
-        runner.run(['a.srt', 'b.srt', 'c.srt'], per_file)
-        assert per_file.call_count == 3
-        per_file.assert_has_calls([call('a.srt'), call('b.srt'), call('c.srt')])
+    def test_builds_request_and_returns_committed_srt(self, runner, transcriber, presenter):
+        transcriber.transcribe.return_value = _completed("/x/video.mp4")
 
-    def test_run_sets_running_flag(self, runner):
+        result = runner.transcribe_file("/x/video.mp4", _request)
+
+        assert result.srt_path == Path("/x/video.srt")
+        assert result.cancelled is False
+        request = transcriber.transcribe.call_args.args[0]
+        assert request.source == Path("/x/video.mp4")
+        assert _log_calls(presenter, "SUCCESS") == [
+            f"Generated: {Path('/x/video.srt')}"]
+
+    def test_cancelled_outcome_reports_cancelled(self, runner, transcriber, presenter):
+        transcriber.transcribe.return_value = Cancelled()
+
+        result = runner.transcribe_file("/x/video.mp4", _request)
+
+        assert result.srt_path is None
+        assert result.cancelled is True
+        assert _log_calls(presenter, "WARNING") == ["Transcription cancelled: video.mp4"]
+
+    def test_failed_outcome_logs_stage_and_message(self, runner, transcriber, presenter):
+        transcriber.transcribe.return_value = Failed("transcribing", "boom")
+
+        result = runner.transcribe_file("/x/video.mp4", _request)
+
+        assert result.srt_path is None
+        assert result.cancelled is False
+        assert _log_calls(presenter, "ERROR") == [
+            "Failed: video.mp4 - transcribing: boom"]
+
+    def test_exception_in_build_request_is_logged_and_skipped(self, runner, presenter):
+        def bad_request(filepath):
+            raise RuntimeError("no model")
+
+        result = runner.transcribe_file("/x/video.mp4", bad_request)
+
+        assert result.srt_path is None
+        assert result.cancelled is False
+        assert _log_calls(presenter, "ERROR") == ["Failed: video.mp4 - no model"]
+
+    def test_stop_before_transcribe_cancels_the_fresh_token(self, runner, transcriber):
+        runner.stop()
+        seen = {}
+
+        def spy(request, cancellation, emit):
+            seen['cancelled'] = cancellation.cancelled
+            return Cancelled()
+
+        transcriber.transcribe.side_effect = spy
+
+        runner.transcribe_file("/x/video.mp4", _request)
+
+        assert seen['cancelled'] is True
+
+
+# ---------------------------------------------------------------------------
+# Event routing: stage -> status, kind -> log/status, commit moment surfaces
+# ---------------------------------------------------------------------------
+
+class TestEventRouting:
+
+    def _run_with_events(self, runner, transcriber, events):
+        def spy(request, cancellation, emit):
+            for event in events:
+                emit(event)
+            return _completed("/x/video.mp4")
+
+        transcriber.transcribe.side_effect = spy
+        return runner.transcribe_file("/x/video.mp4", _request)
+
+    def test_diagnostic_events_become_log_lines(self, runner, transcriber, presenter):
+        self._run_with_events(runner, transcriber, [
+            TranscriptionEvent("transcribing", "diagnostic", message="hello"),
+        ])
+        assert _log_calls(presenter, "INFO") == ["hello"]
+
+    def test_started_events_become_stage_status(self, runner, transcriber, presenter):
+        self._run_with_events(runner, transcriber, [
+            TranscriptionEvent("preparing", "started"),
+        ])
+        presenter.status.assert_any_call("Preparing")
+
+    def test_progress_events_become_fraction_status(self, runner, transcriber, presenter):
+        self._run_with_events(runner, transcriber, [
+            TranscriptionEvent("chunking", "progress", current=1, total=3),
+        ])
+        presenter.status.assert_any_call("chunking: 1/3")
+
+    def test_completed_events_no_longer_dropped(self, runner, transcriber, presenter):
+        self._run_with_events(runner, transcriber, [
+            TranscriptionEvent("transcribing", "completed"),
+        ])
+        presenter.status.assert_any_call("Transcribing complete")
+
+    def test_committing_completed_surfaces_the_committed_srt(self, runner, transcriber, presenter):
+        """The moment the Committed SRT lands must be visible, not dropped."""
+        self._run_with_events(runner, transcriber, [
+            TranscriptionEvent("committing", "started"),
+            TranscriptionEvent("committing", "completed"),
+        ])
+        presenter.status.assert_any_call("Committing")
+        presenter.status.assert_any_call("SRT committed")
+
+    def test_full_engine_stream_maps_cleanly(self, runner, transcriber, presenter):
+        self._run_with_events(runner, transcriber, [
+            TranscriptionEvent("preparing", "started"),
+            TranscriptionEvent("preparing", "completed"),
+            TranscriptionEvent("transcribing", "started"),
+            TranscriptionEvent("transcribing", "completed"),
+            TranscriptionEvent("committing", "started"),
+            TranscriptionEvent("committing", "completed"),
+        ])
+        statuses = [c.args[0] for c in presenter.status.call_args_list]
+        assert statuses == [
+            "Preparing", "Preparing complete",
+            "Transcribing", "Transcribing complete",
+            "Committing", "SRT committed",
+        ]
+
+
+# ---------------------------------------------------------------------------
+# run_files: the batch loop
+# ---------------------------------------------------------------------------
+
+class TestRunFiles:
+
+    def test_transcribes_once_per_file(self, runner, transcriber, presenter):
+        transcriber.transcribe.side_effect = [
+            _completed("/x/a.mp4"), _completed("/x/b.mp4"), _completed("/x/c.mp4"),
+        ]
+
+        report = runner.run_files(["/x/a.mp4", "/x/b.mp4", "/x/c.mp4"], _request)
+
+        assert transcriber.transcribe.call_count == 3
+        assert report == TranscriptionBatchReport(
+            total=3, completed=3, failed=0, stopped=False)
+
+    def test_reports_failures_without_stopping(self, runner, transcriber):
+        transcriber.transcribe.side_effect = [
+            _completed("/x/a.mp4"),
+            Failed("transcribing", "boom"),
+            _completed("/x/c.mp4"),
+        ]
+
+        report = runner.run_files(["/x/a.mp4", "/x/b.mp4", "/x/c.mp4"], _request)
+
+        assert transcriber.transcribe.call_count == 3
+        assert (report.completed, report.failed, report.stopped) == (2, 1, False)
+
+    def test_per_file_status_and_batch_progress(self, runner, transcriber, presenter):
+        transcriber.transcribe.side_effect = [
+            _completed("/x/a.mp4"), _completed("/x/b.mp4"),
+        ]
+
+        runner.run_files(["/x/a.mp4", "/x/b.mp4"], _request)
+
+        presenter.status.assert_any_call("Processing: a.mp4 (1/2)")
+        presenter.status.assert_any_call("Processing: b.mp4 (2/2)")
+        presenter.progress.assert_has_calls([call(50.0), call(100.0)])
+
+    def test_srt_generated_reported_per_completed_file(self, runner, transcriber, presenter):
+        transcriber.transcribe.side_effect = [
+            _completed("/x/a.mp4"), Failed("transcribing", "boom"),
+        ]
+
+        runner.run_files(["/x/a.mp4", "/x/b.mp4"], _request)
+
+        presenter.srt_generated.assert_called_once_with("/x/a.mp4", Path("/x/a.srt"))
+
+    def test_running_flag_set_during_iteration(self, runner, transcriber):
         seen = []
-        def per_file(f):
-            seen.append(runner.is_running)
-        runner.run(['a'], per_file)
+
+        def spy(request, cancellation, emit):
+            seen.append(runner.running)
+            return _completed(request.source)
+
+        transcriber.transcribe.side_effect = spy
+        runner.run_files(["/x/a.mp4"], _request)
+
         assert seen == [True]
+        assert runner.running is False
 
-    def test_run_clears_running_after(self, runner):
-        runner.run(['a'], lambda f: None)
-        assert runner.is_running is False
+    def test_finished_reports_clean_run(self, runner, transcriber, presenter):
+        transcriber.transcribe.side_effect = [_completed("/x/a.mp4")]
 
+        runner.run_files(["/x/a.mp4"], _request)
 
-# ---------------------------------------------------------------------------
-# Button + schedule wiring on run lifecycle
-# ---------------------------------------------------------------------------
+        presenter.finished.assert_called_once_with(stopped=False)
 
-class TestLifecycleWiring:
+    def test_stop_requested_before_run_stops_without_transcribing(self, runner, transcriber, presenter):
+        runner.stop()
 
-    def test_disables_start_enables_stop_at_start(self, runner, widgets):
-        runner.run(['a'], lambda f: None)
-        widgets['start_btn'].config.assert_any_call(state="disabled")
-        widgets['stop_btn'].config.assert_any_call(state="normal")
+        report = runner.run_files(["/x/a.mp4", "/x/b.mp4"], _request)
 
-    def test_re_enables_start_disables_stop_at_end(self, runner, widgets):
-        runner.run(['a'], lambda f: None)
-        # final state
-        start_calls = widgets['start_btn'].config.call_args_list
-        stop_calls = widgets['stop_btn'].config.call_args_list
-        assert start_calls[-1] == call(state="normal")
-        assert stop_calls[-1] == call(state="disabled")
+        assert transcriber.transcribe.call_count == 0
+        assert report.stopped is True
+        presenter.finished.assert_called_once_with(stopped=True)
+        assert _log_calls(presenter, "WARNING") == ["Transcription stopped by user"]
 
 
 # ---------------------------------------------------------------------------
-# Stop
+# Stop semantics
 # ---------------------------------------------------------------------------
 
 class TestStop:
 
     def test_stop_sets_flag(self, runner):
         runner.stop()
-        assert runner._stop_requested is True
+        assert runner.stopped is True
 
-    def test_stop_exits_loop_after_current_file(self, runner):
-        """When stop() is called mid-file, loop exits after that file."""
-        processed = []
+    def test_stop_cancels_active_transcription(self, runner, transcriber):
+        seen = {}
 
-        def per_file(f):
-            processed.append(f)
-            if f == 'b':
-                runner.stop()
-
-        runner.run(['a', 'b', 'c', 'd'], per_file)
-        # c and d must NOT be processed
-        assert processed == ['a', 'b']
-
-
-# ---------------------------------------------------------------------------
-# Per-file exceptions don't crash the loop
-# ---------------------------------------------------------------------------
-
-class TestExceptionHandling:
-
-    def test_exception_in_one_file_does_not_stop_loop(self, runner, widgets):
-        per_file = MagicMock(side_effect=[RuntimeError("boom"), "ok"])
-        runner.run(['bad', 'good'], per_file)
-        assert per_file.call_count == 2
-
-    def test_exception_is_logged(self, runner, widgets):
-        per_file = MagicMock(side_effect=RuntimeError("boom"))
-        runner.run(['bad'], per_file)
-        # log_fn called at least once with ERROR level
-        error_calls = [c for c in widgets['log'].call_args_list
-                       if len(c.args) >= 2 and c.args[0] == "ERROR"]
-        assert len(error_calls) >= 1
-
-
-# ---------------------------------------------------------------------------
-# on_progress callback fired per file
-# ---------------------------------------------------------------------------
-
-class TestProgressCallback:
-
-    def test_on_progress_called_per_file_with_index(self, runner):
-        progress = MagicMock()
-        runner.run(['a', 'b'], lambda f: None, on_progress=progress)
-        assert progress.call_count == 2
-        # MagicMocks add a __bool__ check from `if on_progress:` — filter it.
-        real_calls = [c for c in progress.call_args_list
-                      if c.args and isinstance(c.args[0], int)]
-        assert real_calls == [call(0, 'a'), call(1, 'b')]
-
-    def test_on_progress_optional(self, runner):
-        # No on_progress supplied: loop still completes
-        per_file = MagicMock()
-        runner.run(['a', 'b'], per_file)
-        assert per_file.call_count == 2
-
-
-# ---------------------------------------------------------------------------
-# on_done callback semantics
-# ---------------------------------------------------------------------------
-
-class TestOnDone:
-
-    def test_on_done_called_with_stopped_false_on_normal_completion(self, runner, widgets):
-        done = MagicMock()
-        runner.run(['a'], lambda f: None, on_done=done)
-        # on_done is marshalled via schedule_fn; that wrapper is invoked once
-        # and, when run, calls done(stopped=False).
-        assert widgets['schedule'].call_count == 1
-        scheduled_fn = widgets['schedule'].call_args.args[0]
-        scheduled_fn()
-        done.assert_called_once_with(stopped=False)
-
-    def test_on_done_called_with_stopped_true_when_stopped(self, runner, widgets):
-        done = MagicMock()
-        def per_file(f):
+        def spy(request, cancellation, emit):
             runner.stop()
-        runner.run(['a', 'b'], per_file, on_done=done)
-        scheduled_fn = widgets['schedule'].call_args.args[0]
-        scheduled_fn()
-        done.assert_called_once_with(stopped=True)
+            seen['cancelled'] = cancellation.cancelled
+            return Cancelled()
 
+        transcriber.transcribe.side_effect = spy
 
-# ---------------------------------------------------------------------------
-# schedule_fn used to marshal back to UI thread
-# ---------------------------------------------------------------------------
+        report = runner.run_files(["/x/a.mp4"], _request)
 
-class TestScheduleUsage:
+        assert seen['cancelled'] is True
+        assert report.stopped is True
 
-    def test_schedule_invoked_for_done(self, runner, widgets):
-        runner.run(['a'], lambda f: None, on_done=lambda **kw: None)
-        assert widgets['schedule'].call_count == 1
+    def test_stop_exits_loop_after_current_file(self, runner, transcriber, presenter):
+        def spy(request, cancellation, emit):
+            runner.stop()
+            return _completed(request.source)
+
+        transcriber.transcribe.side_effect = spy
+
+        report = runner.run_files(
+            ["/x/a.mp4", "/x/b.mp4", "/x/c.mp4"], _request)
+
+        # Only the first file is transcribed; the loop then sees the stop flag.
+        assert transcriber.transcribe.call_count == 1
+        assert report.stopped is True
+        presenter.finished.assert_called_once_with(stopped=True)
+
+    def test_cancelled_outcome_stops_the_run(self, runner, transcriber, presenter):
+        transcriber.transcribe.side_effect = [
+            Cancelled(), _completed("/x/b.mp4"),
+        ]
+
+        report = runner.run_files(["/x/a.mp4", "/x/b.mp4"], _request)
+
+        assert transcriber.transcribe.call_count == 1
+        assert report.stopped is True
+        assert _log_calls(presenter, "WARNING") == ["Transcription cancelled: a.mp4"]
+
+    def test_stopped_run_does_not_leak_into_next_run(self, runner, transcriber):
+        transcriber.transcribe.side_effect = [
+            _completed("/x/a.mp4"), _completed("/x/b.mp4"),
+        ]
+
+        runner.stop()
+        runner.run_files(["/x/a.mp4"], _request)  # stops immediately
+        report = runner.run_files(["/x/a.mp4", "/x/b.mp4"], _request)
+
+        # The second run processes both files normally: the stop did not leak.
+        assert transcriber.transcribe.call_count == 2
+        assert (report.completed, report.failed, report.stopped) == (2, 0, False)
