@@ -16,6 +16,12 @@ import psutil
 from ui_helpers import CHANNEL_APP, CHANNEL_SERVER, LogMixin
 
 
+CONTEXT_SIZE_OPTIONS = (
+    512, 1024, 2048, 4096, 8192, 16384,
+    32768, 49152, 65536, 98304, 131072,
+)
+
+
 TRANSLATION_PRESET = {
     "context_size": 16384,
     "batch_size": 512,
@@ -42,13 +48,13 @@ CHAT_PRESET = {
 }
 
 LONG_CONTEXT_PRESET = {
-    "context_size": 65536,
+    "context_size": 131072,
     "batch_size": 512,
     "parallel": 1,
     "flash_attn": True,
     "cont_batching": True,
-    "cache_type_k": "f16",
-    "cache_type_v": "f16",
+    "cache_type_k": "q8_0",
+    "cache_type_v": "q8_0",
 }
 
 
@@ -115,6 +121,7 @@ class ServerTab(LogMixin, ttk.Frame):
 
         server_frame = ttk.LabelFrame(main_frame, text="\u2699\uFE0F \u670D\u52A1\u5668\u8BBE\u7F6E", padding="10")
         server_frame.grid(row=2, column=0, sticky=(tk.W, tk.E), pady=(0, 10))
+        server_frame.columnconfigure(0, weight=1)
 
         params_grid = ttk.Frame(server_frame)
         params_grid.grid(row=0, column=0, sticky=(tk.W, tk.E))
@@ -139,7 +146,7 @@ class ServerTab(LogMixin, ttk.Frame):
         self.context_var = tk.IntVar(value=self._config.get("server.context_size", 16384))
         context_combo = ttk.Combobox(
             params_grid, textvariable=self.context_var,
-            values=[512, 1024, 2048, 4096, 8192, 16384, 32768, 49152, 65536, 98304, 131072],
+            values=CONTEXT_SIZE_OPTIONS,
             width=10, state="readonly")
         context_combo.grid(row=0, column=6, padx=(0, 20))
 
@@ -170,8 +177,68 @@ class ServerTab(LogMixin, ttk.Frame):
                      values=["f16", "q8_0", "q4_0"], width=8,
                      state="readonly").grid(row=1, column=7, columnspan=2, sticky=tk.W, pady=(8, 0))
 
+        dflash_frame = ttk.LabelFrame(
+            server_frame, text="DFlash speculative decoding", padding="8"
+        )
+        dflash_frame.grid(row=1, column=0, sticky=(tk.W, tk.E), pady=(10, 0))
+        dflash_frame.columnconfigure(2, weight=1)
+
+        self.dflash_enabled_var = tk.BooleanVar(
+            value=self._config.get("server.dflash_enabled", False)
+        )
+        ttk.Checkbutton(
+            dflash_frame, text="Enable DFlash",
+            variable=self.dflash_enabled_var,
+        ).grid(row=0, column=0, sticky=tk.W, padx=(0, 12))
+
+        ttk.Label(dflash_frame, text="Draft GGUF:").grid(
+            row=0, column=1, sticky=tk.W, padx=(0, 5)
+        )
+        self.dflash_model_path_var = tk.StringVar(value=self._initial_auxiliary_path(
+            "server.dflash_model_path", "dflash-kquant.gguf"
+        ))
+        ttk.Entry(
+            dflash_frame, textvariable=self.dflash_model_path_var, width=48
+        ).grid(row=0, column=2, sticky=(tk.W, tk.E), padx=(0, 5))
+        ttk.Button(
+            dflash_frame, text="Browse...",
+            command=lambda: self._browse_auxiliary_model(
+                self.dflash_model_path_var, "Select DFlash draft model"
+            ),
+        ).grid(row=0, column=3, padx=(0, 12))
+
+        ttk.Label(dflash_frame, text="N max:").grid(
+            row=0, column=4, sticky=tk.W, padx=(0, 5)
+        )
+        self.dflash_n_max_var = tk.IntVar(
+            value=self._config.get("server.dflash_n_max", 6)
+        )
+        ttk.Spinbox(
+            dflash_frame, from_=1, to=15,
+            textvariable=self.dflash_n_max_var, width=5,
+        ).grid(row=0, column=5, sticky=tk.W)
+
+        ttk.Label(dflash_frame, text="mmproj GGUF (optional):").grid(
+            row=1, column=0, columnspan=2, sticky=tk.W, pady=(8, 0),
+            padx=(0, 5)
+        )
+        self.mmproj_path_var = tk.StringVar(value=self._initial_auxiliary_path(
+            "server.mmproj_path", "mmproj-kquant.gguf"
+        ))
+        ttk.Entry(
+            dflash_frame, textvariable=self.mmproj_path_var, width=48
+        ).grid(
+            row=1, column=2, sticky=(tk.W, tk.E), padx=(0, 5), pady=(8, 0)
+        )
+        ttk.Button(
+            dflash_frame, text="Browse...",
+            command=lambda: self._browse_auxiliary_model(
+                self.mmproj_path_var, "Select multimodal projector"
+            ),
+        ).grid(row=1, column=3, padx=(0, 12), pady=(8, 0))
+
         preset_frame = ttk.Frame(server_frame)
-        preset_frame.grid(row=1, column=0, sticky=tk.W, pady=(10, 0))
+        preset_frame.grid(row=2, column=0, sticky=tk.W, pady=(10, 0))
         ttk.Label(preset_frame, text="用途 Preset:").pack(side=tk.LEFT, padx=(0, 6))
         ttk.Button(
             preset_frame, text="翻譯模式",
@@ -184,13 +251,13 @@ class ServerTab(LogMixin, ttk.Frame):
             width=14,
         ).pack(side=tk.LEFT, padx=(0, 6))
         ttk.Button(
-            preset_frame, text="長上下文模式",
+            preset_frame, text="128K 長上下文",
             command=self._apply_long_context_preset,
             width=16,
         ).pack(side=tk.LEFT)
         ttk.Label(
             preset_frame,
-            text="翻譯 16K/3 slots · 對話 32K/2 slots · 長上下文 64K/1 slot",
+            text="翻譯 16K/3 slots · 對話 32K/2 slots · 長上下文 128K/1 slot",
             foreground="gray",
         ).pack(side=tk.LEFT, padx=(10, 0))
 
@@ -239,6 +306,22 @@ class ServerTab(LogMixin, ttk.Frame):
 
     def log(self, level, message):
         self._log(level, message)
+
+    def _initial_auxiliary_path(self, config_key, suggested_filename):
+        configured = self._config.get(config_key, "")
+        if configured:
+            return configured
+        suggested = Path(self._base_dir) / suggested_filename
+        return str(suggested) if suggested.is_file() else ""
+
+    def _browse_auxiliary_model(self, path_var, title):
+        file_path = filedialog.askopenfilename(
+            title=title,
+            filetypes=[("GGUF Files", "*.gguf"), ("All Files", "*.*")],
+            initialdir=str(self._base_dir),
+        )
+        if file_path:
+            path_var.set(file_path)
 
     # --------------------------------------------------------- Model management
     def refresh_model_list(self):
@@ -334,14 +417,27 @@ class ServerTab(LogMixin, ttk.Frame):
         if self._server.running and self._active_model_name == model_name:
             messagebox.showwarning("\u8B66\u544A", "\u6B64\u6A21\u578B\u5DF2\u5728\u904B\u884C\u4E2D\uFF01")
             return
-        self._config.set("server.port", self.port_var.get())
-        self._config.set("server.gpu_layers", self.gpu_layers_var.get())
-        self._config.set("server.context_size", self.context_var.get())
-        self._config.set("server.batch_size", self.batch_var.get())
-        self._config.set("server.parallel", self.parallel_var.get())
-        self._config.set("server.flash_attn", self.flash_attn_var.get())
-        self._config.set("server.cache_type_k", self.cache_type_k_var.get())
-        self._config.set("server.cache_type_v", self.cache_type_v_var.get())
+        # Numeric vars (spinboxes are editable) raise TclError when cleared or
+        # given non-numeric text; catch once here instead of crashing the
+        # Tk callback with no feedback.
+        try:
+            self._config.set("server.port", self.port_var.get())
+            self._config.set("server.gpu_layers", self.gpu_layers_var.get())
+            self._config.set("server.context_size", self.context_var.get())
+            self._config.set("server.batch_size", self.batch_var.get())
+            self._config.set("server.parallel", self.parallel_var.get())
+            self._config.set("server.flash_attn", self.flash_attn_var.get())
+            self._config.set("server.cache_type_k", self.cache_type_k_var.get())
+            self._config.set("server.cache_type_v", self.cache_type_v_var.get())
+            self._config.set("server.dflash_enabled", self.dflash_enabled_var.get())
+            self._config.set(
+                "server.dflash_model_path", self.dflash_model_path_var.get()
+            )
+            self._config.set("server.dflash_n_max", self.dflash_n_max_var.get())
+            self._config.set("server.mmproj_path", self.mmproj_path_var.get())
+        except tk.TclError as e:
+            messagebox.showerror("錯誤", f"參數輸入無效，請檢查數字欄位：{e}")
+            return
 
         self.log("INFO", f"\u555F\u52D5\u670D\u52A1\u5668: {model_name}")
         if self._do_start_server(model_name, self.port_var.get()):
@@ -380,6 +476,18 @@ class ServerTab(LogMixin, ttk.Frame):
         cont_batching = self._config.get("server.cont_batching", True)
         cache_type_k = self._config.get("server.cache_type_k", "q8_0")
         cache_type_v = self._config.get("server.cache_type_v", "q8_0")
+        dflash_enabled = self._config.get("server.dflash_enabled", False)
+        dflash_model_path = self._config.get("server.dflash_model_path", "")
+        dflash_n_max = self._config.get("server.dflash_n_max", 6)
+        dflash_gpu_layers = self._config.get(
+            "server.dflash_gpu_layers", "all"
+        )
+        dflash_device = self._config.get("server.dflash_device", "Vulkan0")
+        mmproj_path = self._config.get("server.mmproj_path", "")
+        # ServerController forces --flash-attn on for DFlash; surface that so
+        # the checkbox being unchecked doesn't read as the server's behavior.
+        if dflash_enabled and not flash_attn:
+            self.log("WARNING", "DFlash 需要 flash-attn，已自動啟用 --flash-attn on")
 
         try:
             self._server.start(
@@ -388,7 +496,13 @@ class ServerTab(LogMixin, ttk.Frame):
                 gpu_layers=gpu, context_size=ctx, batch_size=bsz,
                 parallel=parallel, flash_attn=flash_attn,
                 cont_batching=cont_batching,
-                cache_type_k=cache_type_k, cache_type_v=cache_type_v
+                cache_type_k=cache_type_k, cache_type_v=cache_type_v,
+                dflash_enabled=dflash_enabled,
+                dflash_model_path=dflash_model_path,
+                dflash_n_max=dflash_n_max,
+                dflash_gpu_layers=dflash_gpu_layers,
+                dflash_device=dflash_device,
+                mmproj_path=mmproj_path,
             )
             # Keep the start button available while running so selecting another
             # model + pressing it performs the automatic switch above.

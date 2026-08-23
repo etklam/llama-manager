@@ -17,7 +17,7 @@ class ModelRegistry(BaseModelRegistry):
     format_name = "Unknown"
 
     FORMATS = [
-        "Q4_K_M", "Q4_K_S", "Q5_K_M", "Q5_K_S", "Q8_0",
+        "Q4_K_XL", "Q4_K_M", "Q4_K_S", "Q5_K_M", "Q5_K_S", "Q8_0",
         "IQ4_NL", "IQ4_XS", "Q3_K_M", "Q2_K",
     ]
 
@@ -25,6 +25,10 @@ class ModelRegistry(BaseModelRegistry):
         info = super()._build_model_info(filepath)
         info["format"] = self.detect_format(filepath.name)
         return info
+
+    def _is_scan_candidate(self, filepath: Path) -> bool:
+        name = filepath.name.lower()
+        return not name.startswith(("dflash", "mmproj"))
 
     @staticmethod
     def detect_format(filename: str) -> str:

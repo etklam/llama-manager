@@ -94,6 +94,7 @@ class TestDetectFormatUnknown:
     def test_detect_format_all_known_formats(self):
         """Test all known format patterns are detected."""
         test_cases = [
+            ("model.Q4_K_XL.gguf", "Q4_K_XL"),
             ("model.Q4_K_M.gguf", "Q4_K_M"),
             ("model.Q4_K_S.gguf", "Q4_K_S"),
             ("model.Q5_K_M.gguf", "Q5_K_M"),
@@ -142,6 +143,29 @@ class TestScanDiscover:
         assert len(models) == 2, f"Should discover 2 models, found {len(models)}"
         assert added == 2, f"Should add 2 models, added count was {added}"
         assert removed == 0, f"Should remove 0 models, removed count was {removed}"
+
+    def test_scan_excludes_dflash_and_mmproj_auxiliary_models(self, model_registry, temp_scan_dir):
+        (temp_scan_dir / "main-model.gguf").touch()
+        (temp_scan_dir / "dflash-kquant.gguf").touch()
+        (temp_scan_dir / "DFlash-extra.GGUF").touch()
+        (temp_scan_dir / "mmproj-kquant.gguf").touch()
+
+        models, added, removed = model_registry.scan()
+
+        assert [model["name"] for model in models] == ["main-model"]
+        assert added == 1
+        assert removed == 0
+
+    def test_explicit_add_keeps_auxiliary_model_behavior(self, model_registry, temp_scan_dir):
+        auxiliary = temp_scan_dir / "dflash-kquant.gguf"
+        auxiliary.touch()
+
+        model_registry.add_model(str(auxiliary))
+        models, added, removed = model_registry.scan()
+
+        assert [model["name"] for model in models] == ["dflash-kquant"]
+        assert added == 0
+        assert removed == 0
 
     def test_scan_ignores_non_gguf_files(self, model_registry, temp_scan_dir):
         """Test that scan ignores non-.gguf files."""

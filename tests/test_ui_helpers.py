@@ -1,11 +1,17 @@
 """Tests for ui_helpers module: populate_language_combo, extract_combo_code, LogMixin."""
+import queue
 import tkinter as tk
 from tkinter import ttk
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from ui_helpers import populate_language_combo, extract_combo_code, LogMixin
+from ui_helpers import (
+    LOG_POLL_MS,
+    populate_language_combo,
+    extract_combo_code,
+    LogMixin,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -233,3 +239,57 @@ class TestLogMixinDefaultMaxLines:
 
     def test_class_level_default(self):
         assert LogMixin._log_max_lines == 2000
+
+
+# ---------------------------------------------------------------------------
+# LogMixin queue pump. Emitters include background threads (the server stdout
+# monitor, workers), so the bus handler must not touch Tk directly.
+# ---------------------------------------------------------------------------
+
+class TestLogQueuePump:
+    def _make_mixin(self):
+        mixin = LogMixin()
+        mixin._log_text = MagicMock()
+        mixin._log_text.index.return_value = "1.0"
+        mixin._log_max_lines = 2000
+        mixin._log_queue = queue.Queue()
+        return mixin
+
+    def test_handler_enqueues_without_touching_widget(self):
+        mixin = self._make_mixin()
+
+        mixin._log_bus_handler("INFO", "from a worker thread")
+
+        assert mixin._log_queue.qsize() == 1
+        mixin._log_text.insert.assert_not_called()
+
+    def test_poll_drains_queue_and_reschedules(self):
+        mixin = self._make_mixin()
+        mixin._log_bus_handler("INFO", "a")
+        mixin._log_bus_handler("ERROR", "b")
+
+        mixin._poll_log_queue()
+
+        assert mixin._log_queue.qsize() == 0
+        assert mixin._log_text.insert.call_count == 2
+        mixin._log_text.after.assert_called_once_with(
+            LOG_POLL_MS, mixin._poll_log_queue)
+
+    def test_poll_batches_many_lines_in_one_widget_pass(self):
+        mixin = self._make_mixin()
+        mixin._log_text.index.return_value = "1.0"
+        for i in range(50):
+            mixin._log_bus_handler("INFO", f"line {i}")
+
+        mixin._poll_log_queue()
+
+        # One enable/see/disable pass for the whole batch, not per line.
+        assert mixin._log_text.insert.call_count == 50
+        assert mixin._log_text.see.call_count == 1
+
+    def test_poll_survives_destroyed_widget(self):
+        mixin = self._make_mixin()
+        mixin._log_text.after.side_effect = tk.TclError("bad window path")
+        mixin._log_bus_handler("INFO", "too late")
+
+        mixin._poll_log_queue()  # must not raise

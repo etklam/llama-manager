@@ -1,9 +1,11 @@
 """Headless tests for ServerTab presets and automatic model switching."""
+import tkinter as tk
 from pathlib import Path
 from unittest.mock import Mock, patch
 
 from server_tab import (
     CHAT_PRESET,
+    CONTEXT_SIZE_OPTIONS,
     LONG_CONTEXT_PRESET,
     TRANSLATION_PRESET,
     ServerTab,
@@ -19,6 +21,16 @@ class FakeVar:
 
     def set(self, value):
         self.value = value
+
+
+class ClearedSpinboxVar:
+    """Simulates an IntVar read after the user empties the spinbox field."""
+
+    def get(self):
+        raise tk.TclError('expected integer but got ""')
+
+    def set(self, value):
+        pass
 
 
 class FakeConfig:
@@ -63,7 +75,14 @@ def _make_tab(model_path: Path, *, server=None, active_model=None):
         "server.cont_batching": True,
         "server.cache_type_k": "q8_0",
         "server.cache_type_v": "q8_0",
+        "server.dflash_enabled": False,
+        "server.dflash_model_path": "",
+        "server.dflash_n_max": 6,
+        "server.dflash_gpu_layers": "all",
+        "server.dflash_device": "Vulkan0",
+        "server.mmproj_path": "",
     })
+    tab._base_dir = model_path.parent
     tab._active_model_name = active_model
     tab._monitor_running = False
     tab._monitor_generation = 0
@@ -78,6 +97,10 @@ def _make_tab(model_path: Path, *, server=None, active_model=None):
     tab.flash_attn_var = FakeVar(True)
     tab.cache_type_k_var = FakeVar("q8_0")
     tab.cache_type_v_var = FakeVar("q8_0")
+    tab.dflash_enabled_var = FakeVar(False)
+    tab.dflash_model_path_var = FakeVar("")
+    tab.dflash_n_max_var = FakeVar(6)
+    tab.mmproj_path_var = FakeVar("")
 
     tab.start_button = Mock()
     tab.stop_button = Mock()
@@ -149,19 +172,86 @@ class TestServerPresets:
             < LONG_CONTEXT_PRESET["context_size"]
         )
 
+    def test_context_options_top_out_at_128k(self):
+        assert max(CONTEXT_SIZE_OPTIONS) == 131072
+
     def test_long_context_preset_updates_fields_and_config(self, tmp_path):
         tab = _make_tab(tmp_path / "model.gguf")
 
         tab._apply_long_context_preset()
 
-        assert tab.context_var.get() == 65536
+        assert tab.context_var.get() == 131072
         assert tab.batch_var.get() == 512
         assert tab.parallel_var.get() == 1
         assert tab.flash_attn_var.get() is True
-        assert tab.cache_type_k_var.get() == "f16"
-        assert tab.cache_type_v_var.get() == "f16"
+        assert tab.cache_type_k_var.get() == "q8_0"
+        assert tab.cache_type_v_var.get() == "q8_0"
         for key, value in LONG_CONTEXT_PRESET.items():
             assert tab._config.get(f"server.{key}") == value
+
+
+class TestDFlashSettings:
+    def test_auxiliary_path_is_suggested_when_config_is_empty(self, tmp_path):
+        suggested = tmp_path / "dflash-kquant.gguf"
+        suggested.write_bytes(b"gguf")
+        tab = _make_tab(tmp_path / "model.gguf")
+
+        assert tab._initial_auxiliary_path(
+            "server.dflash_model_path", "dflash-kquant.gguf"
+        ) == str(suggested)
+
+    def test_configured_auxiliary_path_wins_over_suggestion(self, tmp_path):
+        suggested = tmp_path / "mmproj-kquant.gguf"
+        suggested.write_bytes(b"gguf")
+        tab = _make_tab(tmp_path / "model.gguf")
+        tab._config.values["server.mmproj_path"] = "D:/custom/mmproj.gguf"
+
+        assert tab._initial_auxiliary_path(
+            "server.mmproj_path", "mmproj-kquant.gguf"
+        ) == "D:/custom/mmproj.gguf"
+
+    def test_start_persists_dflash_fields(self, tmp_path):
+        tab = _make_tab(tmp_path / "model.gguf")
+        tab.dflash_enabled_var.set(True)
+        tab.dflash_model_path_var.set("D:/models/dflash.gguf")
+        tab.dflash_n_max_var.set(9)
+        tab.mmproj_path_var.set("D:/models/mmproj.gguf")
+        tab._do_start_server = Mock(return_value=True)
+
+        tab.start_server()
+
+        assert tab._config.get("server.dflash_enabled") is True
+        assert tab._config.get("server.dflash_model_path") == "D:/models/dflash.gguf"
+        assert tab._config.get("server.dflash_n_max") == 9
+        assert tab._config.get("server.mmproj_path") == "D:/models/mmproj.gguf"
+
+    def test_dflash_with_flash_attn_off_warns_about_forced_flash_attn(self, tmp_path):
+        """ServerController forces --flash-attn on for DFlash; the tab must
+        say so instead of silently contradicting the unchecked checkbox."""
+        model_path = tmp_path / "new.gguf"
+        model_path.write_bytes(b"gguf")
+        tab = _make_tab(model_path)
+        tab._config.values["server.flash_attn"] = False
+        tab._config.values["server.dflash_enabled"] = True
+
+        assert tab._do_start_server("new-model", 8080) is True
+
+        tab.log.assert_any_call(
+            "WARNING", "DFlash 需要 flash-attn，已自動啟用 --flash-attn on")
+
+
+class TestStartServerValidation:
+    @patch("server_tab.messagebox.showerror")
+    def test_cleared_spinbox_shows_error_instead_of_crashing(
+            self, showerror, tmp_path):
+        tab = _make_tab(tmp_path / "model.gguf")
+        tab.dflash_n_max_var = ClearedSpinboxVar()
+        tab._do_start_server = Mock(return_value=True)
+
+        tab.start_server()
+
+        showerror.assert_called_once()
+        tab._do_start_server.assert_not_called()
 
 
 class TestAutomaticModelSwitch:
@@ -193,6 +283,12 @@ class TestAutomaticModelSwitch:
         assert server.start_kwargs["model_path"] == str(model_path)
         assert server.start_kwargs["parallel"] == 3
         assert server.start_kwargs["cache_type_k"] == "q8_0"
+        assert server.start_kwargs["dflash_enabled"] is False
+        assert server.start_kwargs["dflash_model_path"] == ""
+        assert server.start_kwargs["dflash_n_max"] == 6
+        assert server.start_kwargs["dflash_gpu_layers"] == "all"
+        assert server.start_kwargs["dflash_device"] == "Vulkan0"
+        assert server.start_kwargs["mmproj_path"] == ""
         tab.start_button.config.assert_called_with(
             state="normal", text="\U0001F504 切換模型"
         )

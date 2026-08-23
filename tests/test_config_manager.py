@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, Dict
 
 # This import will FAIL until ConfigManager is implemented
-from config_manager import ConfigManager
+from config_manager import ConfigManager, DEFAULT_CONFIG
 
 
 # Fixtures
@@ -89,6 +89,19 @@ def config_manager(sample_config_file):
 def config_manager_with_defaults(temp_config_file):
     """Create a ConfigManager instance with defaults (no existing file)."""
     return ConfigManager(str(temp_config_file))
+
+
+class TestServerDefaults:
+    def test_dflash_defaults(self):
+        for key, expected in {
+            "dflash_enabled": False,
+            "dflash_model_path": "",
+            "dflash_n_max": 6,
+            "dflash_gpu_layers": "all",
+            "dflash_device": "Vulkan0",
+            "mmproj_path": "",
+        }.items():
+            assert DEFAULT_CONFIG["server"][key] == expected
 
 
 # Test 1: Test loading config file

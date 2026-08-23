@@ -1,8 +1,14 @@
+import queue
 import re
 from datetime import datetime
 from typing import Callable, Optional, Sequence
 import tkinter as tk
 from tkinter import ttk, scrolledtext
+
+# Log widget pump: how often the main thread drains the per-widget queue, and
+# the cap per tick so one chatty emitter can't monopolize a redraw.
+LOG_POLL_MS = 80
+LOG_DRAIN_MAX = 200
 
 
 # Log channels. Every emitter names the subsystem it speaks for so a log widget
@@ -122,24 +128,49 @@ class LogMixin:
         # subsystem's traffic. `channels` overrides it for widgets that need to
         # watch more than one (the Server tab also carries app-level notices).
         self._log_channels = tuple(channels) if channels else (self.log_channel,)
+        self._log_queue = queue.Queue()
         self._log_unsub = log_bus.subscribe(
             self._log_bus_handler, channels=self._log_channels)
+        self._log_text.after(LOG_POLL_MS, self._poll_log_queue)
 
     def _log_bus_handler(self, level, message):
-        self.winfo_toplevel().after(0, lambda: self._insert_log(level, message))
+        # Emitters include background threads (server stdout monitor, workers),
+        # and Tk calls from those threads are unsafe. Park the line on the
+        # queue; the main-thread poll loop does all widget work.
+        self._log_queue.put((level, message))
+
+    def _poll_log_queue(self):
+        try:
+            pending = []
+            while len(pending) < LOG_DRAIN_MAX:
+                try:
+                    pending.append(self._log_queue.get_nowait())
+                except queue.Empty:
+                    break
+            if pending:
+                self._insert_log_lines(pending)
+            self._log_text.after(LOG_POLL_MS, self._poll_log_queue)
+        except tk.TclError:
+            # Widget destroyed; stop polling.
+            pass
 
     def _log(self, level, message):
         log_bus.emit(level, message, self.log_channel)
 
     def _insert_log(self, level, message):
-        timestamp = datetime.now().strftime("%H:%M:%S")
-        line = f"[{timestamp}] [{level}] {message}\n"
+        self._insert_log_lines([(level, message)])
+
+    def _insert_log_lines(self, lines):
         self._log_text.config(state="normal")
-        self._log_text.insert(tk.END, line, level)
+        for level, message in lines:
+            timestamp = datetime.now().strftime("%H:%M:%S")
+            self._log_text.insert(
+                tk.END, f"[{timestamp}] [{level}] {message}\n", level)
         self._log_text.see(tk.END)
-        lines = int(self._log_text.index('end-1c').split('.')[0])
-        if lines > self._log_max_lines:
-            self._log_text.delete(1.0, f"{lines - self._log_max_lines}.0")
+        lines_count = int(self._log_text.index('end-1c').split('.')[0])
+        if lines_count > self._log_max_lines:
+            self._log_text.delete(
+                1.0, f"{lines_count - self._log_max_lines}.0")
         self._log_text.config(state="disabled")
 
     def _clear_log(self):

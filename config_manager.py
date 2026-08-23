@@ -26,7 +26,13 @@ DEFAULT_CONFIG = {
         'flash_attn': True,
         'cont_batching': True,
         'cache_type_k': 'q8_0',
-        'cache_type_v': 'q8_0'
+        'cache_type_v': 'q8_0',
+        'dflash_enabled': False,
+        'dflash_model_path': '',
+        'dflash_n_max': 6,
+        'dflash_gpu_layers': 'all',
+        'dflash_device': 'Vulkan0',
+        'mmproj_path': ''
     },
     'ui': {
         'theme': 'default',

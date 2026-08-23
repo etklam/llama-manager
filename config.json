@@ -3,21 +3,28 @@
     "port": 8080,
     "host": "0.0.0.0",
     "gpu_layers": 99,
-    "context_size": 65536,
+    "context_size": 16384,
     "batch_size": 512,
     "threads": -1,
-    "parallel": 1,
+    "parallel": 3,
     "flash_attn": true,
     "cont_batching": true,
-    "cache_type_k": "f16",
-    "cache_type_v": "f16"
+    "cache_type_k": "q8_0",
+    "cache_type_v": "q8_0",
+    "dflash_enabled": false,
+    "dflash_model_path": "D:\\AI\\llama\\llama.cpp\\llama-hip\\dflash-kquant.gguf",
+    "dflash_n_max": 6,
+    "dflash_gpu_layers": "all",
+    "dflash_device": "Vulkan0",
+    "mmproj_path": ""
   },
   "ui": {
     "theme": "default",
     "auto_scroll": true,
     "last_model": "gemma-4-E2B-it-uncensored-Q8_0",
     "last_source_lang": "auto",
-    "last_target_lang": "zh-tw"
+    "last_target_lang": "zh-tw",
+    "max_workers": 3
   },
   "translation": {
     "enabled": false,
@@ -46,6 +53,12 @@
         "path": "D:\\AI\\llama\\llama.cpp\\llama-hip\\Gemma4-26B-A4B-QAT-Uncensored-HauhauCS-Balanced-Q4_K_M.gguf",
         "size": "15.64GB",
         "format": "Q4_K_M"
+      },
+      {
+        "name": "Muse-Glimmer-30B-UD-Q4_K_XL",
+        "path": "D:\\AI\\llama\\llama.cpp\\llama-hip\\Muse-Glimmer-30B-UD-Q4_K_XL.gguf",
+        "size": "14.79GB",
+        "format": "Q4_K_XL"
       }
     ]
   },

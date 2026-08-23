@@ -1,8 +1,11 @@
 """Headless tests for PipelineCard log routing and model resolution."""
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from pipeline_card import PipelineCard
+from pipeline_runner import PipelineRunner
+from translation.preflight import PreflightPlan
+from translation.server_probe import ServerInfo
 
 
 def _make_card():
@@ -36,6 +39,49 @@ def test_pipeline_error_updates_status_in_red_without_duplicate_log():
         text="Error: llama-server not reachable", foreground="red")
     card._on_log.assert_called_once()
     card._on_debug_log.assert_not_called()
+
+
+def test_unreachable_preflight_emits_one_pipeline_log_line():
+    """The progress callback already publishes the preflight error to the log."""
+    card = _make_card()
+    config = Mock()
+    config.get.return_value = 3
+    message = (
+        "llama-server 未回應 (http://localhost:8080/props): "
+        "ReadError: [WinError 10054]\n"
+        "請先在 Server 分頁啟動伺服器並等模型載入完成。"
+    )
+    runner = PipelineRunner(
+        config_manager=config,
+        get_port=lambda: 8080,
+        get_current_model=lambda: "test-model",
+        resolve_whisper_model_path=lambda model_dir, name: name,
+        get_whisper_models=lambda: [],
+        on_log=lambda msg: card._on_log("INFO", msg),
+        on_progress=card._pipeline_step,
+        on_done=Mock(),
+    )
+
+    with patch(
+        "pipeline_runner.run_preflight",
+        return_value=PreflightPlan(
+            reachable=False,
+            workers=3,
+            note=message,
+            info=ServerInfo(reachable=False, error="ReadError"),
+        ),
+    ):
+        runner.run(
+            files=["/test/a.srt"],
+            target_lang="zh-cn",
+            language="en",
+            replace_original=False,
+            whisper_cli_path=Path("whisper-cli.exe"),
+            whisper_model_name="tiny",
+            whisper_model_dir="/models",
+        )
+
+    card._on_log.assert_called_once_with("INFO", f"Error: {message}")
 
 
 def test_resolve_whisper_model_path_uses_the_shared_registry_lookup():

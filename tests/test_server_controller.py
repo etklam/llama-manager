@@ -74,7 +74,10 @@ class TestServerStart:
         ]
         mock_popen.assert_called_once()
         call_args = mock_popen.call_args
-        assert call_args[0][0][:len(expected_prefix)] == expected_prefix
+        cmd = call_args[0][0]
+        assert cmd[:len(expected_prefix)] == expected_prefix
+        assert cmd[cmd.index("--cache-type-k") + 1] == "q8_0"
+        assert cmd[cmd.index("--cache-type-v") + 1] == "q8_0"
 
         # Verify stdout/stderr are piped
         import subprocess
@@ -179,8 +182,8 @@ class TestConcurrencyAndKVFlags:
         assert cmd[cmd.index("--parallel") + 1] == "3"
 
     @patch('server_controller.subprocess.Popen')
-    def test_parallel_one_omits_parallel_flag(self, mock_popen, temp_model_file):
-        """parallel == 1 should not add --parallel (server default)."""
+    def test_parallel_one_sets_single_slot(self, mock_popen, temp_model_file):
+        """parallel == 1 should override llama-server's backend default."""
         mock_process = Mock()
         mock_process.stdout.readline.return_value = ''
         mock_process.poll.return_value = None
@@ -193,7 +196,8 @@ class TestConcurrencyAndKVFlags:
             parallel=1
         )
 
-        assert "--parallel" not in mock_popen.call_args[0][0]
+        cmd = mock_popen.call_args[0][0]
+        assert cmd[cmd.index("--parallel") + 1] == "1"
 
     @patch('server_controller.subprocess.Popen')
     def test_flash_attn_and_cont_batching_flags(self, mock_popen, temp_model_file):
@@ -271,6 +275,80 @@ class TestConcurrencyAndKVFlags:
         cmd = mock_popen.call_args[0][0]
         assert "--cache-type-k" not in cmd
         assert "--cache-type-v" not in cmd
+
+
+class TestDFlashFlags:
+    """Test DFlash and multimodal launch behavior."""
+
+    @patch('server_controller.subprocess.Popen')
+    def test_dflash_adds_speculative_flags_and_jinja(self, mock_popen, temp_model_file, tmp_path):
+        draft_model = tmp_path / "dflash-kquant.gguf"
+        draft_model.write_bytes(b"gguf")
+        mock_process = Mock()
+        mock_process.stdout.readline.return_value = ''
+        mock_process.poll.return_value = None
+        mock_popen.return_value = mock_process
+
+        controller = ServerController(Path("llama-server.exe"), Mock())
+        controller.start(
+            model_path=temp_model_file, port=8080, host="0.0.0.0",
+            gpu_layers=99, context_size=16384, batch_size=512,
+            flash_attn=False,
+            dflash_enabled=True, dflash_model_path=str(draft_model),
+            dflash_n_max=8, dflash_gpu_layers="all",
+            dflash_device="Vulkan1",
+        )
+
+        cmd = mock_popen.call_args[0][0]
+        assert cmd[cmd.index("--spec-draft-model") + 1] == str(draft_model)
+        assert cmd[cmd.index("--spec-type") + 1] == "draft-dflash"
+        assert cmd[cmd.index("--spec-draft-n-max") + 1] == "8"
+        assert cmd[cmd.index("--spec-draft-ngl") + 1] == "all"
+        assert cmd[cmd.index("--spec-draft-device") + 1] == "Vulkan1"
+        assert cmd[cmd.index("--flash-attn") + 1] == "on"
+        assert "--jinja" in cmd
+
+    def test_dflash_requires_existing_draft_model(self, temp_model_file, tmp_path):
+        controller = ServerController(Path("llama-server.exe"), Mock())
+        missing = tmp_path / "missing-dflash.gguf"
+
+        with pytest.raises(FileNotFoundError, match="DFlash draft model file not found"):
+            controller.start(
+                model_path=temp_model_file, port=8080, host="0.0.0.0",
+                gpu_layers=99, context_size=16384, batch_size=512,
+                dflash_enabled=True, dflash_model_path=str(missing),
+            )
+
+    @patch('server_controller.subprocess.Popen')
+    def test_mmproj_is_validated_and_added_without_dflash(self, mock_popen, temp_model_file, tmp_path):
+        mmproj = tmp_path / "mmproj-kquant.gguf"
+        mmproj.write_bytes(b"gguf")
+        mock_process = Mock()
+        mock_process.stdout.readline.return_value = ''
+        mock_process.poll.return_value = None
+        mock_popen.return_value = mock_process
+
+        controller = ServerController(Path("llama-server.exe"), Mock())
+        controller.start(
+            model_path=temp_model_file, port=8080, host="0.0.0.0",
+            gpu_layers=99, context_size=16384, batch_size=512,
+            mmproj_path=str(mmproj),
+        )
+
+        cmd = mock_popen.call_args[0][0]
+        assert cmd[cmd.index("--mmproj") + 1] == str(mmproj)
+        assert "--spec-draft-model" not in cmd
+
+    def test_mmproj_requires_existing_file(self, temp_model_file, tmp_path):
+        controller = ServerController(Path("llama-server.exe"), Mock())
+        missing = tmp_path / "missing-mmproj.gguf"
+
+        with pytest.raises(FileNotFoundError, match="Multimodal projector file not found"):
+            controller.start(
+                model_path=temp_model_file, port=8080, host="0.0.0.0",
+                gpu_layers=99, context_size=16384, batch_size=512,
+                mmproj_path=str(missing),
+            )
 
 
 class TestServerStop:

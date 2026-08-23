@@ -5,6 +5,7 @@ llama.cpp Manager - 簡單的 GUI 管理器
 用於管理 llama.cpp 服務器和模型
 """
 
+import queue
 import tkinter as tk
 from tkinter import ttk, scrolledtext, messagebox
 from pathlib import Path
@@ -21,7 +22,14 @@ from server_controller import ServerController
 from model_registry import ModelRegistry
 from whisper_model_registry import WhisperModelRegistry
 # constants imported indirectly by pipeline_card, server_tab, etc.
-from ui_helpers import CHANNEL_APP, CHANNEL_PIPELINE, LogMixin, log_bus
+from ui_helpers import (
+    CHANNEL_APP,
+    CHANNEL_PIPELINE,
+    CHANNEL_SERVER,
+    LOG_POLL_MS,
+    LogMixin,
+    log_bus,
+)
 
 class LlamaManager(LogMixin):
     def __init__(self, root):
@@ -31,16 +39,22 @@ class LlamaManager(LogMixin):
         self.root.resizable(True, True)
 
         self.base_dir = Path(r"D:\AI\llama\llama.cpp")
-        self.hip_dir = self.base_dir / "llama-hip"
-        self.server_exe = self.hip_dir / "llama-server.exe"
+        self.runtime_dir = Path(
+            r"D:\AI\llama\llama.cpp-dflash\build-vulkan-msvc\bin"
+        )
+        self.model_dir = self.base_dir / "llama-hip"
+        self.server_exe = self.runtime_dir / "llama-server.exe"
 
         self.config_manager = ConfigManager(str(Path(__file__).parent / "config.json"))
         self.config_manager.load()
 
-        self.server = ServerController(self.server_exe, lambda line: None)
-        self.models = ModelRegistry(self.hip_dir, self.config_manager)
+        self.server = ServerController(
+            self.server_exe,
+            lambda line: log_bus.emit("INFO", line, CHANNEL_SERVER),
+        )
+        self.models = ModelRegistry(self.model_dir, self.config_manager)
 
-        whisper_model_dir = Path(self.config_manager.get("whisper.model_dir", str(self.hip_dir)))
+        whisper_model_dir = Path(self.config_manager.get("whisper.model_dir", str(self.model_dir)))
         self.whisper_models = WhisperModelRegistry(whisper_model_dir, self.config_manager)
 
         self._debug_win = None
@@ -53,8 +67,8 @@ class LlamaManager(LogMixin):
         self.root._app = self
 
     def scan_models(self):
-        if not self.hip_dir.exists():
-            self.log("WARNING", f"目錄不存在: {self.hip_dir}")
+        if not self.model_dir.exists():
+            self.log("WARNING", f"目錄不存在: {self.model_dir}")
             return
 
         models_list, added_count, removed_count = self.models.scan()
@@ -91,7 +105,7 @@ class LlamaManager(LogMixin):
             server_controller=self.server,
             models_registry=self.models,
             config_manager=self.config_manager,
-            base_dir=self.hip_dir,
+            base_dir=self.model_dir,
             on_model_selected=self._on_server_model_selected,
             on_server_state_changed=self._on_server_state_changed,
         )
@@ -252,7 +266,9 @@ class LlamaManager(LogMixin):
         self._debug_text.tag_config("WARNING", foreground="orange")
         # The debug window is the one sink that sees every channel, so it stays
         # the place to watch a whole run end to end.
+        self._debug_queue = queue.Queue()
         self._debug_unsub = log_bus.subscribe_all(self._debug_subscriber)
+        self._debug_text.after(LOG_POLL_MS, self._poll_debug_queue)
 
     def _close_debug_win(self):
         if getattr(self, "_debug_unsub", None):
@@ -279,10 +295,25 @@ class LlamaManager(LogMixin):
         log_bus.emit(level, message)
 
     def _debug_subscriber(self, level, message, channel=CHANNEL_APP):
-        # ponytail: marshal onto Tk thread; reuse existing _debug_insert formatter
-        timestamp = datetime.now().strftime("%H:%M:%S")
-        line = f"[{timestamp}] [{level}] [{channel}] {message}\n"
-        self.root.after(0, lambda: self._debug_insert(line, level))
+        # Emitters include background threads (server stdout monitor, workers);
+        # Tk calls from there are unsafe, so park on the queue and let the
+        # main-thread poll loop do the widget work.
+        self._debug_queue.put((level, message, channel))
+
+    def _poll_debug_queue(self):
+        try:
+            while True:
+                try:
+                    level, message, channel = self._debug_queue.get_nowait()
+                except queue.Empty:
+                    break
+                timestamp = datetime.now().strftime("%H:%M:%S")
+                line = f"[{timestamp}] [{level}] [{channel}] {message}\n"
+                self._debug_insert(line, level)
+            self._debug_text.after(LOG_POLL_MS, self._poll_debug_queue)
+        except tk.TclError:
+            # Window closed; stop polling.
+            pass
 
     def _debug_insert(self, line, level):
         if not self._debug_text:

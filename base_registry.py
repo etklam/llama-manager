@@ -25,11 +25,17 @@ class BaseModelRegistry:
     def _parse_name(self, filepath: Path) -> str:
         return filepath.stem
 
+    def _is_scan_candidate(self, filepath: Path) -> bool:
+        return True
+
     def scan(self) -> tuple:
         if not self.scan_dir.exists():
             return [], 0, 0
 
-        files = list(self.scan_dir.glob(self.glob_pattern))
+        files = [
+            path for path in self.scan_dir.glob(self.glob_pattern)
+            if self._is_scan_candidate(path)
+        ]
 
         current_models = self.config_manager.get(self.config_key, {}).get("models", [])
         models_to_keep = []

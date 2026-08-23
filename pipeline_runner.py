@@ -143,8 +143,9 @@ class PipelineRunner:
             plan = run_preflight(api_url, requested_workers)
             if not plan.reachable:
                 message = plan.note or "no response"
+                # PipelineCard publishes progress messages to its log, so sending
+                # this failure through both callbacks would duplicate the line.
                 self._on_progress(f"Error: {message}")
-                self._on_log(message)
                 # Report this as a stop, not a clean finish: on_done only carries
                 # a bool, and stopped=False makes the caller announce success for
                 # a run that translated nothing.

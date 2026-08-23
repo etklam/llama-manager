@@ -28,8 +28,14 @@ class ServerController:
               gpu_layers: int, context_size: int, batch_size: int,
               parallel: int = 1, flash_attn: bool = True,
               cont_batching: bool = True,
-              cache_type_k: Optional[str] = None,
-              cache_type_v: Optional[str] = None) -> None:
+              cache_type_k: Optional[str] = "q8_0",
+              cache_type_v: Optional[str] = "q8_0",
+              dflash_enabled: bool = False,
+              dflash_model_path: str = "",
+              dflash_n_max: int = 6,
+              dflash_gpu_layers: str = "all",
+              dflash_device: str = "Vulkan0",
+              mmproj_path: str = "") -> None:
         """Start the server with given params.
 
         Args:
@@ -44,8 +50,16 @@ class ServerController:
             flash_attn: Enable FlashAttention (--flash-attn on). Saves
                 attention VRAM and is required by some builds for quantized KV.
             cont_batching: Enable continuous batching (--cont-batching).
-            cache_type_k: KV cache K data type (e.g. "q8_0"); None keeps f16.
-            cache_type_v: KV cache V data type (e.g. "q8_0"); None keeps f16.
+            cache_type_k: KV cache K data type; defaults to "q8_0".
+                Pass None to use llama.cpp's native default.
+            cache_type_v: KV cache V data type; defaults to "q8_0".
+                Pass None to use llama.cpp's native default.
+            dflash_enabled: Enable DFlash speculative decoding.
+            dflash_model_path: Path to the DFlash draft GGUF model.
+            dflash_n_max: Maximum number of drafted tokens.
+            dflash_gpu_layers: Draft model GPU layer setting.
+            dflash_device: Optional draft model device.
+            mmproj_path: Optional multimodal projector GGUF path.
 
         Raises:
             FileNotFoundError: If model_path doesn't exist
@@ -58,6 +72,15 @@ class ServerController:
         model_file = Path(model_path)
         if not model_file.exists():
             raise FileNotFoundError(f"Model file not found: {model_path}")
+
+        if dflash_enabled and not Path(dflash_model_path).is_file():
+            raise FileNotFoundError(
+                f"DFlash draft model file not found: {dflash_model_path}"
+            )
+        if mmproj_path and not Path(mmproj_path).is_file():
+            raise FileNotFoundError(
+                f"Multimodal projector file not found: {mmproj_path}"
+            )
 
         # Build command
         cmd = [
@@ -72,17 +95,29 @@ class ServerController:
 
         # Concurrency: enable multiple server slots so ThreadPoolExecutor
         # workers on the client side are actually processed in parallel.
-        if parallel and parallel > 1:
+        if parallel and parallel > 0:
             cmd += ["--parallel", str(parallel)]
         if cont_batching:
             cmd += ["--cont-batching"]
-        if flash_attn:
+        if flash_attn or dflash_enabled:
             cmd += ["--flash-attn", "on"]
         # KV cache quantization (requires flash-attn on most builds).
         if cache_type_k:
             cmd += ["--cache-type-k", cache_type_k]
         if cache_type_v:
             cmd += ["--cache-type-v", cache_type_v]
+        if dflash_enabled:
+            cmd += [
+                "--spec-draft-model", dflash_model_path,
+                "--spec-type", "draft-dflash",
+                "--spec-draft-n-max", str(dflash_n_max),
+                "--spec-draft-ngl", str(dflash_gpu_layers),
+            ]
+            if dflash_device:
+                cmd += ["--spec-draft-device", dflash_device]
+            cmd += ["--jinja"]
+        if mmproj_path:
+            cmd += ["--mmproj", mmproj_path]
 
         # Start process
         self._process = subprocess.Popen(
