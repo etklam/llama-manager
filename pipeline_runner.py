@@ -62,6 +62,7 @@ class PipelineRunner:
         on_log: Callable[[str], None],
         on_progress: Callable[[str], None],
         on_done: Callable[[bool], None],
+        on_file_completed: Optional[Callable[[str], None]] = None,
         transcriber: Optional[WhisperTranscriber] = None,
     ):
         self._config_manager = config_manager
@@ -72,6 +73,7 @@ class PipelineRunner:
         self._on_log = on_log
         self._on_progress = on_progress
         self._on_done = on_done
+        self._on_file_completed = on_file_completed or (lambda filepath: None)
         self._transcriber = transcriber or WhisperTranscriber()
 
         # The whisper step goes through the shared transcription run loop,
@@ -165,7 +167,10 @@ class PipelineRunner:
                         self._on_progress(
                             f"[{i+1}/{len(files)}] Translating: {Path(filepath).name}"
                         )
-                        self._translate_file(filepath, target_lang, replace_original)
+                        if self._translate_file(
+                            filepath, target_lang, replace_original
+                        ):
+                            self._on_file_completed(filepath)
                     else:
                         self._on_progress(
                             f"[{i+1}/{len(files)}] Whisper: {Path(filepath).name}"
@@ -177,8 +182,10 @@ class PipelineRunner:
                             self._on_progress(
                                 f"[{i+1}/{len(files)}] Translating: {Path(srt_path).name}"
                             )
-                            self._translate_file(
-                                str(srt_path), target_lang, replace_original)
+                            if self._translate_file(
+                                str(srt_path), target_lang, replace_original
+                            ):
+                                self._on_file_completed(filepath)
                         elif self._stop_requested:
                             break
                 except Exception as e:
@@ -259,12 +266,12 @@ class PipelineRunner:
         srt_path: str,
         target_lang: str,
         replace_original: bool,
-    ) -> None:
-        """Parse an SRT file, translate it, and write the result."""
+    ) -> bool:
+        """Parse, translate, and save an SRT; return whether it completed."""
         subtitles = parse_srt_from_file(srt_path)
         if not subtitles:
             self._on_progress(f"Empty SRT, skipping: {Path(srt_path).name}")
-            return
+            return False
 
         config = build_translation_config(
             self._config_manager, self._get_port(), self._get_current_model()
@@ -294,3 +301,4 @@ class PipelineRunner:
         out_path = output_path_for(srt_path, target_lang, replace_original)
         Path(out_path).write_text(srt_content, encoding='utf-8')
         self._on_progress(f"Saved: {Path(out_path).name}")
+        return True

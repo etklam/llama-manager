@@ -52,6 +52,7 @@ def callbacks():
         'on_log': Mock(),
         'on_progress': Mock(),
         'on_done': Mock(),
+        'on_file_completed': Mock(),
     }
 
 
@@ -67,6 +68,7 @@ def runner(config_manager, callbacks):
         on_log=callbacks['on_log'],
         on_progress=callbacks['on_progress'],
         on_done=callbacks['on_done'],
+        on_file_completed=callbacks['on_file_completed'],
     )
 
 
@@ -518,6 +520,32 @@ class TestCallbacks:
     @patch('pipeline_runner.LocalLLMTranslator')
     @patch('pipeline_runner.parse_srt_from_file')
     @patch('pathlib.Path.write_text', MagicMock())
+    def test_on_file_completed_receives_successful_source_file(
+        self, mock_parse, mock_translator_cls, mock_generate, runner, callbacks
+    ):
+        mock_parse.return_value = [
+            {'line': 1, 'text': 'Hello', 'time': '00:00:00,000 --> 00:00:01,000'}
+        ]
+        mock_translator_cls.return_value.translate_srt.return_value = [
+            {'line': 1, 'text': 'Translated', 'time': '00:00:00,000 --> 00:00:01,000'}
+        ]
+
+        runner.run(
+            files=['/test/a.srt'],
+            target_lang='zh-cn',
+            language='en',
+            replace_original=False,
+            whisper_cli_path=Path('whisper-cli.exe'),
+            whisper_model_name='tiny',
+            whisper_model_dir='/models',
+        )
+
+        callbacks['on_file_completed'].assert_called_once_with('/test/a.srt')
+
+    @patch('pipeline_runner.generate_srt_from_list', return_value="srt output")
+    @patch('pipeline_runner.LocalLLMTranslator')
+    @patch('pipeline_runner.parse_srt_from_file')
+    @patch('pathlib.Path.write_text', MagicMock())
     def test_on_done_called_with_stopped_when_stop_requested(
         self, mock_parse, mock_translator_cls, mock_generate, runner, callbacks
     ):
@@ -587,8 +615,9 @@ class TestErrorHandling:
             whisper_model_dir='/models',
         )
 
-        # Should still process second file
+        # Should still process second file; only successful files are completed.
         assert mock_translator.translate_srt.call_count == 1
+        callbacks['on_file_completed'].assert_called_once_with('/test/good.srt')
         callbacks['on_done'].assert_called_once()
 
 

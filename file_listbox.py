@@ -19,8 +19,9 @@ class FileListboxModel:
     """Pure-Python state for a file listbox.
 
     Holds a list of files; enforces: supported-extension filter + dedup.
-    Calls on_change (if not None) on real mutations only (add, clear),
-    NOT on no-ops (duplicate add, unsupported add, clear-when-empty).
+    Calls on_change (if not None) on real mutations only (add, remove, clear),
+    NOT on no-ops (duplicate add, unsupported add, missing remove,
+    clear-when-empty).
     """
 
     def __init__(self, valid_extensions: set, on_change: Optional[Callable[[], None]] = None):
@@ -54,6 +55,13 @@ class FileListboxModel:
         paths = (p.strip() for p in parse_dropped_paths(raw_data))
         return self.add_many([p for p in paths if p])
 
+    def remove(self, filepath: str) -> bool:
+        if filepath not in self._files:
+            return False
+        self._files.remove(filepath)
+        self._notify()
+        return True
+
     def clear(self) -> None:
         if not self._files:
             return
@@ -78,19 +86,21 @@ class FileListbox(ttk.Frame):
                  filetypes_exts: Optional[Sequence[str]] = None,
                  browse_text: str = "Choose Files",
                  clear_text: str = "Clear",
-                 on_change: Optional[Callable[[], None]] = None):
+                 on_change: Optional[Callable[[], None]] = None,
+                 on_clear: Optional[Callable[[], None]] = None):
         super().__init__(parent)
         self.columnconfigure(0, weight=1)
 
         self.model = FileListboxModel(valid_extensions, on_change=self._on_model_changed)
         self._user_on_change = on_change
+        self._user_on_clear = on_clear
 
         self.button_row = ttk.Frame(self)
         self.button_row.grid(row=0, column=0, sticky=tk.W)
         ttk.Button(self.button_row, text=browse_text,
                    command=self._browse).pack(side=tk.LEFT, padx=2)
         ttk.Button(self.button_row, text=clear_text,
-                   command=self.clear).pack(side=tk.LEFT, padx=2)
+                   command=self._request_clear).pack(side=tk.LEFT, padx=2)
 
         list_frame = ttk.Frame(self)
         list_frame.grid(row=1, column=0, sticky=(tk.W, tk.E), pady=(5, 0))
@@ -126,9 +136,18 @@ class FileListbox(ttk.Frame):
     def add(self, filepath: str) -> bool:
         return self.model.add(filepath)
 
+    def remove(self, filepath: str) -> bool:
+        return self.model.remove(filepath)
+
     def clear(self) -> None:
         self.model.clear()
         self._listbox.delete(0, tk.END)  # always wipe display (matches old behavior)
+
+    def _request_clear(self) -> None:
+        if self._user_on_clear is not None:
+            self._user_on_clear()
+        else:
+            self.clear()
 
     def _browse(self) -> None:
         files = filedialog.askopenfilenames(filetypes=self._filetypes)

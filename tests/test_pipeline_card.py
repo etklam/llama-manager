@@ -84,6 +84,33 @@ def test_unreachable_preflight_emits_one_pipeline_log_line():
     card._on_log.assert_called_once_with("INFO", f"Error: {message}")
 
 
+def test_completed_file_moves_out_of_pending():
+    card = _make_card()
+    card._file_listbox_widget = Mock()
+    card._file_listbox_widget.remove.return_value = True
+    card._completed_files = []
+    card._completed_listbox = Mock()
+
+    card._move_pipeline_file_to_completed("D:/media/a.mp4")
+
+    card._file_listbox_widget.remove.assert_called_once_with("D:/media/a.mp4")
+    assert card._completed_files == ["D:/media/a.mp4"]
+    card._completed_listbox.insert.assert_called_once_with("end", "a.mp4")
+
+
+def test_clear_pipeline_files_clears_pending_and_completed():
+    card = _make_card()
+    card._file_listbox_widget = Mock()
+    card._completed_files = ["D:/media/a.mp4"]
+    card._completed_listbox = Mock()
+
+    card._clear_pipeline_files()
+
+    card._file_listbox_widget.clear.assert_called_once_with()
+    assert card._completed_files == []
+    card._completed_listbox.delete.assert_called_once_with(0, "end")
+
+
 def test_resolve_whisper_model_path_uses_the_shared_registry_lookup():
     card = object.__new__(PipelineCard)
     card._get_whisper_models = lambda: [{"name": "tiny", "path": "D:/models/tiny.bin"}]

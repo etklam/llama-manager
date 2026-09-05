@@ -59,6 +59,25 @@ class TestAdd:
 
 
 # ---------------------------------------------------------------------------
+# remove()
+# ---------------------------------------------------------------------------
+
+class TestRemove:
+    def test_remove_existing_file(self):
+        m = FileListboxModel(SUPPORTED_SUBTITLE)
+        m.add("/tmp/a.srt")
+
+        assert m.remove("/tmp/a.srt") is True
+        assert m.files == []
+
+    def test_remove_missing_file_is_noop(self):
+        m = FileListboxModel(SUPPORTED_SUBTITLE)
+
+        assert m.remove("/tmp/a.srt") is False
+        assert m.files == []
+
+
+# ---------------------------------------------------------------------------
 # clear()
 # ---------------------------------------------------------------------------
 

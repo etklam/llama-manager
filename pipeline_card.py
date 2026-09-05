@@ -31,6 +31,7 @@ class PipelineCard(ttk.LabelFrame):
 
         self._pipeline_runner = None
         self._pipe_files = []
+        self._completed_files = []
 
         self._create_ui()
 
@@ -39,17 +40,26 @@ class PipelineCard(ttk.LabelFrame):
         self.columnconfigure(1, weight=1)
         self.rowconfigure(5, weight=1)
 
+        lists_frame = ttk.Frame(self)
+        lists_frame.grid(
+            row=0, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 5))
+        lists_frame.columnconfigure(0, weight=1)
+        lists_frame.columnconfigure(1, weight=1)
+
+        pending_frame = ttk.LabelFrame(lists_frame, text="Pending", padding="5")
+        pending_frame.grid(row=0, column=0, sticky=(tk.W, tk.E), padx=(0, 4))
+        pending_frame.columnconfigure(0, weight=1)
+
         # ponytail: subtitle+media union — pipeline accepts both kinds.
-        # No label: PipelineCard itself is already a LabelFrame titled above.
         valid = SUPPORTED_SUBTITLE | SUPPORTED_MEDIA
         self._file_listbox_widget = FileListbox(
-            self, valid_extensions=valid,
+            pending_frame, valid_extensions=valid,
             filetypes_label="Subtitle + Media",
             filetypes_exts=[".srt", ".txt", *sorted(SUPPORTED_MEDIA)],
             on_change=self._sync_pipe_files,
+            on_clear=self._clear_pipeline_files,
         )
-        self._file_listbox_widget.grid(
-            row=0, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 5))
+        self._file_listbox_widget.grid(row=0, column=0, sticky=(tk.W, tk.E))
         self._pipe_listbox = self._file_listbox_widget.listbox
 
         # ponytail: extra control rides along the widget's btn row.
@@ -58,6 +68,19 @@ class PipelineCard(ttk.LabelFrame):
         ttk.Checkbutton(self._file_listbox_widget.button_row,
                         text="Replace original",
                         variable=self._pipe_replace_var).pack(side=tk.LEFT, padx=10)
+
+        completed_frame = ttk.LabelFrame(
+            lists_frame, text="Completed", padding="5")
+        completed_frame.grid(row=0, column=1, sticky=(tk.W, tk.E), padx=(4, 0))
+        completed_frame.columnconfigure(0, weight=1)
+        self._completed_listbox = tk.Listbox(
+            completed_frame, height=4, selectmode=tk.EXTENDED)
+        self._completed_listbox.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        completed_scrollbar = ttk.Scrollbar(
+            completed_frame, orient=tk.VERTICAL,
+            command=self._completed_listbox.yview)
+        completed_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self._completed_listbox.config(yscrollcommand=completed_scrollbar.set)
 
         ttk.Label(self, text="Whisper Model:").grid(row=2, column=0, sticky=tk.W, padx=(0, 5), pady=(5, 0))
         self._pipe_wmodel_var = tk.StringVar()
@@ -109,8 +132,25 @@ class PipelineCard(ttk.LabelFrame):
 
     # ------------------------------------------------------- File management
     def _sync_pipe_files(self):
-        """Mirror the widget's file list so _run_pipeline reads it."""
+        """Mirror the Pending list so _run_pipeline reads it."""
         self._pipe_files = self._file_listbox_widget.files
+
+    def _clear_pipeline_files(self):
+        """Clear both Pending and Completed with the shared Clear button."""
+        self._file_listbox_widget.clear()
+        self._completed_files.clear()
+        self._completed_listbox.delete(0, tk.END)
+
+    def _pipeline_file_completed(self, filepath):
+        self.winfo_toplevel().after(
+            0, lambda: self._move_pipeline_file_to_completed(filepath))
+
+    def _move_pipeline_file_to_completed(self, filepath):
+        if not self._file_listbox_widget.remove(filepath):
+            return
+        if filepath not in self._completed_files:
+            self._completed_files.append(filepath)
+            self._completed_listbox.insert(tk.END, Path(filepath).name)
 
     # ------------------------------------------------------- Pipeline control
     def _start_pipeline(self):
@@ -145,6 +185,7 @@ class PipelineCard(ttk.LabelFrame):
             on_log=lambda msg: self._on_log("INFO", msg),
             on_progress=self._pipeline_step,
             on_done=self._pipeline_done,
+            on_file_completed=self._pipeline_file_completed,
         )
 
         threading.Thread(target=self._run_pipeline, daemon=True).start()
