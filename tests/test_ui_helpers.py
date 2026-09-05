@@ -8,6 +8,8 @@ import pytest
 
 from ui_helpers import (
     LOG_POLL_MS,
+    LOG_DRAIN_MAX,
+    LogBuffer,
     populate_language_combo,
     extract_combo_code,
     LogMixin,
@@ -156,6 +158,7 @@ class TestLogMixinTrimLogic:
         """_insert_log should insert a formatted line with timestamp and level."""
         mixin = LogMixin()
         mock_text = MagicMock()
+        mock_text.yview.return_value = (0.0, 1.0)
         # Simulate index returning "2.0" (meaning 1 line after insert)
         mock_text.index.return_value = "2.0"
         mixin._log_text = mock_text
@@ -174,6 +177,7 @@ class TestLogMixinTrimLogic:
         """When line count > max_lines, delete should be called to trim."""
         mixin = LogMixin()
         mock_text = MagicMock()
+        mock_text.yview.return_value = (0.0, 1.0)
         # Simulate 12 lines after insert
         mock_text.index.return_value = "12.0"
         mixin._log_text = mock_text
@@ -188,6 +192,7 @@ class TestLogMixinTrimLogic:
         """When line count <= max_lines, delete should NOT be called."""
         mixin = LogMixin()
         mock_text = MagicMock()
+        mock_text.yview.return_value = (0.0, 1.0)
         mock_text.index.return_value = "5.0"
         mixin._log_text = mock_text
         mixin._log_max_lines = 10
@@ -200,6 +205,7 @@ class TestLogMixinTrimLogic:
         """When line count == max_lines, no trimming needed."""
         mixin = LogMixin()
         mock_text = MagicMock()
+        mock_text.yview.return_value = (0.0, 1.0)
         mock_text.index.return_value = "10.0"
         mixin._log_text = mock_text
         mixin._log_max_lines = 10
@@ -212,6 +218,7 @@ class TestLogMixinTrimLogic:
         """_insert_log should call see(tk.END) to scroll to bottom."""
         mixin = LogMixin()
         mock_text = MagicMock()
+        mock_text.yview.return_value = (0.0, 1.0)
         mock_text.index.return_value = "1.0"
         mixin._log_text = mock_text
         mixin._log_max_lines = 2000
@@ -224,6 +231,7 @@ class TestLogMixinTrimLogic:
         """When many lines over max, trims the right number."""
         mixin = LogMixin()
         mock_text = MagicMock()
+        mock_text.yview.return_value = (0.0, 1.0)
         mock_text.index.return_value = "2050.0"
         mixin._log_text = mock_text
         mixin._log_max_lines = 2000
@@ -250,6 +258,7 @@ class TestLogQueuePump:
     def _make_mixin(self):
         mixin = LogMixin()
         mixin._log_text = MagicMock()
+        mixin._log_text.yview.return_value = (0.0, 1.0)
         mixin._log_text.index.return_value = "1.0"
         mixin._log_max_lines = 2000
         mixin._log_queue = queue.Queue()
@@ -271,7 +280,10 @@ class TestLogQueuePump:
         mixin._poll_log_queue()
 
         assert mixin._log_queue.qsize() == 0
-        assert mixin._log_text.insert.call_count == 2
+        assert mixin._log_text.insert.call_count == 1
+        args = mixin._log_text.insert.call_args.args
+        assert "a\n" in args[1] and "b\n" in args[3]
+        assert args[2] == ("INFO",) and args[4] == ("ERROR",)
         mixin._log_text.after.assert_called_once_with(
             LOG_POLL_MS, mixin._poll_log_queue)
 
@@ -284,7 +296,8 @@ class TestLogQueuePump:
         mixin._poll_log_queue()
 
         # One enable/see/disable pass for the whole batch, not per line.
-        assert mixin._log_text.insert.call_count == 50
+        assert mixin._log_text.insert.call_count == 1
+        assert len(mixin._log_text.insert.call_args.args) == 101
         assert mixin._log_text.see.call_count == 1
 
     def test_poll_survives_destroyed_widget(self):
@@ -293,3 +306,41 @@ class TestLogQueuePump:
         mixin._log_bus_handler("INFO", "too late")
 
         mixin._poll_log_queue()  # must not raise
+
+    def test_poll_limits_work_per_tick(self):
+        mixin = self._make_mixin()
+        for i in range(LOG_DRAIN_MAX + 20):
+            mixin._log_bus_handler("INFO", str(i))
+        mixin._poll_log_queue()
+        assert mixin._log_queue.qsize() == 20
+
+    def test_reading_history_does_not_jump_to_bottom(self):
+        mixin = self._make_mixin()
+        mixin._log_text.yview.return_value = (0.2, 0.5)
+        mixin._insert_log("INFO", "new message")
+        mixin._log_text.see.assert_not_called()
+
+    def test_overflow_is_reported_with_recent_messages(self):
+        mixin = self._make_mixin()
+        mixin._log_queue = LogBuffer(capacity=2)
+        for text in ("old", "recent", "newest"):
+            mixin._log_bus_handler("INFO", text)
+        mixin._poll_log_queue()
+        rendered = str(mixin._log_text.insert.call_args)
+        assert "skipped 1 older messages" in rendered
+        assert "recent" in rendered and "newest" in rendered
+
+
+def test_log_buffer_retains_newest_and_reports_overflow_once():
+    buffer = LogBuffer(capacity=2)
+    for i in range(10000):
+        buffer.put(i)
+    assert buffer.qsize() == 2
+    assert buffer.take_dropped() == 9998
+    assert buffer.take_dropped() == 0
+    assert [buffer.get_nowait(), buffer.get_nowait()] == [9998, 9999]
+
+
+def test_log_buffer_rejects_empty_capacity():
+    with pytest.raises(ValueError):
+        LogBuffer(capacity=0)

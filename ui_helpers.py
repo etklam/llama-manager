@@ -9,6 +9,54 @@ from tkinter import ttk, scrolledtext
 # the cap per tick so one chatty emitter can't monopolize a redraw.
 LOG_POLL_MS = 80
 LOG_DRAIN_MAX = 200
+LOG_QUEUE_MAX = 4000
+
+
+class LogBuffer(queue.Queue):
+    """Nonblocking, thread-safe recent history with explicit overflow reporting."""
+
+    def __init__(self, capacity=LOG_QUEUE_MAX):
+        if capacity < 1:
+            raise ValueError("capacity must be positive")
+        super().__init__()
+        self.capacity = capacity
+        self._dropped = 0
+
+    def _put(self, item):
+        # Queue holds its mutex while calling this hook.
+        if len(self.queue) >= self.capacity:
+            self.queue.popleft()
+            self.unfinished_tasks -= 1
+            self._dropped += 1
+        self.queue.append(item)
+
+    def take_dropped(self):
+        with self.mutex:
+            count, self._dropped = self._dropped, 0
+            return count
+
+
+def append_log_lines(widget, lines, max_lines):
+    """Render a batch in one Tcl call and preserve the reader's scroll position."""
+    if not lines:
+        return
+    follow = widget.yview()[1] >= 0.999
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    parts = []
+    for entry in lines:
+        level, message = entry[:2]
+        channel = f" [{entry[2]}]" if len(entry) > 2 else ""
+        parts.extend((f"[{timestamp}] [{level}]{channel} {message}\n", (level,)))
+    widget.config(state="normal")
+    try:
+        widget.insert(tk.END, *parts)
+        count = int(widget.index('end-1c').split('.')[0])
+        if count > max_lines:
+            widget.delete(1.0, f"{count - max_lines}.0")
+        if follow:
+            widget.see(tk.END)
+    finally:
+        widget.config(state="disabled")
 
 
 # Log channels. Every emitter names the subsystem it speaks for so a log widget
@@ -108,7 +156,7 @@ class LogMixin:
 
     def _init_log_widget(self, parent, row=0, column=0, label="Log",
                          height=10, max_lines=2000, channels=None):
-        frame = tk.LabelFrame(parent, text=label)
+        frame = ttk.LabelFrame(parent, text=label, padding=8)
         frame.grid(row=row, column=column, sticky=(tk.W, tk.E, tk.N, tk.S), padx=5, pady=5)
         frame.columnconfigure(0, weight=1)
         frame.rowconfigure(0, weight=1)
@@ -128,10 +176,19 @@ class LogMixin:
         # subsystem's traffic. `channels` overrides it for widgets that need to
         # watch more than one (the Server tab also carries app-level notices).
         self._log_channels = tuple(channels) if channels else (self.log_channel,)
-        self._log_queue = queue.Queue()
+        self._log_queue = LogBuffer()
         self._log_unsub = log_bus.subscribe(
             self._log_bus_handler, channels=self._log_channels)
-        self._log_text.after(LOG_POLL_MS, self._poll_log_queue)
+        self._log_after = self._log_text.after(LOG_POLL_MS, self._poll_log_queue)
+        self._log_text.bind("<Destroy>", self._dispose_log, add="+")
+
+    def _dispose_log(self, event):
+        if event.widget is not self._log_text:
+            return
+        self._log_unsub()
+        if self._log_after:
+            self._log_text.after_cancel(self._log_after)
+            self._log_after = None
 
     def _log_bus_handler(self, level, message):
         # Emitters include background threads (server stdout monitor, workers),
@@ -142,6 +199,10 @@ class LogMixin:
     def _poll_log_queue(self):
         try:
             pending = []
+            if isinstance(self._log_queue, LogBuffer):
+                dropped = self._log_queue.take_dropped()
+                if dropped:
+                    pending.append(("WARNING", f"Log buffer full: skipped {dropped} older messages."))
             while len(pending) < LOG_DRAIN_MAX:
                 try:
                     pending.append(self._log_queue.get_nowait())
@@ -149,7 +210,7 @@ class LogMixin:
                     break
             if pending:
                 self._insert_log_lines(pending)
-            self._log_text.after(LOG_POLL_MS, self._poll_log_queue)
+            self._log_after = self._log_text.after(LOG_POLL_MS, self._poll_log_queue)
         except tk.TclError:
             # Widget destroyed; stop polling.
             pass
@@ -161,17 +222,7 @@ class LogMixin:
         self._insert_log_lines([(level, message)])
 
     def _insert_log_lines(self, lines):
-        self._log_text.config(state="normal")
-        for level, message in lines:
-            timestamp = datetime.now().strftime("%H:%M:%S")
-            self._log_text.insert(
-                tk.END, f"[{timestamp}] [{level}] {message}\n", level)
-        self._log_text.see(tk.END)
-        lines_count = int(self._log_text.index('end-1c').split('.')[0])
-        if lines_count > self._log_max_lines:
-            self._log_text.delete(
-                1.0, f"{lines_count - self._log_max_lines}.0")
-        self._log_text.config(state="disabled")
+        append_log_lines(self._log_text, lines, self._log_max_lines)
 
     def _clear_log(self):
         self._log_text.config(state="normal")

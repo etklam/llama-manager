@@ -29,7 +29,7 @@ class SubtitleTranslationTab(LogMixin, ttk.Frame):
     log_channel = CHANNEL_TRANSLATE
 
     def __init__(self, parent, get_port_callback, get_model_callback, config_manager=None):
-        super().__init__(parent)
+        super().__init__(parent, padding=12)
         self._get_port = get_port_callback
         self._get_model = get_model_callback
         self._config_manager = config_manager

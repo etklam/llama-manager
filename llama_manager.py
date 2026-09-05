@@ -9,7 +9,6 @@ import queue
 import tkinter as tk
 from tkinter import ttk, scrolledtext, messagebox
 from pathlib import Path
-from datetime import datetime
 
 from tkinterdnd2 import TkinterDnD
 
@@ -21,12 +20,16 @@ from config_manager import ConfigManager
 from server_controller import ServerController
 from model_registry import ModelRegistry
 from whisper_model_registry import WhisperModelRegistry
+from ui_theme import apply_theme
 # constants imported indirectly by pipeline_card, server_tab, etc.
 from ui_helpers import (
     CHANNEL_APP,
     CHANNEL_PIPELINE,
     CHANNEL_SERVER,
     LOG_POLL_MS,
+    LOG_DRAIN_MAX,
+    LogBuffer,
+    append_log_lines,
     LogMixin,
     log_bus,
 )
@@ -35,8 +38,10 @@ class LlamaManager(LogMixin):
     def __init__(self, root):
         self.root = root
         self.root.title("llama.cpp Manager")
-        self.root.geometry("900x700")
+        self.root.geometry("1120x820")
+        self.root.minsize(960, 720)
         self.root.resizable(True, True)
+        self._style = apply_theme(root)
 
         self.base_dir = Path(r"D:\AI\llama\llama.cpp")
         self.runtime_dir = Path(
@@ -59,6 +64,7 @@ class LlamaManager(LogMixin):
 
         self._debug_win = None
         self._debug_text = None
+        self._debug_after = None
 
         self.create_ui()
         self.scan_models()
@@ -95,8 +101,8 @@ class LlamaManager(LogMixin):
         self.notebook.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
 
         # Tab 0: Main
-        self.main_tab = ttk.Frame(self.notebook, padding="10")
-        self.notebook.add(self.main_tab, text="Main")
+        self.main_tab = ttk.Frame(self.notebook, padding="12")
+        self.notebook.add(self.main_tab, text="工作台")
         self._create_main_tab()
 
         # Tab 1: Server
@@ -109,7 +115,7 @@ class LlamaManager(LogMixin):
             on_model_selected=self._on_server_model_selected,
             on_server_state_changed=self._on_server_state_changed,
         )
-        self.notebook.add(self.server_tab, text="Server")
+        self.notebook.add(self.server_tab, text="伺服器設定")
 
         # Tab 2: Subtitle Translation
         self.subtitle_tab = SubtitleTranslationTab(
@@ -118,7 +124,7 @@ class LlamaManager(LogMixin):
             get_model_callback=self.get_current_model,
             config_manager=self.config_manager
         )
-        self.notebook.add(self.subtitle_tab, text="Subtitle Translation")
+        self.notebook.add(self.subtitle_tab, text="字幕翻譯")
 
         # Tab 3: Speech Recognition
         self.whisper_tab = WhisperTab(
@@ -128,7 +134,7 @@ class LlamaManager(LogMixin):
             scan_whisper_models=lambda: self.get_whisper_models(do_scan=True),
             on_srt_generated=self._on_srt_generated
         )
-        self.notebook.add(self.whisper_tab, text="Speech Recognition")
+        self.notebook.add(self.whisper_tab, text="語音轉錄")
 
         self.notebook.bind('<<NotebookTabChanged>>', self._on_tab_changed)
 
@@ -152,11 +158,15 @@ class LlamaManager(LogMixin):
         self.main_tab.rowconfigure(1, weight=1)
 
         header = ttk.Frame(self.main_tab)
-        header.grid(row=0, column=0, sticky=tk.W, pady=(0, 15))
-        ttk.Label(header, text="🦙 llama.cpp Manager",
-                  font=("Arial", 18, "bold")).pack(side=tk.LEFT)
+        header.grid(row=0, column=0, sticky=tk.EW, pady=(0, 20))
+        heading = ttk.Frame(header)
+        heading.pack(side=tk.LEFT)
+        ttk.Label(heading, text="llama.cpp Manager",
+                  style="Title.TLabel").pack(anchor=tk.W)
+        ttk.Label(heading, text="啟動本地模型，將語音轉成字幕並完成翻譯。",
+                  style="Muted.TLabel").pack(anchor=tk.W, pady=(6, 0))
         self._debug_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(header, text="Debug", variable=self._debug_var,
+        ttk.Checkbutton(header, text="診斷日誌", variable=self._debug_var,
                         command=self._toggle_debug).pack(side=tk.RIGHT, padx=(20, 0))
 
         cards = ttk.Frame(self.main_tab)
@@ -183,17 +193,17 @@ class LlamaManager(LogMixin):
         self.pipeline_card.grid(row=0, column=1, sticky=(tk.W, tk.E, tk.N, tk.S), padx=(5, 0))
 
     def _create_quick_start_card(self, parent, col):
-        card = ttk.LabelFrame(parent, text="🚀 Quick Start llama.cpp", padding="10")
+        card = ttk.LabelFrame(parent, text="啟動模型伺服器", padding="12")
         card.grid(row=0, column=col, sticky=(tk.W, tk.E, tk.N, tk.S), padx=(0, 5))
         card.columnconfigure(1, weight=1)
 
-        ttk.Label(card, text="Model:").grid(row=0, column=0, sticky=tk.W, padx=(0, 5))
+        ttk.Label(card, text="模型").grid(row=0, column=0, sticky=tk.W, padx=(0, 5))
         self._qs_model_var = tk.StringVar()
         self._qs_model_combo = ttk.Combobox(card, textvariable=self._qs_model_var,
-                                             state="readonly", width=35)
+                                             state="readonly", width=24)
         self._qs_model_combo.grid(row=0, column=1, sticky=(tk.W, tk.E), padx=(0, 5))
 
-        ttk.Label(card, text="Port:").grid(row=1, column=0, sticky=tk.W, padx=(0, 5), pady=(5, 0))
+        ttk.Label(card, text="連接埠").grid(row=1, column=0, sticky=tk.W, padx=(0, 5), pady=(5, 0))
         self._qs_port_var = tk.IntVar(value=self.config_manager.get("server.port", 8080))
         ttk.Entry(card, textvariable=self._qs_port_var, width=8).grid(
             row=1, column=1, sticky=tk.W, padx=(0, 5), pady=(5, 0))
@@ -203,12 +213,15 @@ class LlamaManager(LogMixin):
 
         btn_frame = ttk.Frame(card)
         btn_frame.grid(row=3, column=0, columnspan=2, pady=(8, 0))
-        self._qs_start_btn = ttk.Button(btn_frame, text="▶ Start Server",
+        self._qs_start_btn = ttk.Button(btn_frame, text="啟動伺服器", style="Accent.TButton",
                                          command=self._quick_start_server)
         self._qs_start_btn.pack(side=tk.LEFT, padx=2)
-        self._qs_stop_btn = ttk.Button(btn_frame, text="⏹ Stop Server",
+        self._qs_stop_btn = ttk.Button(btn_frame, text="停止",
                                         command=self._quick_stop_server, state="disabled")
         self._qs_stop_btn.pack(side=tk.LEFT, padx=2)
+        ttk.Label(card, text="GPU、上下文與加速選項可在「伺服器設定」調整。",
+                  style="Muted.TLabel", wraplength=310).grid(
+            row=4, column=0, columnspan=2, sticky=tk.W, pady=(18, 0))
 
     def _populate_quick_start(self):
         model_list = self.models.list_models()
@@ -266,11 +279,15 @@ class LlamaManager(LogMixin):
         self._debug_text.tag_config("WARNING", foreground="orange")
         # The debug window is the one sink that sees every channel, so it stays
         # the place to watch a whole run end to end.
-        self._debug_queue = queue.Queue()
+        self._debug_queue = LogBuffer()
         self._debug_unsub = log_bus.subscribe_all(self._debug_subscriber)
-        self._debug_text.after(LOG_POLL_MS, self._poll_debug_queue)
+        self._debug_text.config(state="disabled")
+        self._debug_after = self.root.after(LOG_POLL_MS, self._poll_debug_queue)
 
     def _close_debug_win(self):
+        if self._debug_after is not None:
+            self.root.after_cancel(self._debug_after)
+            self._debug_after = None
         if getattr(self, "_debug_unsub", None):
             self._debug_unsub()
             self._debug_unsub = None
@@ -301,30 +318,23 @@ class LlamaManager(LogMixin):
         self._debug_queue.put((level, message, channel))
 
     def _poll_debug_queue(self):
-        try:
-            while True:
-                try:
-                    level, message, channel = self._debug_queue.get_nowait()
-                except queue.Empty:
-                    break
-                timestamp = datetime.now().strftime("%H:%M:%S")
-                line = f"[{timestamp}] [{level}] [{channel}] {message}\n"
-                self._debug_insert(line, level)
-            self._debug_text.after(LOG_POLL_MS, self._poll_debug_queue)
-        except tk.TclError:
-            # Window closed; stop polling.
-            pass
-
-    def _debug_insert(self, line, level):
-        if not self._debug_text:
+        self._debug_after = None
+        if self._debug_text is None:
             return
         try:
-            self._debug_text.insert(tk.END, line, level or ())
-            self._debug_text.see(tk.END)
-            lines = int(self._debug_text.index('end-1c').split('.')[0])
-            if lines > 2000:
-                self._debug_text.delete(1.0, f"{lines - 2000}.0")
+            pending = []
+            dropped = self._debug_queue.take_dropped()
+            if dropped:
+                pending.append(("WARNING", f"Log buffer full: skipped {dropped} older messages.", CHANNEL_APP))
+            while len(pending) < LOG_DRAIN_MAX:
+                try:
+                    pending.append(self._debug_queue.get_nowait())
+                except queue.Empty:
+                    break
+            append_log_lines(self._debug_text, pending, 2000)
+            self._debug_after = self.root.after(LOG_POLL_MS, self._poll_debug_queue)
         except tk.TclError:
+            # Window closed; stop polling.
             pass
 
     # ---------------------------------------------- Tab change

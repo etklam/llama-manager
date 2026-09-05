@@ -80,13 +80,15 @@ class ServerTab(LogMixin, ttk.Frame):
 
     def _create_ui(self):
         main_frame = self
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(4, weight=1)
 
         title_label = ttk.Label(
             main_frame,
-            text="\U0001F680 llama.cpp Manager",
-            font=("Arial", 16, "bold")
+            text="伺服器設定",
+            style="Title.TLabel"
         )
-        title_label.grid(row=0, column=0, pady=(0, 10))
+        title_label.grid(row=0, column=0, sticky=tk.W, pady=(0, 10))
 
         model_frame = ttk.LabelFrame(main_frame, text="\U0001F4E6 \u6A21\u578B\u9078\u64C7", padding="10")
         model_frame.grid(row=1, column=0, sticky=(tk.W, tk.E), pady=(0, 10))
@@ -125,6 +127,10 @@ class ServerTab(LogMixin, ttk.Frame):
 
         params_grid = ttk.Frame(server_frame)
         params_grid.grid(row=0, column=0, sticky=(tk.W, tk.E))
+        params_grid.columnconfigure(1, weight=1)
+        params_grid.columnconfigure(3, weight=1)
+        for row in range(4):
+            params_grid.rowconfigure(row, pad=6)
 
         ttk.Label(params_grid, text="\u7AEF\u53E3:").grid(row=0, column=0, sticky=tk.W, padx=(0, 5))
         self.port_var = tk.IntVar(value=self._config.get("server.port", 8080))
@@ -142,40 +148,40 @@ class ServerTab(LogMixin, ttk.Frame):
         self.gpu_layers_label = ttk.Label(params_grid, text="99")
         self.gpu_layers_label.grid(row=0, column=4, padx=(0, 20))
 
-        ttk.Label(params_grid, text="\u4E0A\u4E0B\u6587\u5927\u5C0F:").grid(row=0, column=5, sticky=tk.W, padx=(0, 5))
+        ttk.Label(params_grid, text="\u4E0A\u4E0B\u6587\u5927\u5C0F:").grid(row=1, column=0, sticky=tk.W, padx=(0, 5))
         self.context_var = tk.IntVar(value=self._config.get("server.context_size", 16384))
         context_combo = ttk.Combobox(
             params_grid, textvariable=self.context_var,
             values=CONTEXT_SIZE_OPTIONS,
             width=10, state="readonly")
-        context_combo.grid(row=0, column=6, padx=(0, 20))
+        context_combo.grid(row=1, column=1, padx=(0, 20))
 
-        ttk.Label(params_grid, text="\u6279\u6B21\u5927\u5C0F:").grid(row=0, column=7, sticky=tk.W, padx=(0, 5))
+        ttk.Label(params_grid, text="\u6279\u6B21\u5927\u5C0F:").grid(row=1, column=2, sticky=tk.W, padx=(0, 5))
         self.batch_var = tk.IntVar(value=self._config.get("server.batch_size", 512))
-        ttk.Entry(params_grid, textvariable=self.batch_var, width=10).grid(row=0, column=8)
+        ttk.Entry(params_grid, textvariable=self.batch_var, width=10).grid(row=1, column=3)
 
-        # Second row: concurrency + KV cache quantization
-        ttk.Label(params_grid, text="\u4E26\u767C\u69FD (-np):").grid(row=1, column=0, sticky=tk.W, padx=(0, 5), pady=(8, 0))
+        # Concurrency and KV cache settings share the same two field groups.
+        ttk.Label(params_grid, text="\u4E26\u767C\u69FD (-np):").grid(row=2, column=0, sticky=tk.W, padx=(0, 5), pady=(8, 0))
         self.parallel_var = tk.IntVar(value=self._config.get("server.parallel", 3))
         ttk.Spinbox(params_grid, from_=1, to=16, textvariable=self.parallel_var,
-                    width=8).grid(row=1, column=1, padx=(0, 20), pady=(8, 0))
+                    width=8).grid(row=2, column=1, padx=(0, 20), pady=(8, 0))
 
         self.flash_attn_var = tk.BooleanVar(value=self._config.get("server.flash_attn", True))
         ttk.Checkbutton(params_grid, text="FlashAttention",
-                        variable=self.flash_attn_var).grid(row=1, column=2, columnspan=2,
+                        variable=self.flash_attn_var).grid(row=2, column=2, columnspan=2,
                                                            sticky=tk.W, padx=(0, 20), pady=(8, 0))
 
-        ttk.Label(params_grid, text="KV \u5FEB\u53D6 K:").grid(row=1, column=4, sticky=tk.W, padx=(0, 5), pady=(8, 0))
+        ttk.Label(params_grid, text="KV \u5FEB\u53D6 K:").grid(row=3, column=0, sticky=tk.W, padx=(0, 5), pady=(8, 0))
         self.cache_type_k_var = tk.StringVar(value=self._config.get("server.cache_type_k", "q8_0"))
         ttk.Combobox(params_grid, textvariable=self.cache_type_k_var,
                      values=["f16", "q8_0", "q4_0"], width=8,
-                     state="readonly").grid(row=1, column=5, padx=(0, 20), pady=(8, 0))
+                     state="readonly").grid(row=3, column=1, padx=(0, 20), pady=(8, 0))
 
-        ttk.Label(params_grid, text="KV \u5FEB\u53D6 V:").grid(row=1, column=6, sticky=tk.W, padx=(0, 5), pady=(8, 0))
+        ttk.Label(params_grid, text="KV \u5FEB\u53D6 V:").grid(row=3, column=2, sticky=tk.W, padx=(0, 5), pady=(8, 0))
         self.cache_type_v_var = tk.StringVar(value=self._config.get("server.cache_type_v", "q8_0"))
         ttk.Combobox(params_grid, textvariable=self.cache_type_v_var,
                      values=["f16", "q8_0", "q4_0"], width=8,
-                     state="readonly").grid(row=1, column=7, columnspan=2, sticky=tk.W, pady=(8, 0))
+                     state="readonly").grid(row=3, column=3, sticky=tk.W, pady=(8, 0))
 
         dflash_frame = ttk.LabelFrame(
             server_frame, text="DFlash speculative decoding", padding="8"
@@ -256,17 +262,17 @@ class ServerTab(LogMixin, ttk.Frame):
             width=16,
         ).pack(side=tk.LEFT)
         ttk.Label(
-            preset_frame,
+            server_frame,
             text="翻譯 16K/3 slots · 對話 32K/2 slots · 長上下文 128K/1 slot",
             foreground="gray",
-        ).pack(side=tk.LEFT, padx=(10, 0))
+        ).grid(row=3, column=0, sticky=tk.W, pady=(6, 0))
 
         control_frame = ttk.Frame(main_frame)
         control_frame.grid(row=3, column=0, pady=(0, 10))
 
         self.start_button = ttk.Button(
             control_frame, text="\u25B6\uFE0F \u555F\u52D5\u670D\u52A1\u5668",
-            command=self.start_server, width=20)
+            command=self.start_server, width=20, style="Accent.TButton")
         self.start_button.grid(row=0, column=0, padx=5)
 
         self.stop_button = ttk.Button(

@@ -1,4 +1,5 @@
 psutil>=5.9.0
+tkinterdnd2
 
 # Subtitle translation dependencies
 openai>=1.0.0

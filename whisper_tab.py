@@ -57,7 +57,7 @@ class WhisperTab(LogMixin, ttk.Frame):
 
     def __init__(self, parent, config_manager, get_whisper_models,
                  scan_whisper_models, on_srt_generated, transcriber=None):
-        super().__init__(parent)
+        super().__init__(parent, padding=12)
         self._config_manager = config_manager
         self._get_whisper_models = get_whisper_models
         self._scan_whisper_models = scan_whisper_models
