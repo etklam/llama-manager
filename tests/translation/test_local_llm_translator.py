@@ -677,9 +677,8 @@ class TestResponseParsing:
         config = _full_config()
         translator = LocalLLMTranslator(config)
 
-        result = translator.translate('Hello', target_language='French')
-        # Should return empty string or handle gracefully
-        assert result == ''
+        with pytest.raises(RuntimeError, match='empty translation'):
+            translator.translate('Hello', target_language='French')
 
     @patch('translation.openai_client.OpenAI')
     def test_response_with_none_content(self, mock_openai):

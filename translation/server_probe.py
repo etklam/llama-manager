@@ -62,6 +62,7 @@ class ServerInfo:
     model_path: Optional[str] = None
     context_size: Optional[int] = None
     error: Optional[str] = None
+    retryable: bool = False
 
 
 def props_url(api_url: str) -> str:
@@ -108,6 +109,7 @@ def probe_server(api_url: str, timeout: float = PROBE_TIMEOUT) -> ServerInfo:
         return ServerInfo(
             reachable=False,
             error=f"{type(exc).__name__}: {exc}",
+            retryable=isinstance(exc, httpx.TransportError),
         )
 
     # A model still loading answers 503. That is reachable-but-not-ready, and
@@ -116,6 +118,7 @@ def probe_server(api_url: str, timeout: float = PROBE_TIMEOUT) -> ServerInfo:
         return ServerInfo(
             reachable=False,
             error=f"HTTP {response.status_code} from {url}",
+            retryable=response.status_code == 503,
         )
 
     try:

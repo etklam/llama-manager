@@ -618,6 +618,7 @@ class TestErrorHandling:
         # Should still process second file; only successful files are completed.
         assert mock_translator.translate_srt.call_count == 1
         callbacks['on_file_completed'].assert_called_once_with('/test/good.srt')
+        assert runner.failed_files == 1
         callbacks['on_done'].assert_called_once()
 
 
@@ -731,8 +732,8 @@ class TestPreflight:
     ):
         """A failed preflight must not finish as a clean run.
 
-        on_done(stopped=False) makes the pipeline card paint a green "All done!"
-        over the error it just showed.
+        A startup error is separate from user cancellation and stays visible
+        on the pipeline card after the completion callback.
         """
         reachable_server.return_value = PreflightPlan(
             reachable=False,
@@ -750,7 +751,8 @@ class TestPreflight:
             whisper_model_dir='/models',
         )
 
-        callbacks['on_done'].assert_called_once_with(stopped=True)
+        assert runner.startup_error == 'llama-server 未回應'
+        callbacks['on_done'].assert_called_once_with(stopped=False)
 
     @patch('pipeline_runner.generate_srt_from_list', return_value="srt output")
     @patch('pipeline_runner.LocalLLMTranslator')

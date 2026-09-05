@@ -99,6 +99,15 @@ def _make_tab(*, workers=3, files=('/test/a.srt',), config=None):
     return tab
 
 
+def test_failed_file_is_not_reported_as_all_translated():
+    tab = _make_tab()
+    tab._get_target_code = lambda: 'zh-tw'
+    tab._translate_file = Mock(side_effect=RuntimeError('L12: server timeout'))
+    SubtitleTranslationTab._run_translation(tab)
+    tab._progress_label.config.assert_called_with(text='Finished with 1 failed file(s)')
+    assert not any(args[0] == 'SUCCESS' for args, _ in tab._log.call_args_list)
+
+
 class TestPreflightBlocksRun:
 
     def test_unreachable_server_does_not_translate(self):

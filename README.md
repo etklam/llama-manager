@@ -1,111 +1,156 @@
-# llama.cpp Manager 🚀
+# llama.cpp Manager
 
-簡單易用的 GUI 管理器，用於管理 llama.cpp 伺服器、模型、Whisper 語音轉錄與字幕翻譯。
+Windows 桌面工具，用於啟動本地 llama.cpp 模型、透過 whisper.cpp 轉錄音訊／影片，再將字幕翻譯成指定語言。
 
-## ✨ 功能特點
+**日文語音轉錄推薦使用 `kotoba-whisper-v2.0`。** 本程式使用 whisper.cpp，請下載下方介紹的 GGML `.bin` 版本。
 
-- ✅ **圖形化界面** - 簡潔直觀的 GUI（伺服器、Whisper、字幕翻譯、管線四個分頁）
-- ✅ **模型管理** - 自動掃描和新增 GGUF 模型
-- ✅ **伺服器控制** - 一鍵啟動/停止 llama-server
-- ✅ **參數配置** - 視覺化配置伺服器參數
-- ✅ **Whisper 語音轉錄** - 透過 whisper.cpp 將音訊/視訊轉成 SRT 字幕（自動 ffmpeg 預處理）
-- ✅ **字幕翻譯** - 透過本地 LLM（OpenAI 相容 API）做兩步翻譯（直譯→意譯），支援批次並行
-- ✅ **一鍵管線** - 媒體檔案自動「Whisper 轉錄 → 字幕翻譯」一氣呵成
-- ✅ **即時日誌** - 統一的 log_bus pub/sub，顯示伺服器、轉錄、翻譯日誌
-- ✅ **資源監控** - 監控 CPU/RAM 使用情況
-- ✅ **配置儲存** - 自動保存配置、模型清單、上次選擇的模型與語言
+## 功能與工作流程
 
-## 🚀 快速開始
+| 分頁 | 用途 |
+| --- | --- |
+| 工作台 | 快速啟動模型伺服器；執行「轉錄 → 翻譯」管線，分開顯示 Pending／Completed |
+| 伺服器設定 | 選擇 GGUF 模型、設定 GPU／上下文／並行槽、啟停 llama-server |
+| 字幕翻譯 | 將 `.srt`／`.txt` 翻譯成指定語言，支援批次與單步／兩步模式 |
+| 語音轉錄 | 使用 whisper.cpp 將音訊／影片轉成 SRT，支援長音訊分段 |
 
-### 方法 1: 雙擊啟動 (推薦)
+只做語音轉錄不需要啟動 llama-server；字幕翻譯需要 LLM 伺服器；媒體管線需要兩者。
 
-直接雙擊 `start.bat` 即可啟動！
+## 安裝（Windows／PowerShell）
 
-### 方法 2: 命令行啟動
+### 1. 安裝 Python 與專案依賴
 
-```bash
-# 安裝依賴
-pip install -r requirements.txt
+以下步驟以 **Python 3.12 64-bit** 為基準（開發測試使用的版本）。安裝 Python 時包含 Tcl/Tk 與 Python Launcher。下載／解壓本專案後，在專案根目錄開啟 PowerShell：
 
-# 執行管理器
-python llama_manager.py
+```powershell
+py -3.12 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install --upgrade pip
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
-### 外部依賴
+依賴包含 `tkinterdnd2`、`psutil`、`openai`、`httpx`、`tenacity`。模型與外部執行檔需另行準備。
 
-- **llama-server** - llama.cpp 編譯產物（伺服器分頁要用）
-- **whisper-cli** - whisper.cpp 編譯產物（Whisper 分頁、管線分頁要用）
-- **ffmpeg** - 必須在 PATH 中（Whisper 自動將音訊/視訊轉成 16kHz WAV）
+### 2. 準備外部工具
 
-> 三者都不在 repo 內，請自行編譯或下載預編譯版。
+| 工具 | 取得方式 | 本程式用途 |
+| --- | --- | --- |
+| `llama-server.exe` | [llama.cpp Releases](https://github.com/ggml-org/llama.cpp/releases) | 載入文字 GGUF 模型並提供翻譯 API |
+| `whisper-cli.exe` | [whisper.cpp Releases](https://github.com/ggml-org/whisper.cpp/releases) | 載入 Whisper GGML 模型並轉錄 |
+| `ffmpeg.exe`、`ffprobe.exe` | [FFmpeg 下載頁](https://ffmpeg.org/download.html)的 Windows builds | 音訊預處理與長音訊時長探測 |
 
-## 📖 使用說明
+選擇配合電腦與 GPU 的執行版本，保留下載套件內的 DLL。將 FFmpeg 的 `bin` 目錄加入 PATH，重新開啟 PowerShell 後確認：
 
-主視窗有四個分頁：**伺服器**、**Whisper**、**翻譯**、**管線**。
+```powershell
+ffmpeg -version
+ffprobe -version
+```
 
-### 1. 伺服器分頁 — 模型與 llama-server
+本程式另有可選的 **DFlash** 加速設定；首次設定先關閉。啟用時需使用支援本程式 `--spec-type draft-dflash` 等參數的 llama-server 與相容 draft 模型，不能假設任何下載版都支援。
 
-#### 模型選擇（📦 模型選擇）
+### 3. 設定 llama-server 與文字模型路徑
 
-- **🔄 掃描**：自動掃描 `llama-hip` 目錄下的 `.gguf` 檔案
-- **📂 新增**：手動挑選模型檔
-- 選單下方顯示模型大小與量化格式（Q4_K_M、Q5_K_S…）
+目前這些路徑仍在 `llama_manager.py` 的 `LlamaManager.__init__` 內指定，GUI 尚未提供執行檔路徑選項。首次使用請改成自己的目錄，例如：
 
-#### 伺服器設定（⚙️ 伺服器設定）
+```python
+self.base_dir = Path(r"C:\AI\llama.cpp")
+self.runtime_dir = Path(r"C:\AI\llama.cpp\bin")
+self.model_dir = Path(r"C:\AI\models\llm")
+self.server_exe = self.runtime_dir / "llama-server.exe"
+```
 
-- **端口**：API 連接埠（預設 8080）
-- **GPU 層數**：卸載到 GPU 的層數（0–99，預設 99）
-- **上下文大小**：文字上下文長度（512–16384，預設 4096）
-- **批次大小**：批處理大小（預設 512）
+把文字模型的 `.gguf` 放入 `model_dir`，或啟動後在「伺服器設定」按「新增」選取模型。LLM 的 GGUF 與 Whisper 的 GGML `.bin` 是兩種不同模型，不能互換。
 
-#### 啟動 / 停止 / 釋放
+### 4. 下載日文 Whisper 推薦模型
 
-1. 選好模型、調好參數
-2. 點 **▶️ 啟動伺服器**
-3. 下方日誌顯示啟動過程，狀態變成「● 執行中」即可使用 API
-4. 點 **⏹️ 停止伺服器** 或關閉視窗可終止
-5. **🧹 釋放記憶體**：伺服器停止後清出 VRAM/RAM（切換大模型前用）
-6. 右下角即時顯示 GPU / VRAM / RAM 用量
-7. Debug Log 勾選框會開啟獨立視窗顯示詳細日誌（所有分頁的 log 都會匯流到這裡）
+**推薦：`kotoba-whisper-v2.0`。** 官方提供 [kotoba-whisper-v2.0-ggml](https://huggingface.co/kotoba-tech/kotoba-whisper-v2.0-ggml)，可直接供 whisper.cpp 使用，無需自行轉換原始權重。
 
-### 2. Whisper 分頁 — 語音轉錄
+在專案根目錄執行以下下載指令，或從官方模型頁手動下載同名檔案：
 
-> 需要先在設定區填好 `whisper-cli` 路徑與 GGML 模型目錄；`ffmpeg` 必須在 PATH。
+```powershell
+New-Item -ItemType Directory -Force .\models\whisper
+curl.exe -L --fail --output .\models\whisper\ggml-kotoba-whisper-v2.0.bin https://huggingface.co/kotoba-tech/kotoba-whisper-v2.0-ggml/resolve/main/ggml-kotoba-whisper-v2.0.bin
+```
 
-1. **Settings**：設定 whisper-cli 路徑、Whisper 模型、模型目錄（點 **Scan** 掃描 `.bin` 模型）
-2. **File Selection**：拖放或點 **Browse** 選音訊/視訊檔（mp4、mkv、avi、mp3、wav、flac、m4a…）
-3. 選 **Language**（或 Auto Detect）與 **Threads**（執行緒數，預設 8）
-4. 點 **Start Transcription**
-   - ffmpeg 會先把輸入轉成 16kHz 單聲道 WAV（視訊檔會先抽出音軌）
-   - 再交給 whisper-cli 產生 SRT
-5. 完成後 **Completed**，SRT 路徑顯示在日誌，可直接拖到翻譯分頁
+官方亦提供 `ggml-kotoba-whisper-v2.0-q5_0.bin` 量化版本，可按需要選用。兩個檔案都在同一個[官方模型頁](https://huggingface.co/kotoba-tech/kotoba-whisper-v2.0-ggml/tree/main)。請選 GGML `.bin`，不要把原始 Transformers 權重放進模型清單。
 
-### 3. 翻譯分頁 — 字幕翻譯
+### 5. 啟動並設定 Whisper
 
-> 需要先在伺服器分頁啟動 llama-server 並選好模型。
+```powershell
+.\.venv\Scripts\python.exe llama_manager.py
+```
 
-1. **File Selection**：拖放或 **Browse** 選 `.srt` / `.txt`
-2. **Source → Target**：選來源語言與目標語言（簡中/繁中/英/日/韓/法/德/西/葡/俄/阿拉伯/印地/泰/越/義/荷，共 15+ 語言）
-3. **Model**：顯示目前用的模型；選 "(no model loaded)" 會無法翻譯
-4. **Replace original**：勾起來則直接覆寫原檔；不勾則輸出 `<原名>_<目標語言全名>.<原副檔名>`（例如 `video_Simplified Chinese.srt`）
-5. **Show Advanced**：展開後可調
-   - **Batch Size**（預設 15）
-   - **Temperature**（預設 0.2）
-   - **Max Tokens**（預設 16384）
-   - **並行數** / Workers（預設 3，批次並行數；按鈕原文為「并发數」）
-   - **快速模式**（按鈕原文：`快速模式 (跳过直译, 仅意译)`）：勾起來只跑意譯一步，較快但品質略降
-6. 點 **Start Translation**，日誌顯示每批 / 每行進度，**Stop** 可中途停止
+打開「語音轉錄」→ **Settings**：
 
-### 4. 管線分頁 — 一鍵 Whisper → 翻譯
+1. **whisper-cli**：按 Browse，選擇 `whisper-cli.exe`。
+2. **Model Dir**：選剛才的 `models\whisper` 目錄，再按 **Scan**。掃描目錄內的 `.bin` 檔，請勿放在更深層子目錄。
+3. **Model**：選 `kotoba-whisper-v2.0`（清單會移除檔名的 `ggml-` 前綴與 `.bin`）。
+4. **Language**：日文音訊選 **ja - Japanese**。
+5. **Threads**：預設 8，可按電腦資源調整。
+6. 長音訊可勾 **Chunk long audio (30 min, anti-repeat)**。設定會存入 `config.json`，管線共用 Whisper 設定。
 
-> 需要同時設定好 whisper-cli、模型、且伺服器已啟動。
+日後可繼續用上述 Python 指令啟動，不需啟用虛擬環境。`start.bat` 使用 PATH 中的 `python`，不會自動選 `.venv`，而且只檢查 `psutil`；使用該捷徑前，請確保同一個 Python 已安裝完整 `requirements.txt`。
 
-1. 拖放或 **Browse** 選媒體檔（支援音訊與視訊副檔名聯集）
-2. 選 **Language**（來源）與 **Target**（目標語言）
-3. **Whisper Model**：選 whisper 模型
-4. **Replace original**：是否覆寫原檔
-5. 點 **▶ Start**：自動依序執行「Whisper 轉錄 → 翻譯」，**⏹ Stop** 可停
+## 使用教學
 
+### 日文影片 → 繁體中文字幕（一鍵管線）
+
+1. 先依安裝步驟設定 `kotoba-whisper-v2.0` 與 `whisper-cli`。
+2. 到「伺服器設定」選文字 GGUF 模型，按 **翻譯模式** preset，再啟動伺服器。等待模型載入，檢查日誌是否有錯誤。
+3. 到「工作台」的管線卡片，按 **Choose Files** 或拖入日文影片，檔案會出現在 **Pending**。
+4. **Whisper Model** 選 `kotoba-whisper-v2.0`，**Language** 選 `ja - Japanese`，**Target** 選 `zh-tw - Traditional Chinese`。
+5. 初次使用先不勾 **Replace original**，按 **Start**。
+6. 程式自動抽取音訊、產生日文 SRT，再交給 LLM 翻譯。成功檔案移到 **Completed**；失敗檔案留在 Pending，診斷日誌會記錄原因。
+
+第一次啟動時，伺服器程序可能已執行但模型仍在載入。Quick Whisper 遇到 HTTP 503 或暫時連線失敗會顯示 **Waiting for llama-server**，在約 120 秒的等待期限內重試，準備好便自動繼續。Stop 可取消等待（正在進行的短 HTTP 檢查需先返回）。超時或其他無法重試的錯誤會顯示 **Cannot start** 與原因，不會誤報為使用者停止。
+
+例如輸入 `movie.mp4`，會在來源目錄產生：
+
+```text
+movie.srt                       # 日文轉錄
+movie_Traditional Chinese.srt   # 繁體中文翻譯
+```
+
+**Replace original** 在媒體管線中是覆寫產生的 `.srt`，不會覆寫影片。Whisper 轉錄本身會在成功時更新同名 `.srt`。管線的 **Clear** 會清空 Pending 與 Completed 清單；Stop 會取消目前轉錄，翻譯期間則需等待當前翻譯呼叫返回。
+
+### 只做語音轉錄
+
+1. 到「語音轉錄」完成 Settings 設定。
+2. 在 File Selection 選音訊／影片（例如 mp4、mkv、mp3、wav、flac、m4a）。
+3. 日文選 `ja - Japanese`，按 **Start Transcription**。
+4. 程式以 FFmpeg 轉成 16kHz 單聲道 WAV，再交給 whisper-cli 產生同名 SRT；完成後也會加入「字幕翻譯」檔案清單。
+
+這個流程不需要 llama-server。短檔案可先單次轉錄確認結果；超過 30 分鐘的檔案勾選分段後，會獨立轉錄各段並合併時間軸。
+
+### 只翻譯已有字幕
+
+1. 在「伺服器設定」啟動文字模型。
+2. 到「字幕翻譯」，按 **Choose Files** 或拖入 `.srt`／`.txt`。
+3. 選 **Target**（例如繁體中文）；來源文字由模型辨識，Source 選單目前不會作為明確的來源語言指令送入 prompt。
+4. **Replace original** 不勾時另存帶目標語言名稱的檔案；勾選則覆寫輸入字幕／文字檔。
+5. 按 **Start Translation**。Stop 會在當前檔案處理結束後停止。
+
+工作台管線也接受 SRT，會直接跳過 Whisper；一般文字 `.txt` 請使用「字幕翻譯」分頁。
+
+### 翻譯設定
+
+「伺服器設定」的 **翻譯模式** preset 設為 16,384 context、3 個並行槽、512 batch、FlashAttention 與 q8_0 KV cache，並同步翻譯 Workers。這是程式內建起始設定，可再按模型與硬體調整。
+
+「字幕翻譯」→ **Show Advanced**：
+
+| 選項 | 預設值 | 說明 |
+| --- | --- | --- |
+| Batch Size | 15 | 每次請求的字幕句數 |
+| Temperature | 0.2 | 生成隨機度 |
+| Max Tokens | 16384 | 輸出 token 上限；實際請求會按字幕句數縮小預算 |
+| Workers | 3 | 批次並行數；啟動翻譯前會依伺服器可用槽調整 |
+| 快速模式 | 開啟 | 單步輸出 `translation`；關閉後要求 `step1` 直譯及 `step2` 意譯 |
+
+快速模式日誌出現 `直译="" -> 意译="..."` 屬正常，因為沒有要求直譯欄位。兩步模式會產生更多輸出，實際品質差異需用自己的字幕比較。System 與 user prompt 的指令均為英文，**不會因此把目標語言改成英文**。
+
+### 日誌與失敗處理
+
+工作台右上角 **診斷日誌** 可查看所有分頁的詳細訊息。分頁內的日誌只顯示對應工作。
+
+漏掉的字幕會自動逐句補譯；補譯仍失敗時，該檔案不會儲存為成功結果，也不會覆寫既有輸出。請找出 `Batch ... failed` 或 `L12: ... retry failed` 的具體錯誤。管線會保留失敗檔案供重新執行。
 
 ## 🧪 開發與測試
 
@@ -115,59 +160,44 @@ python llama_manager.py
 
 `tests/test_desktop_ui.py` 使用實際 Tk 元件驗證版面與日誌生命週期；環境無法初始化 Tk 時會跳過。
 
-```bash
+```powershell
 # 跑全套測試（pytest + coverage）
-python -m pytest
+.\.venv\Scripts\python.exe -m pip install pytest pytest-cov
+.\.venv\Scripts\python.exe -m pytest
 
 # 跳過翻譯子套件的緩慢測試
-python -m pytest --ignore=tests/translation --no-cov -q
+.\.venv\Scripts\python.exe -m pytest --ignore=tests/translation --no-cov -q
 ```
 
 主要架構模組：
 
 - `log_bus`（在 `ui_helpers.py`）- 統一的日誌 pub/sub，所有分頁共用
 - `FileListbox`（`file_listbox.py`）- 共用的檔案清單 widget（清單 + 瀏覽 + 拖放 + 副檔名過濾）
-- `BatchRunner`（在 `ui_helpers.py`）- 共用的批次任務生命週期（按鈕切換、停止旗標、進度回報）
+- `TranscriptionRunner`（`transcription_runner.py`）- Whisper 與管線共用的轉錄生命週期
 - `build_translation_config`（`config_helpers.py`）- 翻譯設定的單一來源
 - `output_path_for`（`utils/srt_parser.py`）- 翻譯輸出路徑的單一來源
 
 ## 📁 配置檔案
 
-### models.json
-儲存模型清單：
-```json
-{
-  "models": [
-    {
-      "name": "supergemma4-26b-uncensored-fast-v2-Q4_K_M",
-      "path": "D:\\AI\\llama\\llama.cpp\\llama-hip\\supergemma4-26b-uncensored-fast-v2-Q4_K_M.gguf",
-      "size": "16.80GB",
-      "format": "Q4_K_M"
-    }
-  ]
-}
-```
-
 ### config.json
-儲存伺服器配置：
-```json
-{
-  "server": {
-    "port": 8080,
-    "host": "0.0.0.0",
-    "gpu_layers": 99,
-    "context_size": 4096,
-    "batch_size": 512,
-    "threads": -1
-  }
-}
-```
+
+設定儲存在程式目錄的 `config.json`。目前模型清單也存於這個檔案的 `models.models` 與 `whisper_models.models`；根目錄的 `models.json` 不是目前 registry 的讀取來源。
+
+主要設定群組：
+
+- `server`：port、GPU 層數、context、並行槽與加速選項。
+- `whisper`：CLI 路徑、模型目錄、語言、執行緒數、長音訊分段選項。
+- `ui`：最後選擇的文字模型、目標語言及翻譯參數。
+- `pipeline`：管線語言、目標語言與覆寫選項。
+
+一般透過 GUI 設定即可。手動編輯前先關閉程式；llama-server 執行路徑仍須按安裝步驟修改 `llama_manager.py`。
 
 ## 🔌 API 使用
 
 伺服器啟動後，可以透過以下方式使用：
 
 ### Python (OpenAI SDK)
+
 ```python
 from openai import OpenAI
 
@@ -185,6 +215,7 @@ print(response.choices[0].message.content)
 ```
 
 ### cURL
+
 ```bash
 curl http://localhost:8080/v1/chat/completions \
   -H "Content-Type: application/json" \
@@ -196,6 +227,16 @@ curl http://localhost:8080/v1/chat/completions \
 
 ## 🛠️ 故障排除
 
+### 翻譯漏句或出現「retry failed」
+
+實際使用的 prompt 由 `translation/prompt_builder.py` 產生（`translation/prompts/srt_translation.txt` 是未載入的舊參考模板）。System 與 user prompt 的指令統一使用英文；原文與譯文仍依所選語言處理。單句、批次與補譯共用目標語言及輸出要求：每個 ID 回覆一次、只輸出指定 YAML 欄位、保留原意與語氣、不合併或自行補完字幕。單步輸出 `translation`；兩步輸出 `step1` 和 `step2`。原文字串會跳脫引號與換行，Context 只作背景資料。這些規則改善指令一致性，但實際模型的格式遵從與譯文品質仍需以樣本驗證。
+
+模型回覆漏掉字幕 ID 或編號時，程式只補譯缺失的句子。回覆前的開場白與 Markdown 標記不會當成第一句譯文。
+
+如果補譯仍失敗，日誌會列出行號與錯誤原因（例如 `L12: RuntimeError: ...`），該檔案不會寫入或覆蓋輸出；管線中仍留在 Pending，介面顯示失敗檔案數。修復伺服器或調整設定後可重新執行。這避免先前「保留原句但回報完成」或儲存空白字幕的情況。
+
+排查時請保留 `Batch ... failed`、`retry failed` 附近的日誌：連線／timeout、context 超限、回覆格式問題需要不同處理方式，單靠「保留原句」無法判斷上游原因。
+
 ### 伺服器無法啟動
 
 1. **檢查模型路徑**: 確保選擇的模型檔案存在
@@ -205,8 +246,8 @@ curl http://localhost:8080/v1/chat/completions \
 ### GPU 無法使用
 
 - 檢查 `GPU 層數` 設定是否為 0 (應設定為 99)
-- 確認 ROCm HIP 驅動正常安裝
-- 查看 llama.cpp 目錄中的 DLL 檔案是否完整
+- 確認 GPU 驅動與所用執行後端相容（依下載／編譯的版本而定）
+- 查看執行檔目錄中的 DLL 檔案是否完整
 
 ### 顯示編碼問題
 
@@ -239,21 +280,19 @@ curl http://localhost:8080/v1/chat/completions \
 
 #### 內建分段轉錄（推薦用於長音訊）
 
-Whisper 分頁與管線分頁的 Settings 區提供了 **「Chunk long audio (30 min, anti-repeat)」** 勾選框。勾選後：
+語音轉錄分頁與工作台管線卡片提供了 **「Chunk long audio (30 min, anti-repeat)」** 勾選框。勾選後：
 
 1. `whisper_transcription.py` 先用 `ffprobe` 探測時長；30 分鐘以下仍使用單次轉錄，只有超過 30 分鐘才進入 chunked transcription。
 2. 長音訊由 ffmpeg 產生 30 分鐘的 16kHz mono WAV chunk，每個 chunk 各自獨立跑一次 whisper-cli，避免跨段 context collapse。
 3. module 將 chunk SRT 依時間偏移量合併、重新編號，再以 transactional replace 發佈最終 `.srt`；取消或失敗不會覆蓋既有的完整字幕。
 
-設定會儲存到 `config.json` 的 `whisper.chunk_long_audio`，管線分頁也會讀取同一個設定。Whisper 分頁與管線共用同一個 synchronous transcription lifecycle，Stop 會立即取消目前的外部 process 並清理暫存檔。
+設定會儲存到 `config.json` 的 `whisper.chunk_long_audio`，管線也會讀取同一個設定。Whisper 分頁與管線共用同一個 synchronous transcription lifecycle，Stop 會立即取消目前的外部 process 並清理暫存檔。
 
 ## 📊 系統需求
 
 - **作業系統**: Windows 10/11
-- **Python**: 3.7 或更高版本
-- **GPU**: AMD Radeon RX 7900 XTX (或其他 AMD GPU)
-- **RAM**: 建議 32GB 或更多
-- **VRAM**: 建議 24GB 或更多
+- **Python**: 建議 Python 3.12 64-bit（目前測試版本）
+- **GPU／RAM／VRAM**：需求取決於文字模型、Whisper 模型及所用執行後端；沒有固定必須使用的 GPU 型號。
 
 ## 🔧 進階選項
 
@@ -267,18 +306,6 @@ pyinstaller --onefile --windowed --name="llama-manager" llama_manager.py
 ```
 
 產生的 `llama-manager.exe` 將在 `dist` 目錄中。
-
-### 自動啟動伺服器
-
-在 `config.json` 中新增：
-```json
-{
-  "ui": {
-    "auto_start": true,
-    "auto_start_model": "your-model-name"
-  }
-}
-```
 
 ## 📝 更新日誌
 

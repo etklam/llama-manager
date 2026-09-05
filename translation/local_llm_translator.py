@@ -24,7 +24,9 @@ from tenacity import RetryError
 if TYPE_CHECKING:
     from translation.llm_client import LLMClient
 
-from translation.prompt_builder import build_translation_prompt
+from translation.prompt_builder import (
+    build_translation_prompt, build_system_prompt, build_source_yaml,
+)
 from utils.srt_parser import Cue, collapse_repeats
 
 logger = logging.getLogger(__name__)
@@ -54,6 +56,16 @@ MIN_DYNAMIC_MAX_TOKENS = 1024
 # beyond that is long-form text on the wrong path. Exceeding it only logs a
 # warning — see translate_srt — never rejects or truncates the line.
 LONG_SOURCE_WARN_CHARS = 500
+
+
+class TranslationIncompleteError(RuntimeError):
+    """A file has unresolved cues and must not be published as translated."""
+
+    def __init__(self, failures):
+        self.failures = failures
+        details = '; '.join(f"L{line}: {reason}" for line, reason in failures)
+        super().__init__(f"Translation incomplete ({len(failures)} line(s)); "
+                         f"output not saved. {details}")
 
 
 def _rebuild_cue(entry: Cue, text: str, fallback_line: int = 0) -> Cue:
@@ -152,16 +164,7 @@ class LocalLLMTranslator:
         return self._openai_client
 
     def _build_system_prompt(self, target_language: str) -> str:
-        """Build system prompt based on target language (simplified vs traditional Chinese)."""
-        if target_language in ('zh-tw', 'Traditional Chinese'):
-            return (
-                "您是一位精通繁體中文的專業翻譯，"
-                "您負責將它翻譯成中文，不要有任何解釋。"
-            )
-        return (
-            "你是一位精通专业翻译的专家，"
-            "你负责将它翻译成中文，不要有任何解释。"
-        )
+        return build_system_prompt(target_language)
 
     def _build_single_prompt(
         self,
@@ -194,22 +197,15 @@ class LocalLLMTranslator:
         locale = 'traditional' if is_traditional else 'simplified'
 
         # Build YAML input
-        yaml_input = f"- id: 1\n  source: {text}"
+        yaml_input = build_source_yaml([text])
 
         user_content = build_translation_prompt(
             mode=mode,
             locale=locale,
             target_language=target_language,
             yaml_text=yaml_input,
+            context=context,
         )
-
-        if context:
-            # Insert context before the "开始翻译" / "開始翻譯" line
-            start_marker = '開始翻譯:' if is_traditional else '开始翻译:'
-            user_content = user_content.replace(
-                start_marker,
-                f"Context: {context}\n\n{start_marker}"
-            )
 
         return [
             system_message,
@@ -312,6 +308,7 @@ class LocalLLMTranslator:
         text = re.sub(r'^```ya?ml\s*', '', text, flags=re.IGNORECASE)
         text = re.sub(r'^```\s*', '', text)
         text = re.sub(r'\s*```\s*$', '', text)
+        text = re.sub(r'^\s*```[^\n]*$', '', text, flags=re.MULTILINE)
 
         # Try to extract from <TRANSLATE_TEXT> tags if present
         match = re.search(
@@ -334,26 +331,26 @@ class LocalLLMTranslator:
                 continue
 
             # Extract id (optional - the model may omit it)
-            id_match = re.search(r'id:\s*(\d+)', item)
+            id_match = re.search(r'^[ \t]*id:[ \t]*(\d+)', item, re.MULTILINE)
             item_id = int(id_match.group(1)) if id_match else len(results) + 1
 
             # Extract step1 - stop at the next field label or end of item.
             step1_match = re.search(
-                r'step1:\s*(.+?)(?=\n\s*(?:step2|translation|id)\s*:|$)',
+                r'(?:^|\n)[ \t]*step1:[ \t]*(.+?)(?=\n\s*(?:step2|translation|id)\s*:|$)',
                 item, re.DOTALL
             )
             step1 = LocalLLMTranslator._clean_field_value(step1_match.group(1)) if step1_match else ""
 
             # Extract step2 - stop at the next field label or end of item.
             step2_match = re.search(
-                r'step2:\s*(.+?)(?=\n\s*(?:id|translation)\s*:|$)',
+                r'(?:^|\n)[ \t]*step2:[ \t]*(.+?)(?=\n\s*(?:id|translation)\s*:|$)',
                 item, re.DOTALL
             )
             step2 = LocalLLMTranslator._clean_field_value(step2_match.group(1)) if step2_match else ""
 
             # Extract translation field (single-step mode)
             translation_match = re.search(
-                r'translation:\s*(.+?)(?=\n\s*(?:id|step1|step2)\s*:|$)',
+                r'(?:^|\n)[ \t]*translation:[ \t]*(.+?)(?=\n\s*(?:id|step1|step2)\s*:|$)',
                 item, re.DOTALL
             )
             translation = LocalLLMTranslator._clean_field_value(translation_match.group(1)) if translation_match else ""
@@ -361,6 +358,11 @@ class LocalLLMTranslator:
             # For single-step responses, map translation -> step2
             if not step2 and translation:
                 step2 = translation
+
+            # Commentary before the YAML is not a subtitle. Giving it a
+            # synthetic id used to shadow the real id=1 in the result map.
+            if not id_match and not step1 and not step2:
+                continue
 
             results.append({
                 'id': item_id,
@@ -447,12 +449,18 @@ class LocalLLMTranslator:
         raw_result = self._call_api(
             messages, max_tokens=self._dynamic_max_tokens(1)
         )
+        if not raw_result:
+            raise RuntimeError("model returned an empty translation")
 
         # Parse YAML result
         parsed = self._parse_yaml_result(raw_result)
 
         if parsed and parsed[0].get('step2'):
             return parsed[0]['step2']
+        if parsed:
+            if parsed[0].get('step1'):
+                return parsed[0]['step1']
+            raise RuntimeError("model returned translation fields without usable text")
 
         # Fallback: if YAML parsing fails, try to extract any useful content
         # from the response (e.g., the model didn't follow YAML format)
@@ -687,8 +695,9 @@ class LocalLLMTranslator:
                          f"({batch_start_global}-{batch_end_global})")
                 except Exception as e:
                     batch_errors[batch_idx] = e
-                    _log("WARNING", f"Batch {batch_idx+1} failed ({e}), "
-                         "falling back to individual translation")
+                    if not isinstance(e, TranslationIncompleteError):
+                        _log("WARNING", f"Batch {batch_idx+1} failed ({e}), "
+                             "falling back to individual translation")
 
                 # Report line-level progress as each batch completes so the
                 # UI progress bar / ETA advances smoothly, not once at the end.
@@ -703,27 +712,26 @@ class LocalLLMTranslator:
 
         # Reconstruct results in order, with fallback for failed batches
         all_translated = []
+        failures = []
         for batch_idx, batch in enumerate(batches):
-            batch_start_global = batch_idx * batch_size + 1
-
             if batch_idx in batch_results:
                 all_translated.extend(batch_results[batch_idx])
             elif batch_idx in batch_errors:
-                # Fall back to individual translation
-                for i, entry in enumerate(batch):
-                    line_num = batch_start_global + i
-                    text = entry.text.strip().replace("\n", " ")
-                    if text:
-                        try:
-                            translated = self.translate(text, target_language)
-                        except Exception:
-                            translated = text
-                    else:
-                        translated = text
-                    _log("INFO", f"  L{line_num}: \"{text[:60]}\" -> \"{translated[:60]}\"")
-                    all_translated.append(
-                        _rebuild_cue(entry, translated, fallback_line=line_num)
-                    )
+                error = batch_errors[batch_idx]
+                if isinstance(error, TranslationIncompleteError):
+                    # Targeted recovery already ran inside this batch.
+                    failures.extend(error.failures)
+                    continue
+                try:
+                    all_translated.extend(self._recover_missing(
+                        batch, [''] * len(batch), target_language, _log))
+                except TranslationIncompleteError as error:
+                    failures.extend(error.failures)
+
+        if failures:
+            error = TranslationIncompleteError(failures)
+            _log("ERROR", str(error))
+            raise error
 
         total_elapsed = time.time() - overall_start
         rate = len(all_translated) / total_elapsed if total_elapsed > 0 else float('inf')
@@ -741,12 +749,7 @@ class LocalLLMTranslator:
             - id: 2
               source: Second line text
         """
-        yaml_lines = []
-        for j, entry in enumerate(batch):
-            text = entry.text.strip().replace("\n", " ")
-            yaml_lines.append(f"- id: {j+1}")
-            yaml_lines.append(f"  source: {text}")
-        return "\n".join(yaml_lines)
+        return build_source_yaml([entry.text.strip() for entry in batch])
 
     def _translate_batch_lines(
         self,
@@ -774,11 +777,11 @@ class LocalLLMTranslator:
         # Parse YAML result
         parsed = self._parse_yaml_result(raw_result)
 
-        if len(parsed) < len(batch) // 2:
+        if not parsed:
             # Fallback: try numbered line parsing
             _log("WARNING", "YAML parse got too few results, trying numbered fallback")
             translations = self._parse_numbered_result(raw_result, len(batch))
-            return self._reconstruct_batch(batch, translations, _log)
+            return self._recover_missing(batch, translations, target_language, _log)
 
         # Map parsed entries by the id echoed back by the model. The batch YAML
         # numbers sources 1..N (see _build_batch_yaml), so the source at
@@ -796,8 +799,7 @@ class LocalLLMTranslator:
             if isinstance(pid, int) and pid not in by_id:
                 by_id[pid] = parsed_entry
 
-        result = []
-        missing_positions: List[int] = []
+        translations = []
         for j, entry in enumerate(batch):
             matched = by_id.get(j + 1)
             final_text = ''
@@ -811,50 +813,33 @@ class LocalLLMTranslator:
                 # The model returned no usable text for this line. Emitting the
                 # source verbatim is precisely the "not translated" symptom, so
                 # mark it for a targeted individual retry below.
-                missing_positions.append(j)
-                final_text = entry.text
                 _log("WARNING", f"  L{entry.line or '?'}: missing parsed result")
-            result.append(_rebuild_cue(entry, final_text))
+            translations.append(final_text)
 
-        # Retranslate any dropped/garbled lines one at a time rather than
-        # leaving the untranslated source in the output. This is bounded by the
-        # batch size and only fires for lines the batch response actually
-        # missed, so a well-behaved model incurs no extra calls.
-        for j in missing_positions:
-            entry = batch[j]
-            src = entry.text.strip().replace("\n", " ")
-            if not src:
-                continue
-            try:
-                retry_text = self.translate(src, target_language)
-            except Exception as e:
-                _log("WARNING", f"  L{entry.line or '?'}: retry failed ({e}), keeping original")
-                continue
-            if retry_text and retry_text.strip():
-                _log("INFO", f"  L{entry.line or '?'}: retried -> \"{retry_text[:60]}\"")
-                result[j] = _rebuild_cue(entry, retry_text)
+        return self._recover_missing(batch, translations, target_language, _log)
 
-        return result
-
-    def _reconstruct_batch(
-        self,
-        batch: List[Cue],
-        translations: List[str],
-        log_fn: Callable
-    ) -> List[Cue]:
-        """Reconstruct batch results from simple numbered translations."""
+    def _recover_missing(self, batch, translations, target_language, log_fn):
+        """One recovery policy for YAML, numbered output and failed API batches."""
+        result = []
+        failures = []
         for j, entry in enumerate(batch):
             src = entry.text.strip().replace("\n", " ")
-            tgt = translations[j] if j < len(translations) else ''
-            log_fn("INFO", f"  L{entry.line or '?'}: \"{src[:60]}\" -> \"{tgt[:60]}\"")
-
-        return [
-            _rebuild_cue(
-                entry,
-                translations[j] if j < len(translations) else entry.text,
-            )
-            for j, entry in enumerate(batch)
-        ]
+            text = translations[j] if j < len(translations) else ''
+            if src and not text.strip():
+                try:
+                    text = self.translate(src, target_language)
+                    if not text or not text.strip():
+                        raise RuntimeError("model returned an empty translation")
+                    log_fn("INFO", f"  L{entry.line or j+1}: retried -> \"{text[:60]}\"")
+                except Exception as error:
+                    reason = f"{type(error).__name__}: {error}"
+                    failures.append((entry.line or j + 1, reason))
+                    log_fn("ERROR", f"  L{entry.line or j+1}: retry failed ({reason})")
+                    continue
+            result.append(_rebuild_cue(entry, text, fallback_line=j + 1))
+        if failures:
+            raise TranslationIncompleteError(failures)
+        return result
 
     def _build_batch_prompt(
         self, yaml_text: str, target_language: str
@@ -889,14 +874,13 @@ class LocalLLMTranslator:
         pattern = re.compile(r'^\s*(\d+)[\.\)\)]\s*(.+)', re.MULTILINE)
         matches = pattern.findall(raw)
 
-        if matches and len(matches) >= expected_count // 2:
+        if matches:
             parsed = {}
             for num_str, text in matches:
                 idx = int(num_str)
-                if 1 <= idx <= expected_count:
+                if 1 <= idx <= expected_count and idx not in parsed:
                     parsed[idx] = text.strip()
-            if len(parsed) >= expected_count // 2:
-                return [parsed.get(i + 1, '') for i in range(expected_count)]
+            return [parsed.get(i + 1, '') for i in range(expected_count)]
 
         # Fallback: clean split by newlines
         lines = [l.strip() for l in raw.split('\n') if l.strip()]

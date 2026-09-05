@@ -175,6 +175,7 @@ class PipelineCard(ttk.LabelFrame):
 
         self._pipe_start_btn.config(state="disabled")
         self._pipe_stop_btn.config(state="normal")
+        self._pipe_status_label.config(text="Checking llama-server...", foreground="blue")
 
         self._pipeline_runner = PipelineRunner(
             config_manager=self._config,
@@ -237,8 +238,16 @@ class PipelineCard(ttk.LabelFrame):
     def _update_pipeline_done(self, stopped):
         self._pipe_start_btn.config(state="normal")
         self._pipe_stop_btn.config(state="disabled")
-        if stopped:
+        if self._pipeline_runner.startup_error:
+            self._pipe_status_label.config(
+                text=f"Cannot start: {self._pipeline_runner.startup_error}",
+                foreground="red")
+        elif stopped:
             self._pipe_status_label.config(text="Stopped", foreground="orange")
+        elif self._pipeline_runner.failed_files:
+            self._pipe_status_label.config(
+                text=f"{self._pipeline_runner.failed_files} file(s) failed — see log",
+                foreground="red")
         else:
             self._pipe_status_label.config(text="All done!", foreground="green")
 

@@ -7,6 +7,7 @@ Plan B: Single-step translation mode (skip step1 literal translation)
 Plan C: Larger default batch size
 """
 import re
+import json
 import threading
 import time
 from dataclasses import replace
@@ -140,7 +141,7 @@ class TestLargerDefaultBatchSize:
 
     def test_translate_srt_uses_default_batch_size_when_not_configured(self):
         """When batch_size is not in config, DEFAULT_BATCH_SIZE is used."""
-        fake = FakeLLMClient()
+        fake = FakeLLMClient(_batch_yaml_response(_make_srt_data(DEFAULT_BATCH_SIZE)))
         config = _full_config()
         del config['batch_size']  # ponytail: batch_size is read lazily by translate_srt
         translator = LocalLLMTranslator(config, client=fake)
@@ -656,8 +657,9 @@ class TestBatchAlignmentByModelId:
         a naive regex would pick up as a phantom first line.
         """
         content = messages[1]['content']
-        body = content.split('翻譯:' if '翻譯:' in content else '翻译:')[-1]
-        return re.findall(r'^\s*source:\s*(.+)$', body, re.MULTILINE)
+        body = content.split('Translate the following input:', 1)[-1]
+        return [json.loads(value) for value in re.findall(
+            r'^\s*source:\s*(.+)$', body, re.MULTILINE)]
 
     def test_reordered_response_maps_each_translation_to_its_own_source(self):
         """Ids returned out of order must still land on the right subtitle."""
@@ -851,8 +853,9 @@ class TestDuplicateSubtitleDeduplication:
             fake.call_count += 1
             fake.messages_list.append(messages)
             content = messages[1]['content']
-            body = content.split('翻譯:' if '翻譯:' in content else '翻译:')[-1]
-            sources = re.findall(r'^\s*source:\s*(.+)$', body, re.MULTILINE)
+            body = content.split('Translate the following input:', 1)[-1]
+            sources = [json.loads(value) for value in re.findall(
+                r'^\s*source:\s*(.+)$', body, re.MULTILINE)]
             lines = []
             for idx, src in enumerate(sources, start=1):
                 lines.append(f"- id: {idx}")

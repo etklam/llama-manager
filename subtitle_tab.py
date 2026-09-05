@@ -37,6 +37,7 @@ class SubtitleTranslationTab(LogMixin, ttk.Frame):
         self._file_list: list = []
         self._translating = False
         self._stop_requested = False
+        self._failed_files = 0
         # Progress state read by _on_progress (set per-run in _run_translation).
         self._current_file_idx = 0
         self._total_files = 1
@@ -403,6 +404,7 @@ class SubtitleTranslationTab(LogMixin, ttk.Frame):
         self._log("WARNING", "Stopping after current file...")
 
     def _run_translation(self):
+        self._failed_files = 0
         total = len(self._file_list)
         target_lang = self._get_target_code()
         replace = self._replace_var.get()
@@ -423,6 +425,7 @@ class SubtitleTranslationTab(LogMixin, ttk.Frame):
             try:
                 self._translate_file(filepath, target_lang, replace_original=replace)
             except Exception as e:
+                self._failed_files += 1
                 self._log("ERROR", f"Failed: {Path(filepath).name} - {e}")
 
             # Snap the bar to the whole-file boundary once the file finishes;
@@ -437,11 +440,14 @@ class SubtitleTranslationTab(LogMixin, ttk.Frame):
         self._start_btn.config(state="normal")
         self._stop_btn.config(state="disabled")
         self._file_listbox.config(state="normal")
-        self._progress_label.config(text="Completed")
-
         if self._stop_requested:
+            self._progress_label.config(text="Stopped")
             self._log("INFO", "Translation stopped")
+        elif self._failed_files:
+            self._progress_label.config(text=f"Finished with {self._failed_files} failed file(s)")
+            self._log("ERROR", f"{self._failed_files} file(s) failed; see line errors above. Outputs were not saved for failed translations.")
         else:
+            self._progress_label.config(text="Completed")
             self._log("SUCCESS", "All files translated!")
 
     # --- Helper methods ---

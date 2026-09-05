@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 from pathlib import Path
+import threading
+import time
 from typing import Callable, Dict, List, Optional
 
 from whisper_transcription import (
@@ -17,6 +19,9 @@ from config_manager import ConfigManager
 from constants import SUPPORTED_MEDIA
 from config_helpers import api_url_for_port, build_translation_config
 from whisper_policy import chunking_enabled
+
+SERVER_READY_TIMEOUT_SECONDS = 120.0
+SERVER_READY_POLL_SECONDS = 1.0
 
 
 class _PipelinePresenter(TranscriptionPresenter):
@@ -74,6 +79,9 @@ class PipelineRunner:
         self._on_progress = on_progress
         self._on_done = on_done
         self._on_file_completed = on_file_completed or (lambda filepath: None)
+        self.failed_files = 0
+        self.startup_error = None
+        self._stop_event = threading.Event()
         self._transcriber = transcriber or WhisperTranscriber()
 
         # The whisper step goes through the shared transcription run loop,
@@ -105,7 +113,24 @@ class PipelineRunner:
 
     def stop(self) -> None:
         self._stop_requested = True
+        self._stop_event.set()
         self._whisper_runner.stop()
+
+    def _wait_for_server(self, api_url, requested_workers):
+        """Wait for cold-start transport/503 failures without blocking the UI."""
+        deadline = time.monotonic() + SERVER_READY_TIMEOUT_SECONDS
+        while not self._stop_requested:
+            plan = run_preflight(api_url, requested_workers)
+            if plan.reachable or not plan.info.retryable:
+                return plan
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return plan
+            self._on_progress(
+                f"Waiting for llama-server to be ready ({remaining:.0f}s remaining)...")
+            if self._stop_event.wait(min(SERVER_READY_POLL_SECONDS, remaining)):
+                break
+        return None
 
     def run(
         self,
@@ -127,13 +152,14 @@ class PipelineRunner:
         Calls on_done(stopped: bool) when finished.
         """
         self._running = True
+        self.failed_files = 0
+        self.startup_error = None
         self._preflight_plan = None
         # A stop requested before run() is honored by the run loop: its first
         # transcribe_file creates a fresh token and cancels it immediately.
 
-        model_path = self._resolve_whisper_model_path(whisper_model_dir, whisper_model_name)
-
         try:
+            model_path = self._resolve_whisper_model_path(whisper_model_dir, whisper_model_name)
             # Preflight once per run, before any transcription. The caller
             # checks that the server process is up, but a process that is still
             # loading a model answers nothing: without this, the failure only
@@ -142,16 +168,15 @@ class PipelineRunner:
             # worker pool.
             api_url = api_url_for_port(self._get_port())
             requested_workers = self._config_manager.get('ui.max_workers', 3)
-            plan = run_preflight(api_url, requested_workers)
+            plan = self._wait_for_server(api_url, requested_workers)
+            if plan is None or self._stop_requested:
+                return
             if not plan.reachable:
                 message = plan.note or "no response"
+                self.startup_error = message
                 # PipelineCard publishes progress messages to its log, so sending
                 # this failure through both callbacks would duplicate the line.
                 self._on_progress(f"Error: {message}")
-                # Report this as a stop, not a clean finish: on_done only carries
-                # a bool, and stopped=False makes the caller announce success for
-                # a run that translated nothing.
-                self._stop_requested = True
                 return
             self._preflight_plan = plan
             # The plan formats its note once; log it here once, not per file.
@@ -188,15 +213,22 @@ class PipelineRunner:
                                 self._on_file_completed(filepath)
                         elif self._stop_requested:
                             break
+                        else:
+                            self.failed_files += 1
                 except Exception as e:
+                    self.failed_files += 1
                     self._on_progress(f"Error: {Path(filepath).name} - {e}")
                     self._on_log(f"Error: {Path(filepath).name} - {e}")
+        except Exception as error:
+            self.startup_error = f"{type(error).__name__}: {error}"
+            self._on_progress(f"Error: {self.startup_error}")
         finally:
             stopped = self._stop_requested
             self._whisper_runner.reset()
             self._running = False
             self._on_done(stopped=stopped)
             self._stop_requested = False
+            self._stop_event.clear()
 
     # ------------------------------------------------------------------
     # Whisper step

@@ -20,6 +20,26 @@ def _make_card():
     return card
 
 
+def test_failed_pipeline_is_not_reported_as_all_done():
+    card = _make_card()
+    card._pipe_start_btn = Mock()
+    card._pipe_stop_btn = Mock()
+    card._pipeline_runner = Mock(failed_files=1, startup_error=None)
+    card._update_pipeline_done(False)
+    card._pipe_status_label.config.assert_called_with(
+        text='1 file(s) failed — see log', foreground='red')
+
+
+def test_startup_error_remains_visible_instead_of_stopped():
+    card = _make_card()
+    card._pipe_start_btn = Mock()
+    card._pipe_stop_btn = Mock()
+    card._pipeline_runner = Mock(startup_error='HTTP 401', failed_files=0)
+    card._update_pipeline_done(False)
+    card._pipe_status_label.config.assert_called_with(
+        text='Cannot start: HTTP 401', foreground='red')
+
+
 def test_pipeline_step_emits_once_on_pipeline_log_callback():
     """Debug subscribes to the bus, so a second callback duplicates the line."""
     card = _make_card()
