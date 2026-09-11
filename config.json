@@ -24,6 +24,7 @@
     "last_model": "gemma-4-E2B-it-uncensored-Q8_0",
     "last_source_lang": "auto",
     "last_target_lang": "zh-tw",
+    "context_mode": "story",
     "max_workers": 3
   },
   "translation": {
