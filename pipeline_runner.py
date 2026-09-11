@@ -349,7 +349,8 @@ class PipelineRunner:
         translated = translator.translate_srt(
             subtitles, target_lang,
             progress_callback=lambda c, t, s: self._on_progress(
-                f"Translating {Path(srt_path).name}: {c}/{t} {s}"
+                (f"Translating {Path(srt_path).name}: {c}/{t} {s}"
+                 if c >= 0 else f"{Path(srt_path).name}: {s}")
             ),
             log_callback=lambda lv, m: self._on_log(f"  [{lv}] {m}"),
             cancel_callback=lambda: getattr(self, '_stop_requested', False),

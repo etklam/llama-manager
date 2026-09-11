@@ -532,6 +532,12 @@ class SubtitleTranslationTab(LogMixin, ttk.Frame):
         single large SRT no longer freezes the bar. Also derives lines/s and an
         ETA for the current file from the wall-clock elapsed since it started.
         """
+        if current < 0:
+            label = f"{file_name} · {status}"
+            self.winfo_toplevel().after(
+                0, lambda t=label: self._progress_label.config(text=t)
+            )
+            return
         total = max(1, total)
         is_analysis = status and any(
             marker in status for marker in ('讀取全文', '分析第', '整理背景')

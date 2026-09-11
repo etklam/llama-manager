@@ -10,6 +10,7 @@ Uses a two-step translation approach (inspired by ImmersiveTranslate Paraphrase 
   Step 2: Paraphrase/free translation (意译) - this is the final output
 """
 
+import json
 import logging
 import re
 import time
@@ -737,7 +738,7 @@ class LocalLLMTranslator:
                 future = executor.submit(
                     self._translate_batch_lines,
                     batch, target_language, log_callback, context,
-                    recovery_contexts, _cancelled,
+                    recovery_contexts, _cancelled, progress_callback,
                 )
                 futures[future] = batch_idx
                 next_batch_idx += 1
@@ -796,7 +797,7 @@ class LocalLLMTranslator:
                     _, _, _, recovery_contexts = batch_plan[batch_idx]
                     all_translated.extend(self._recover_missing(
                         batch, [''] * len(batch), target_language, _log,
-                        recovery_contexts, _cancelled))
+                        recovery_contexts, _cancelled, progress_callback))
                 except TranslationIncompleteError as error:
                     failures.extend(error.failures)
 
@@ -834,6 +835,7 @@ class LocalLLMTranslator:
         context: Optional[str] = None,
         recovery_contexts: Optional[List[str]] = None,
         cancel_check: Optional[Callable[[], bool]] = None,
+        progress_callback: Optional[Callable] = None,
     ) -> List[Cue]:
         """Translate a batch of subtitle lines using YAML two-step format."""
         def _log(level, msg):
@@ -853,6 +855,13 @@ class LocalLLMTranslator:
                 messages, max_tokens=self._dynamic_max_tokens(len(batch))
             )
         except Exception as error:
+            if self._is_context_limit_error(error):
+                reduced_context = self._without_nearby_context(context)
+                if reduced_context != context:
+                    return self._translate_batch_lines(
+                        batch, target_language, log_callback, reduced_context,
+                        recovery_contexts, cancel_check, progress_callback,
+                    )
             if self._is_context_limit_error(error) and len(batch) > 1:
                 middle = len(batch) // 2
                 left_contexts = recovery_contexts[:middle] if recovery_contexts else None
@@ -860,11 +869,11 @@ class LocalLLMTranslator:
                 return (
                     self._translate_batch_lines(
                         batch[:middle], target_language, log_callback, context,
-                        left_contexts, cancel_check,
+                        left_contexts, cancel_check, progress_callback,
                     )
                     + self._translate_batch_lines(
                         batch[middle:], target_language, log_callback, context,
-                        right_contexts, cancel_check,
+                        right_contexts, cancel_check, progress_callback,
                     )
                 )
             if self._is_context_limit_error(error):
@@ -883,7 +892,7 @@ class LocalLLMTranslator:
             translations = self._parse_numbered_result(raw_result, len(batch))
             return self._recover_missing(
                 batch, translations, target_language, _log, recovery_contexts,
-                cancel_check)
+                cancel_check, progress_callback)
 
         # Map parsed entries by the id echoed back by the model. The batch YAML
         # numbers sources 1..N (see _build_batch_yaml), so the source at
@@ -923,10 +932,11 @@ class LocalLLMTranslator:
 
         return self._recover_missing(
             batch, translations, target_language, _log, recovery_contexts,
-            cancel_check)
+            cancel_check, progress_callback)
 
     def _recover_missing(self, batch, translations, target_language, log_fn,
-                         recovery_contexts=None, cancel_check=None):
+                         recovery_contexts=None, cancel_check=None,
+                         progress_callback=None):
         """One recovery policy for YAML, numbered output and failed API batches."""
         result = []
         failures = []
@@ -937,6 +947,10 @@ class LocalLLMTranslator:
                 if cancel_check and cancel_check():
                     raise TranslationCancelledError(
                         "translation cancelled before recovery"
+                    )
+                if progress_callback:
+                    progress_callback(
+                        -1, 0, f"補譯 L{entry.line or j + 1}"
                     )
                 try:
                     context = (recovery_contexts[j]
@@ -1059,6 +1073,19 @@ class LocalLLMTranslator:
             'context limit', 'context length', 'context window',
             'too many tokens', 'n_ctx', 'prompt is too long',
         ))
+
+    @staticmethod
+    def _without_nearby_context(context):
+        if not context:
+            return context
+        try:
+            payload = json.loads(context)
+        except (TypeError, json.JSONDecodeError):
+            return context
+        if not isinstance(payload, dict) or not payload.get('nearby_source'):
+            return context
+        payload['nearby_source'] = []
+        return json.dumps(payload, ensure_ascii=False, separators=(',', ':'))
 
     @staticmethod
     def _parse_numbered_result(raw: str, expected_count: int) -> List[str]:

@@ -115,11 +115,11 @@ class PipelineCard(ttk.LabelFrame):
         self._pipe_context_mode_var = tk.StringVar(
             value=CONTEXT_MODE_LABELS.get(saved_context_mode, CONTEXT_MODE_LABELS['none'])
         )
-        context_combo = ttk.Combobox(
+        self._pipe_context_mode_combo = ttk.Combobox(
             mode_row, textvariable=self._pipe_context_mode_var,
             values=list(CONTEXT_MODE_LABELS.values()), state="readonly", width=16,
         )
-        context_combo.pack(side=tk.LEFT)
+        self._pipe_context_mode_combo.pack(side=tk.LEFT)
 
         self._pipe_status_label = ttk.Label(self, text="Ready", foreground="gray")
         self._pipe_status_label.grid(row=5, column=0, columnspan=2, sticky=tk.W, pady=(5, 0))

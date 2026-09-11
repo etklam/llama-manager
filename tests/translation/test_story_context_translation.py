@@ -1,4 +1,5 @@
 import json
+import re
 
 import pytest
 
@@ -291,3 +292,77 @@ def test_impossibly_small_analysis_budget_fails_before_calling_model():
     with pytest.raises(StoryContextError, match="too small"):
         analyzer.create(_cues("Hello"), "zh-tw")
     assert client.calls == []
+
+
+def test_story_context_can_be_used_with_two_step_translation():
+    client = RecordingClient(
+        _story_reply(), "- id: 1\n  step1: 直譯\n  step2: 意譯",
+    )
+    result = _story_translator(client, single_step=False).translate_srt(
+        _cues("Hello"), "zh-tw"
+    )
+    assert result[0].text == "意譯"
+    prompt = client.calls[1]["messages"][1]["content"]
+    assert "step1" in prompt and "step2" in prompt
+
+
+def test_overlong_story_field_must_be_repaired_before_translation():
+    overlong = json.loads(_story_reply())
+    overlong["summary"] = "x" * 2000
+    client = RecordingClient(
+        json.dumps(overlong), _story_reply("repaired"),
+        "- id: 1\n  translation: 完成",
+    )
+    result = _story_translator(client).translate_srt(_cues("Hello"), "zh-tw")
+    assert result[0].text == "完成"
+    assert "Repair the following response" in client.calls[1]["messages"][1]["content"]
+
+
+def test_runtime_context_limit_removes_nearby_source_before_retry():
+    client = RecordingClient(
+        _story_reply(), RuntimeError("context length exceeded"),
+        "- id: 1\n  translation: 一",
+        "- id: 1\n  translation: 二",
+        "- id: 1\n  translation: 三",
+    )
+    result = _story_translator(client, batch_size=1).translate_srt(
+        _cues("One", "Two", "Three"), "zh-tw"
+    )
+    assert [cue.text for cue in result] == ["一", "二", "三"]
+
+    def context_payload(call):
+        body = call["messages"][1]["content"]
+        encoded = re.search(r'^Context: (.*)$', body, re.MULTILINE).group(1)
+        return json.loads(json.loads(encoded))
+
+    assert context_payload(client.calls[1])["nearby_source"]
+    assert context_payload(client.calls[2])["nearby_source"] == []
+
+
+def test_recovery_reports_its_own_progress_stage():
+    client = RecordingClient(
+        _story_reply(), "- id: 1\n  translation: 一",
+        "- id: 1\n  translation: 二",
+    )
+    statuses = []
+    _story_translator(client, batch_size=2).translate_srt(
+        _cues("One", "Two"), "zh-tw",
+        progress_callback=lambda current, total, status: statuses.append(status),
+    )
+    assert any(status.startswith("補譯 L2") for status in statuses)
+
+
+def test_merge_requests_carry_program_tracked_source_ranges():
+    context_size = 4096
+    client = RecordingClient(*[_story_reply()] * 200)
+    analyzer = StoryContextAnalyzer(
+        client=client, model="test", temperature=0.2,
+        max_tokens=16384, context_size=context_size,
+    )
+    analyzer.create(_cues(*[("長字幕" + "語" * 80) for _ in range(40)]), "zh-tw")
+    merge_prompts = [
+        call["messages"][1]["content"] for call in client.calls
+        if "Merge these chronological notes" in call["messages"][1]["content"]
+    ]
+    assert merge_prompts
+    assert all("source_ranges" in prompt for prompt in merge_prompts)

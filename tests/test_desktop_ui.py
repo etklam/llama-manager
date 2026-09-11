@@ -37,6 +37,16 @@ def test_tabs_fit_minimum_window_width(desktop):
     assert max(widths.values()) <= desktop.root.minsize()[0], widths
 
 
+def test_both_translation_entries_expose_story_context_mode(desktop):
+    expected = ('標準翻譯', '全文理解翻譯')
+    subtitle_combo = desktop.subtitle_tab._context_mode_combo
+    pipeline_combo = desktop.pipeline_card._pipe_context_mode_combo
+    assert tuple(subtitle_combo.cget('values')) == expected
+    assert tuple(pipeline_combo.cget('values')) == expected
+    assert str(subtitle_combo.cget('state')) == 'readonly'
+    assert str(pipeline_combo.cget('state')) == 'readonly'
+
+
 def test_debug_batches_logs_and_releases_timer_on_close(desktop):
     desktop._open_debug_win()
     desktop._debug_win.withdraw()
