@@ -38,6 +38,10 @@ _QUALITY = (
     'Do not summarize, embellish, omit content, or complete unfinished thoughts. '
     'You may use other entries in the batch to resolve references, but never '
     'move their content into another entry.\n'
+    'Use the background only to resolve ambiguity and keep terminology consistent. '
+    'The source cue and nearby source dialogue take precedence over the background. '
+    'Do not add facts, reveal identities earlier than the source, or replace an '
+    'ambiguous reference with an unsupported name. Translate only the requested cue IDs.\n'
 )
 
 _MODES = {

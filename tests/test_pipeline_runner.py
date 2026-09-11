@@ -824,6 +824,34 @@ class TestWorkerClamping:
     @patch('pipeline_runner.LocalLLMTranslator')
     @patch('pipeline_runner.parse_srt_from_file')
     @patch('pathlib.Path.write_text', MagicMock())
+    def test_preflight_context_and_run_mode_reach_shared_translator_config(
+        self, mock_parse, mock_translator_cls, mock_generate,
+        runner, callbacks, reachable_server
+    ):
+        reachable_server.return_value = PreflightPlan(
+            reachable=True, workers=2, note=None,
+            info=ServerInfo(reachable=True, slots=2, context_size=5461),
+        )
+        mock_parse.return_value = [
+            {'line': 1, 'text': 'Hello', 'time': '00:00:00,000 --> 00:00:01,000'}
+        ]
+        mock_translator_cls.return_value.translate_srt.return_value = mock_parse.return_value
+
+        runner.run(
+            files=['/test/a.srt'], target_lang='zh-cn', language='en',
+            replace_original=False, whisper_cli_path=Path('whisper-cli.exe'),
+            whisper_model_name='tiny', whisper_model_dir='/models',
+            context_mode='story',
+        )
+
+        config = mock_translator_cls.call_args[0][0]
+        assert config['context_mode'] == 'story'
+        assert config['context_size'] == 5461
+
+    @patch('pipeline_runner.generate_srt_from_list', return_value="srt output")
+    @patch('pipeline_runner.LocalLLMTranslator')
+    @patch('pipeline_runner.parse_srt_from_file')
+    @patch('pathlib.Path.write_text', MagicMock())
     def test_workers_clamped_to_reported_slots(
         self, mock_parse, mock_translator_cls, mock_generate,
         config_manager, callbacks, reachable_server
@@ -990,11 +1018,11 @@ class TestTranslatorReuse:
     @patch('pipeline_runner.LocalLLMTranslator')
     @patch('pipeline_runner.parse_srt_from_file')
     @patch('pathlib.Path.write_text', MagicMock())
-    def test_translator_rebuilt_when_model_changes(
+    def test_run_uses_one_model_snapshot_even_if_ui_value_changes(
         self, mock_parse, mock_translator_cls, mock_generate,
         config_manager, callbacks
     ):
-        """Reuse must not outlive the config it was built from."""
+        """One run must not mix settings changed by the UI between files."""
         mock_parse.return_value = [
             {'line': 1, 'text': 'Hello', 'time': '00:00:00,000 --> 00:00:01,000'}
         ]
@@ -1023,4 +1051,5 @@ class TestTranslatorReuse:
             whisper_model_dir='',
         )
 
-        assert mock_translator_cls.call_count == 2
+        assert mock_translator_cls.call_count == 1
+        assert mock_translator_cls.call_args[0][0]['model'] == 'model-a'

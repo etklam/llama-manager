@@ -39,7 +39,8 @@ DEFAULT_CONFIG = {
         'auto_scroll': True,
         'last_model': '',
         'last_source_lang': 'auto',
-        'last_target_lang': 'zh-cn'
+        'last_target_lang': 'zh-cn',
+        'context_mode': 'none'
     },
     'translation': {
         'enabled': False,
@@ -257,6 +258,8 @@ class ConfigManager:
             if 'auto_scroll' in ui_config:
                 if not isinstance(ui_config['auto_scroll'], bool):
                     errors.append(f"'ui.auto_scroll' must be a boolean, got {type(ui_config['auto_scroll']).__name__}")
+            if ui_config.get('context_mode', 'none') not in ('none', 'story'):
+                errors.append("'ui.context_mode' must be 'none' or 'story'")
 
         # Validate translation section if it exists
         if 'translation' in self._config:

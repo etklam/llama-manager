@@ -10,6 +10,7 @@ tests/translation/test_preflight.py; here it is patched, because the tab's job i
 to present the plan, not to re-derive it.
 """
 from unittest.mock import Mock, patch
+import time
 
 from subtitle_tab import SubtitleTranslationTab
 from translation.preflight import PreflightPlan
@@ -199,6 +200,19 @@ class TestWorkerClamping:
 
         assert translator_cls.call_args[0][0]['max_workers'] == 1
 
+    def test_effective_context_size_is_passed_to_translator(self):
+        tab = _make_tab(workers=3)
+        plan = _plan(
+            reachable=True, workers=3,
+            info=ServerInfo(reachable=True, slots=3, context_size=5461),
+        )
+
+        with patch('subtitle_tab.run_preflight', return_value=plan), \
+             patch('subtitle_tab.LocalLLMTranslator') as translator_cls:
+            tab._preflight_and_translate(_config_for(workers=3))
+
+        assert translator_cls.call_args[0][0]['context_size'] == 5461
+
     def test_clamp_is_reported_to_the_user(self):
         """Silently fixing it would leave the mismatched setting in place."""
         tab = _make_tab(workers=3)
@@ -265,3 +279,17 @@ class TestWorkerSyncFromConfig:
 
         assert tab._workers_var.get() == 1
         tab._workers_label.config.assert_called_once_with(text="1")
+
+
+def test_analysis_progress_is_labeled_without_advancing_translation_fraction():
+    tab = _make_tab()
+    tab._current_file_idx = 1
+    tab._total_files = 4
+    tab._file_start_time = time.time() - 10
+
+    tab._on_progress('episode.srt', 80, 80, '分析第 4/4 段')
+
+    assert tab._progress_var.get() == 25.0
+    label = tab._progress_label.config.call_args.kwargs['text']
+    assert '分析第 4/4 段' in label
+    assert 'lines/s' not in label

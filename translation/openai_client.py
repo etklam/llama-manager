@@ -17,6 +17,7 @@ from tenacity import (
     before_sleep_log,
     RetryError
 )
+from translation.llm_client import CompletionResult
 
 logger = logging.getLogger(__name__)
 
@@ -89,12 +90,6 @@ class OpenAIClient:
     # produces the same over-long generation, so re-sending it only adds the
     # backoff delay before failing identically. Excluding it turns three
     # identical failures per line into one.
-    @retry(
-        stop=stop_after_attempt(RETRY_NUMS),
-        wait=wait_exponential(multiplier=1, min=RETRY_DELAY, max=10),
-        retry=retry_if_not_exception_type(LengthFinishReasonError),
-        before_sleep=before_sleep_log(logger, logging.WARNING)
-    )
     def complete(
         self,
         messages: List[Dict[str, str]],
@@ -120,6 +115,32 @@ class OpenAIClient:
             RuntimeError: If the API call fails or returns invalid response
             LengthFinishReasonError: If the response was truncated due to length
             Exception: If the API call fails after retries
+        """
+        return self.complete_with_metadata(
+            messages=messages,
+            model=model,
+            max_tokens=max_tokens,
+            temperature=temperature,
+        ).content
+
+    @retry(
+        stop=stop_after_attempt(RETRY_NUMS),
+        wait=wait_exponential(multiplier=1, min=RETRY_DELAY, max=10),
+        retry=retry_if_not_exception_type(LengthFinishReasonError),
+        before_sleep=before_sleep_log(logger, logging.WARNING)
+    )
+    def complete_with_metadata(
+        self,
+        messages: List[Dict[str, str]],
+        model: str,
+        max_tokens: int,
+        temperature: float,
+    ) -> CompletionResult:
+        """Complete a request while retaining its finish reason.
+
+        Translation callers keep using ``complete`` and therefore retain the
+        existing partial-content salvage behavior. Strict structured callers,
+        such as story analysis, can reject a length-stopped JSON document.
         """
         client = self._get_client()
 
@@ -160,7 +181,7 @@ class OpenAIClient:
                     '[OpenAIClient] Response hit the token limit; returning '
                     'the partial content for parsing'
                 )
-                return content.strip()
+                return CompletionResult(content.strip(), "length")
             raise LengthFinishReasonError(completion=response)
 
         if content is None:
@@ -170,9 +191,9 @@ class OpenAIClient:
             )
 
         if not content or not content.strip():
-            return ''
+            return CompletionResult('', response.choices[0].finish_reason)
 
-        return content.strip()
+        return CompletionResult(content.strip(), response.choices[0].finish_reason)
 
     def __repr__(self) -> str:
         """String representation of the client."""

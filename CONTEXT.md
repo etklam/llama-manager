@@ -41,3 +41,20 @@ _Avoid_: Batch loop, run loop
 **Translation Preflight**:
 The probe→clamp→plan decision made once before a translation run: whether the server is reachable, how many workers fit, and one note explaining either outcome.
 _Avoid_: Probe, preflight check, server health check
+
+**Story Context Translation**:
+An SRT translation mode that first analyzes every chronological Cue into one
+validated, compact Story Context, then supplies that same context to every
+translation and recovery request for the file.
+_Avoid_: Full-file translation, cached summary
+
+**Story Context**:
+Immutable, file-local background containing only supported summary, character
+names, terminology, tone, and unresolved ambiguity. Source Cues and Nearby
+Source always take precedence over it.
+_Avoid_: Character database, cross-file memory, plot truth
+
+**Nearby Source**:
+Chronological source Cues around a translation batch or retry. It is context
+data and never creates output IDs.
+_Avoid_: Previous translations, worker context

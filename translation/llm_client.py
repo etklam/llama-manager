@@ -4,7 +4,16 @@ LLM Client Protocol - Port at the seam between translator and LLM API.
 This module defines the Protocol for the LLM client seam, allowing dependency
 injection and testability.
 """
-from typing import Protocol, List, Dict
+from dataclasses import dataclass
+from typing import Protocol, List, Dict, Optional
+
+
+@dataclass(frozen=True)
+class CompletionResult:
+    """Response content plus the stop reason needed by strict consumers."""
+
+    content: str
+    finish_reason: Optional[str] = None
 
 
 class LLMClient(Protocol):

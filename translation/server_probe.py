@@ -149,6 +149,10 @@ def probe_server(api_url: str, timeout: float = PROBE_TIMEOUT) -> ServerInfo:
     if isinstance(generation_settings, dict):
         n_ctx = generation_settings.get('n_ctx')
         if isinstance(n_ctx, int) and n_ctx > 0:
+            # llama-server exposes the generation context for a request/slot
+            # here.  Do not divide it by total_slots again: builds using a
+            # shared total context have already derived the slot_n_ctx value
+            # reported in default_generation_settings.
             context_size = n_ctx
 
     model_path = payload.get('model_path')

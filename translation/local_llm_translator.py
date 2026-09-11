@@ -13,7 +13,7 @@ Uses a two-step translation approach (inspired by ImmersiveTranslate Paraphrase 
 import logging
 import re
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import replace
 from pathlib import Path
 from typing import Callable, List, Dict, Optional, TYPE_CHECKING
@@ -26,6 +26,12 @@ if TYPE_CHECKING:
 
 from translation.prompt_builder import (
     build_translation_prompt, build_system_prompt, build_source_yaml,
+)
+from translation.story_context import (
+    StoryContextAnalyzer,
+    StoryContextError,
+    build_translation_context,
+    request_fits,
 )
 from utils.srt_parser import Cue, collapse_repeats
 
@@ -66,6 +72,10 @@ class TranslationIncompleteError(RuntimeError):
         details = '; '.join(f"L{line}: {reason}" for line, reason in failures)
         super().__init__(f"Translation incomplete ({len(failures)} line(s)); "
                          f"output not saved. {details}")
+
+
+class TranslationCancelledError(RuntimeError):
+    """A translation run was cancelled before it could be committed."""
 
 
 def _rebuild_cue(entry: Cue, text: str, fallback_line: int = 0) -> Cue:
@@ -135,6 +145,11 @@ class LocalLLMTranslator:
 
         self.single_step = bool(config['single_step'])
         self.max_workers = max(1, int(config['max_workers']))
+        self.context_mode = config.get('context_mode', 'none')
+        if self.context_mode not in ('none', 'story'):
+            self.context_mode = 'none'
+        context_size = config.get('context_size')
+        self.context_size = context_size if isinstance(context_size, int) and context_size > 0 else None
 
         # Store injected client or create OpenAIClient lazily
         self._injected_client = client
@@ -518,6 +533,7 @@ class LocalLLMTranslator:
         target_language: str,
         progress_callback: Optional[Callable] = None,
         log_callback: Optional[Callable] = None,
+        cancel_callback: Optional[Callable[[], bool]] = None,
         _deduplicate: bool = True
     ) -> List[Cue]:
         """
@@ -549,6 +565,12 @@ class LocalLLMTranslator:
             if log_callback:
                 log_callback(level, msg)
 
+        def _cancelled():
+            return bool(cancel_callback and cancel_callback())
+
+        if _cancelled():
+            raise TranslationCancelledError("translation cancelled")
+
         # Collapse pathological repetition (e.g. "あ、あ、あ、..." x100) in each
         # cue's source before translating. Such runs burn tokens and can hang
         # the model. We copy each Cue so the caller's objects stay untouched and
@@ -564,6 +586,27 @@ class LocalLLMTranslator:
         if collapsed_count:
             _log("INFO", f"Collapsed repeated runs in {collapsed_count} line(s)")
         srt_data = normalized
+
+        # Story context is local to this invocation.  PipelineRunner deliberately
+        # reuses translator/client instances across files, so storing it on self
+        # would leak one file's facts into the next.
+        story_context = None
+        if self.context_mode == 'story':
+            analysis_start = time.time()
+            story_context = StoryContextAnalyzer(
+                client=self._get_llm_client(),
+                model=self._api_model,
+                temperature=self.temperature,
+                max_tokens=self.max_tokens,
+                context_size=self.context_size,
+                cancel_check=_cancelled,
+                progress_callback=progress_callback,
+                log_callback=log_callback,
+            ).create(srt_data, target_language)
+            _log("INFO", f"Story analysis done in {time.time() - analysis_start:.1f}s")
+            _deduplicate = False
+            if _cancelled():
+                raise TranslationCancelledError("translation cancelled after story analysis")
 
         # Soft guard: this path is tuned for subtitle-sized cues, and the
         # translation server preset runs a correspondingly small context. An
@@ -628,6 +671,7 @@ class LocalLLMTranslator:
                     target_language,
                     progress_callback=unique_progress,
                     log_callback=log_callback,
+                    cancel_callback=cancel_callback,
                     _deduplicate=False,
                 )
 
@@ -656,11 +700,18 @@ class LocalLLMTranslator:
         workers = 1 if self.max_workers <= 1 else self.max_workers
         batch_size = max(1, self._config.get('batch_size', DEFAULT_BATCH_SIZE))
 
-        # Split into batches
-        batches = [
-            srt_data[i:i + batch_size]
-            for i in range(0, len(srt_data), batch_size)
-        ]
+        # A plan item is (start index, batch, batch context, per-line recovery
+        # contexts). Standard mode retains the existing fixed batching.
+        if story_context is not None:
+            batch_plan = self._plan_story_batches(
+                srt_data, target_language, story_context, batch_size
+            )
+        else:
+            batch_plan = [
+                (i, srt_data[i:i + batch_size], None, None)
+                for i in range(0, len(srt_data), batch_size)
+            ]
+        batches = [item[1] for item in batch_plan]
         total_batches = len(batches)
         _log("INFO", f"Batching {len(srt_data)} lines in "
              f"{total_batches} groups of {batch_size} "
@@ -668,47 +719,66 @@ class LocalLLMTranslator:
 
         overall_start = time.time()
 
-        # Submit all batches concurrently. log_callback is safe to pass
-        # through: the UI marshals it via log_bus.emit -> root.after(0, ...)
-        # rather than touching Tk directly, so per-line logs stay visible with
-        # workers>1.
+        # Keep at most `workers` requests submitted.  This preserves concurrency
+        # while giving Stop a request boundary at which no further batch starts.
         batch_results: Dict[int, List[Cue]] = {}
         batch_errors: Dict[int, Exception] = {}
         done_lines = 0
         with ThreadPoolExecutor(max_workers=workers) as executor:
             futures = {}
-            for batch_idx, batch in enumerate(batches):
+            next_batch_idx = 0
+
+            def submit_next():
+                nonlocal next_batch_idx
+                if next_batch_idx >= len(batch_plan) or _cancelled():
+                    return False
+                batch_idx = next_batch_idx
+                _, batch, context, recovery_contexts = batch_plan[batch_idx]
                 future = executor.submit(
                     self._translate_batch_lines,
-                    batch, target_language, log_callback
+                    batch, target_language, log_callback, context,
+                    recovery_contexts, _cancelled,
                 )
                 futures[future] = batch_idx
+                next_batch_idx += 1
+                return True
 
-            for future in as_completed(futures):
-                batch_idx = futures[future]
-                batch = batches[batch_idx]
-                batch_start_global = batch_idx * batch_size + 1
-                batch_end_global = batch_start_global + len(batch) - 1
-                try:
-                    batch_results[batch_idx] = future.result()
-                    _log("SUCCESS", f"Batch {batch_idx+1} done "
-                         f"({batch_start_global}-{batch_end_global})")
-                except Exception as e:
-                    batch_errors[batch_idx] = e
-                    if not isinstance(e, TranslationIncompleteError):
-                        _log("WARNING", f"Batch {batch_idx+1} failed ({e}), "
-                             "falling back to individual translation")
+            while len(futures) < workers and submit_next():
+                pass
 
-                # Report line-level progress as each batch completes so the
-                # UI progress bar / ETA advances smoothly, not once at the end.
-                done_lines += len(batch)
-                if progress_callback:
-                    elapsed = time.time() - overall_start
-                    rate = done_lines / elapsed if elapsed > 0 else 0.0
-                    progress_callback(
-                        done_lines, len(srt_data),
-                        f"{rate:.1f} lines/s"
-                    )
+            while futures:
+                completed, _ = wait(futures, return_when=FIRST_COMPLETED)
+                for future in completed:
+                    batch_idx = futures.pop(future)
+                    batch_start, batch, _, _ = batch_plan[batch_idx]
+                    batch_start_global = batch_start + 1
+                    batch_end_global = batch_start_global + len(batch) - 1
+                    try:
+                        batch_results[batch_idx] = future.result()
+                        _log("SUCCESS", f"Batch {batch_idx+1} done "
+                             f"({batch_start_global}-{batch_end_global})")
+                    except Exception as e:
+                        batch_errors[batch_idx] = e
+                        if not isinstance(e, TranslationIncompleteError):
+                            _log("WARNING", f"Batch {batch_idx+1} failed ({e}), "
+                                 "falling back to individual translation")
+
+                    # Report line-level progress as each batch completes so the
+                    # UI progress bar / ETA advances smoothly, not once at the end.
+                    done_lines += len(batch)
+                    if progress_callback:
+                        elapsed = time.time() - overall_start
+                        rate = done_lines / elapsed if elapsed > 0 else 0.0
+                        progress_callback(
+                            done_lines, len(srt_data),
+                            f"翻譯 · {rate:.1f} lines/s"
+                        )
+
+                    while len(futures) < workers and submit_next():
+                        pass
+
+            if _cancelled():
+                raise TranslationCancelledError("translation cancelled")
 
         # Reconstruct results in order, with fallback for failed batches
         all_translated = []
@@ -723,8 +793,10 @@ class LocalLLMTranslator:
                     failures.extend(error.failures)
                     continue
                 try:
+                    _, _, _, recovery_contexts = batch_plan[batch_idx]
                     all_translated.extend(self._recover_missing(
-                        batch, [''] * len(batch), target_language, _log))
+                        batch, [''] * len(batch), target_language, _log,
+                        recovery_contexts, _cancelled))
                 except TranslationIncompleteError as error:
                     failures.extend(error.failures)
 
@@ -732,6 +804,9 @@ class LocalLLMTranslator:
             error = TranslationIncompleteError(failures)
             _log("ERROR", str(error))
             raise error
+
+        if _cancelled():
+            raise TranslationCancelledError("translation cancelled before completion")
 
         total_elapsed = time.time() - overall_start
         rate = len(all_translated) / total_elapsed if total_elapsed > 0 else float('inf')
@@ -755,7 +830,10 @@ class LocalLLMTranslator:
         self,
         batch: List[Cue],
         target_language: str,
-        log_callback: Optional[Callable] = None
+        log_callback: Optional[Callable] = None,
+        context: Optional[str] = None,
+        recovery_contexts: Optional[List[str]] = None,
+        cancel_check: Optional[Callable[[], bool]] = None,
     ) -> List[Cue]:
         """Translate a batch of subtitle lines using YAML two-step format."""
         def _log(level, msg):
@@ -765,14 +843,36 @@ class LocalLLMTranslator:
         # Build YAML input
         yaml_input = self._build_batch_yaml(batch)
 
-        messages = self._build_batch_prompt(yaml_input, target_language)
+        messages = self._build_batch_prompt(yaml_input, target_language, context)
 
         # Any exception — including a LengthFinishReasonError the client
         # raised because nothing usable came back — propagates to the executor
         # loop, which falls back to per-line translation.
-        raw_result = self._call_api(
-            messages, max_tokens=self._dynamic_max_tokens(len(batch))
-        )
+        try:
+            raw_result = self._call_api(
+                messages, max_tokens=self._dynamic_max_tokens(len(batch))
+            )
+        except Exception as error:
+            if self._is_context_limit_error(error) and len(batch) > 1:
+                middle = len(batch) // 2
+                left_contexts = recovery_contexts[:middle] if recovery_contexts else None
+                right_contexts = recovery_contexts[middle:] if recovery_contexts else None
+                return (
+                    self._translate_batch_lines(
+                        batch[:middle], target_language, log_callback, context,
+                        left_contexts, cancel_check,
+                    )
+                    + self._translate_batch_lines(
+                        batch[middle:], target_language, log_callback, context,
+                        right_contexts, cancel_check,
+                    )
+                )
+            if self._is_context_limit_error(error):
+                line = batch[0].line or 1
+                raise TranslationIncompleteError([
+                    (line, f"context limit: {error}")
+                ]) from error
+            raise
 
         # Parse YAML result
         parsed = self._parse_yaml_result(raw_result)
@@ -781,7 +881,9 @@ class LocalLLMTranslator:
             # Fallback: try numbered line parsing
             _log("WARNING", "YAML parse got too few results, trying numbered fallback")
             translations = self._parse_numbered_result(raw_result, len(batch))
-            return self._recover_missing(batch, translations, target_language, _log)
+            return self._recover_missing(
+                batch, translations, target_language, _log, recovery_contexts,
+                cancel_check)
 
         # Map parsed entries by the id echoed back by the model. The batch YAML
         # numbers sources 1..N (see _build_batch_yaml), so the source at
@@ -819,9 +921,12 @@ class LocalLLMTranslator:
                 _log("WARNING", f"  L{entry.line or '?'}: missing parsed result")
             translations.append(final_text)
 
-        return self._recover_missing(batch, translations, target_language, _log)
+        return self._recover_missing(
+            batch, translations, target_language, _log, recovery_contexts,
+            cancel_check)
 
-    def _recover_missing(self, batch, translations, target_language, log_fn):
+    def _recover_missing(self, batch, translations, target_language, log_fn,
+                         recovery_contexts=None, cancel_check=None):
         """One recovery policy for YAML, numbered output and failed API batches."""
         result = []
         failures = []
@@ -829,8 +934,15 @@ class LocalLLMTranslator:
             src = entry.text.strip().replace("\n", " ")
             text = translations[j] if j < len(translations) else ''
             if src and not text.strip():
+                if cancel_check and cancel_check():
+                    raise TranslationCancelledError(
+                        "translation cancelled before recovery"
+                    )
                 try:
-                    text = self.translate(src, target_language)
+                    context = (recovery_contexts[j]
+                               if recovery_contexts and j < len(recovery_contexts)
+                               else None)
+                    text = self.translate(src, target_language, context=context)
                     if not text or not text.strip():
                         raise RuntimeError("model returned an empty translation")
                     log_fn("INFO", f"  L{entry.line or j+1}: retried -> \"{text[:60]}\"")
@@ -845,7 +957,8 @@ class LocalLLMTranslator:
         return result
 
     def _build_batch_prompt(
-        self, yaml_text: str, target_language: str
+        self, yaml_text: str, target_language: str,
+        context: Optional[str] = None,
     ) -> List[Dict[str, str]]:
         """Build a batch translation prompt using YAML format."""
         is_traditional = target_language in ('zh-tw', 'Traditional Chinese')
@@ -863,12 +976,89 @@ class LocalLLMTranslator:
             locale=locale,
             target_language=target_language,
             yaml_text=yaml_text,
+            context=context,
         )
 
         return [
             system_message,
             {'role': 'user', 'content': user_content}
         ]
+
+    def _plan_story_batches(self, srt_data, target_language, story_context,
+                            requested_batch_size):
+        """Plan batches that fit without ever truncating a requested source."""
+        plan = []
+        cursor = 0
+        while cursor < len(srt_data):
+            size = min(requested_batch_size, len(srt_data) - cursor)
+            selected = None
+            while size >= 1 and selected is None:
+                batch = srt_data[cursor:cursor + size]
+                for radius in (2, 1, 0):
+                    nearby = self._nearby_cues(
+                        srt_data, cursor, cursor + size, radius
+                    )
+                    context = build_translation_context(story_context, nearby)
+                    messages = self._build_batch_prompt(
+                        self._build_batch_yaml(batch), target_language, context
+                    )
+                    if request_fits(
+                        messages, self.context_size,
+                        self._dynamic_max_tokens(len(batch)),
+                    ):
+                        recovery_contexts = [
+                            self._recovery_story_context(
+                                srt_data, index, target_language, story_context,
+                            )
+                            for index in range(cursor, cursor + size)
+                        ]
+                        selected = (cursor, batch, context, recovery_contexts)
+                        break
+                if selected is None:
+                    size //= 2
+            if selected is None:
+                line = srt_data[cursor].line or cursor + 1
+                raise StoryContextError(
+                    f"context window is too small to translate cue {line} without truncation"
+                )
+            plan.append(selected)
+            cursor += len(selected[1])
+        return plan
+
+    def _recovery_story_context(self, srt_data, index, target_language,
+                                story_context):
+        """Choose the largest nearby window that leaves a full retry possible."""
+        source = srt_data[index].text.strip().replace("\n", " ")
+        for radius in (2, 1, 0):
+            context = build_translation_context(
+                story_context,
+                self._nearby_cues(srt_data, index, index + 1, radius),
+            )
+            messages = self._build_single_prompt(source, target_language, context)
+            if request_fits(
+                messages, self.context_size, self._dynamic_max_tokens(1)
+            ):
+                return context
+        line = srt_data[index].line or index + 1
+        raise StoryContextError(
+            f"context window is too small to recover cue {line} without truncation"
+        )
+
+    @staticmethod
+    def _nearby_cues(srt_data, start, end, radius):
+        if radius <= 0:
+            return []
+        before = range(max(0, start - radius), start)
+        after = range(end, min(len(srt_data), end + radius))
+        return [(index + 1, srt_data[index]) for index in (*before, *after)]
+
+    @staticmethod
+    def _is_context_limit_error(error):
+        text = str(error).lower()
+        return any(marker in text for marker in (
+            'context limit', 'context length', 'context window',
+            'too many tokens', 'n_ctx', 'prompt is too long',
+        ))
 
     @staticmethod
     def _parse_numbered_result(raw: str, expected_count: int) -> List[str]:

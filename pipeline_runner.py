@@ -106,6 +106,8 @@ class PipelineRunner:
         # the worker pool per file. None means "not preflighted yet", which
         # leaves the configured worker count untouched.
         self._preflight_plan: Optional[PreflightPlan] = None
+        self._context_mode_snapshot = 'none'
+        self._translation_config_snapshot: Optional[Dict] = None
 
     @property
     def running(self) -> bool:
@@ -141,6 +143,7 @@ class PipelineRunner:
         whisper_cli_path: Path,
         whisper_model_name: str,
         whisper_model_dir: str,
+        context_mode: Optional[str] = None,
     ) -> None:
         """
         Process files sequentially in the calling thread.
@@ -155,6 +158,10 @@ class PipelineRunner:
         self.failed_files = 0
         self.startup_error = None
         self._preflight_plan = None
+        self._context_mode_snapshot = (
+            context_mode if context_mode in ('none', 'story')
+            else self._config_manager.get('ui.context_mode', 'none')
+        )
         # A stop requested before run() is honored by the run loop: its first
         # transcribe_file creates a fresh token and cancels it immediately.
 
@@ -179,6 +186,12 @@ class PipelineRunner:
                 self._on_progress(f"Error: {message}")
                 return
             self._preflight_plan = plan
+            self._translation_config_snapshot = build_translation_config(
+                self._config_manager, self._get_port(), self._get_current_model()
+            )
+            self._translation_config_snapshot['max_workers'] = plan.workers
+            self._translation_config_snapshot['context_size'] = plan.info.context_size
+            self._translation_config_snapshot['context_mode'] = self._context_mode_snapshot
             # The plan formats its note once; log it here once, not per file.
             if plan.note:
                 self._on_log(plan.note)
@@ -216,6 +229,8 @@ class PipelineRunner:
                         else:
                             self.failed_files += 1
                 except Exception as e:
+                    if self._stop_requested:
+                        break
                     self.failed_files += 1
                     self._on_progress(f"Error: {Path(filepath).name} - {e}")
                     self._on_log(f"Error: {Path(filepath).name} - {e}")
@@ -284,9 +299,10 @@ class PipelineRunner:
         llama-server slot affinity: slot selection and prompt-cache reuse remain
         server scheduling decisions.
 
-        The config is still rebuilt per file because port and model can change
-        between files, so we only reuse when every value the translator reads at
-        construction time is unchanged.
+        A run snapshots translation settings after preflight, so all files use
+        the same mode, model, capacity, and worker plan. A later run may carry a
+        different snapshot; reuse only occurs when every construction value is
+        unchanged.
         """
         if self._translator is None or config != self._translator_config:
             self._translator = LocalLLMTranslator(config)
@@ -299,13 +315,9 @@ class PipelineRunner:
         target_lang: str,
         replace_original: bool,
     ) -> bool:
-        """Parse, translate, and save an SRT; return whether it completed."""
-        subtitles = parse_srt_from_file(srt_path)
-        if not subtitles:
-            self._on_progress(f"Empty SRT, skipping: {Path(srt_path).name}")
-            return False
-
-        config = build_translation_config(
+        """Parse, translate, and save a subtitle file when it completes."""
+        snapshot = getattr(self, '_translation_config_snapshot', None)
+        config = dict(snapshot) if snapshot is not None else build_translation_config(
             self._config_manager, self._get_port(), self._get_current_model()
         )
 
@@ -317,6 +329,19 @@ class PipelineRunner:
         # reports it as parallel work.
         if self._preflight_plan is not None:
             config['max_workers'] = self._preflight_plan.workers
+            config['context_size'] = self._preflight_plan.info.context_size
+        config['context_mode'] = getattr(
+            self, '_context_mode_snapshot', config.get('context_mode', 'none')
+        )
+
+        if Path(srt_path).suffix.lower() == '.txt' and config['context_mode'] == 'story':
+            self._on_progress("全文理解翻譯只適用於 SRT；TXT 使用標準翻譯")
+            config['context_mode'] = 'none'
+
+        subtitles = parse_srt_from_file(srt_path)
+        if not subtitles:
+            self._on_progress(f"Empty SRT, skipping: {Path(srt_path).name}")
+            return False
 
         self._on_progress(f"Translating {len(subtitles)} lines: {Path(srt_path).name}")
 
@@ -327,7 +352,11 @@ class PipelineRunner:
                 f"Translating {Path(srt_path).name}: {c}/{t} {s}"
             ),
             log_callback=lambda lv, m: self._on_log(f"  [{lv}] {m}"),
+            cancel_callback=lambda: getattr(self, '_stop_requested', False),
         )
+
+        if getattr(self, '_stop_requested', False):
+            return False
 
         srt_content = generate_srt_from_list(translated)
         out_path = output_path_for(srt_path, target_lang, replace_original)

@@ -19,7 +19,11 @@ from constants import SUPPORTED_SUBTITLE, TARGET_LANGUAGES, SOURCE_LANGUAGES
 from ui_helpers import (
     CHANNEL_TRANSLATE, LogMixin, populate_language_combo, extract_combo_code,
 )
-from config_helpers import build_translation_config
+from config_helpers import (
+    CONTEXT_MODE_LABELS,
+    build_translation_config,
+    context_mode_from_label,
+)
 from file_listbox import FileListbox
 
 
@@ -169,6 +173,10 @@ class SubtitleTranslationTab(LogMixin, ttk.Frame):
         saved_tokens = cm.get("ui.max_tokens", 16384) if cm else 16384
         saved_workers = cm.get("ui.max_workers", 3) if cm else 3
         saved_fast = cm.get("ui.single_step", True) if cm else True
+        saved_context_mode = cm.get("ui.context_mode", "none") if cm else "none"
+        self._context_mode_var = tk.StringVar(
+            value=CONTEXT_MODE_LABELS.get(saved_context_mode, CONTEXT_MODE_LABELS['none'])
+        )
 
         # Row 0: Batch size
         ttk.Label(self._adv_frame, text="Batch Size:").grid(
@@ -235,6 +243,13 @@ class SubtitleTranslationTab(LogMixin, ttk.Frame):
     def _create_control_section(self):
         frame = ttk.Frame(self)
         frame.grid(row=3, column=0, pady=(0, 5), sticky=tk.W)
+
+        ttk.Label(frame, text="翻譯模式:").pack(side=tk.LEFT, padx=(0, 3))
+        self._context_mode_combo = ttk.Combobox(
+            frame, textvariable=self._context_mode_var,
+            values=list(CONTEXT_MODE_LABELS.values()), state="readonly", width=16,
+        )
+        self._context_mode_combo.pack(side=tk.LEFT, padx=(0, 10))
 
         self._toggle_adv_btn = ttk.Button(frame, text="Show Advanced",
                                           command=self._toggle_advanced)
@@ -331,6 +346,10 @@ class SubtitleTranslationTab(LogMixin, ttk.Frame):
         config['temperature'] = self._temp_var.get()
         config['max_tokens'] = self._tokens_var.get()
         config['single_step'] = self._fast_mode_var.get()
+        context_var = getattr(self, '_context_mode_var', None)
+        config['context_mode'] = context_mode_from_label(
+            context_var.get() if context_var else config.get('context_mode', 'none')
+        )
         requested_workers = int(float(self._workers_var.get()))
         config['max_workers'] = requested_workers
 
@@ -352,6 +371,7 @@ class SubtitleTranslationTab(LogMixin, ttk.Frame):
             # against a single-slot server.
             self._config_manager.set("ui.max_workers", requested_workers)
             self._config_manager.set("ui.single_step", config['single_step'])
+            self._config_manager.set("ui.context_mode", config['context_mode'])
 
         thread = threading.Thread(
             target=self._preflight_and_translate, args=(config,), daemon=True)
@@ -385,6 +405,7 @@ class SubtitleTranslationTab(LogMixin, ttk.Frame):
         # parallelism. The plan's note is the user-facing explanation, logged
         # once.
         config['max_workers'] = plan.workers
+        config['context_size'] = plan.info.context_size
         if plan.note:
             self._log("WARNING", plan.note)
 
@@ -401,7 +422,7 @@ class SubtitleTranslationTab(LogMixin, ttk.Frame):
 
     def _stop_translation(self):
         self._stop_requested = True
-        self._log("WARNING", "Stopping after current file...")
+        self._log("WARNING", "Stopping after the current model request...")
 
     def _run_translation(self):
         self._failed_files = 0
@@ -425,6 +446,9 @@ class SubtitleTranslationTab(LogMixin, ttk.Frame):
             try:
                 self._translate_file(filepath, target_lang, replace_original=replace)
             except Exception as e:
+                if self._stop_requested:
+                    self._log("WARNING", "Translation stopped by user")
+                    break
                 self._failed_files += 1
                 self._log("ERROR", f"Failed: {Path(filepath).name} - {e}")
 
@@ -480,14 +504,21 @@ class SubtitleTranslationTab(LogMixin, ttk.Frame):
             translated = self._translator.translate_srt(
                 subtitles, target_lang,
                 progress_callback=file_progress,
-                log_callback=log_callback
+                log_callback=log_callback,
+                cancel_callback=lambda: getattr(self, '_stop_requested', False),
             )
+            if getattr(self, '_stop_requested', False):
+                return
             srt_content = generate_srt_from_list(translated)
             Path(output_path).write_text(srt_content, encoding='utf-8')
         elif ext == '.txt':
             text = filepath.read_text(encoding='utf-8')
             self._log("INFO", f"Text file, {len(text)} chars")
+            if self._translator.context_mode == 'story':
+                self._log("INFO", "全文理解翻譯只適用於 SRT；TXT 使用標準翻譯")
             translated = self._translator.translate(text, target_lang)
+            if getattr(self, '_stop_requested', False):
+                return
             Path(output_path).write_text(translated, encoding='utf-8')
 
         self._on_progress(filepath.name, 1, 1, "completed")
@@ -502,7 +533,12 @@ class SubtitleTranslationTab(LogMixin, ttk.Frame):
         ETA for the current file from the wall-clock elapsed since it started.
         """
         total = max(1, total)
-        file_frac = min(current, total) / total
+        is_analysis = status and any(
+            marker in status for marker in ('讀取全文', '分析第', '整理背景')
+        )
+        # Analysis coverage is not translated-line progress. Keep the bar at
+        # this file's boundary until the first translation batch completes.
+        file_frac = 0 if is_analysis else min(current, total) / total
 
         file_idx = getattr(self, "_current_file_idx", 0)
         total_files = max(1, getattr(self, "_total_files", 1))
@@ -510,7 +546,7 @@ class SubtitleTranslationTab(LogMixin, ttk.Frame):
 
         elapsed = time.time() - getattr(self, "_file_start_time", time.time())
         detail = f"{status}" if status else ""
-        if current > 0 and elapsed > 0:
+        if current > 0 and elapsed > 0 and not is_analysis:
             rate = current / elapsed
             remaining = (total - current) / rate if rate > 0 else 0
             eta = self._format_eta(remaining)

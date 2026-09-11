@@ -13,6 +13,7 @@ from constants import (
     SUPPORTED_MEDIA, SUPPORTED_SUBTITLE, WHISPER_LANGUAGES, TARGET_LANGUAGES,
 )
 from ui_helpers import populate_language_combo, extract_combo_code
+from config_helpers import CONTEXT_MODE_LABELS, context_mode_from_label
 from file_listbox import FileListbox
 
 
@@ -38,7 +39,7 @@ class PipelineCard(ttk.LabelFrame):
     # ---------------------------------------------------------------- UI
     def _create_ui(self):
         self.columnconfigure(1, weight=1)
-        self.rowconfigure(5, weight=1)
+        self.rowconfigure(6, weight=1)
 
         lists_frame = ttk.Frame(self)
         lists_frame.grid(
@@ -107,11 +108,24 @@ class PipelineCard(ttk.LabelFrame):
         target_combo.pack(side=tk.LEFT)
         populate_language_combo(target_combo, TARGET_LANGUAGES, saved_target)
 
+        mode_row = ttk.Frame(self)
+        mode_row.grid(row=4, column=0, columnspan=2, sticky=tk.W, pady=(5, 0))
+        ttk.Label(mode_row, text="翻譯模式:").pack(side=tk.LEFT, padx=(0, 2))
+        saved_context_mode = self._config.get("ui.context_mode", "none")
+        self._pipe_context_mode_var = tk.StringVar(
+            value=CONTEXT_MODE_LABELS.get(saved_context_mode, CONTEXT_MODE_LABELS['none'])
+        )
+        context_combo = ttk.Combobox(
+            mode_row, textvariable=self._pipe_context_mode_var,
+            values=list(CONTEXT_MODE_LABELS.values()), state="readonly", width=16,
+        )
+        context_combo.pack(side=tk.LEFT)
+
         self._pipe_status_label = ttk.Label(self, text="Ready", foreground="gray")
-        self._pipe_status_label.grid(row=4, column=0, columnspan=2, sticky=tk.W, pady=(5, 0))
+        self._pipe_status_label.grid(row=5, column=0, columnspan=2, sticky=tk.W, pady=(5, 0))
 
         btn_frame = ttk.Frame(self)
-        btn_frame.grid(row=5, column=0, columnspan=2, pady=(8, 0))
+        btn_frame.grid(row=6, column=0, columnspan=2, pady=(8, 0))
         self._pipe_start_btn = ttk.Button(btn_frame, text="▶ Start",
                                            command=self._start_pipeline)
         self._pipe_start_btn.pack(side=tk.LEFT, padx=2)
@@ -205,10 +219,15 @@ class PipelineCard(ttk.LabelFrame):
         language = extract_combo_code(lang_val)
         target_val = self._pipe_target_var.get()
         target_lang = extract_combo_code(target_val)
+        context_var = getattr(self, '_pipe_context_mode_var', None)
+        context_mode = context_mode_from_label(
+            context_var.get() if context_var else self._config.get('ui.context_mode', 'none')
+        )
 
         self._config.set("pipeline.language", language)
         self._config.set("pipeline.target_lang", target_lang)
         self._config.set("pipeline.replace_original", self._pipe_replace_var.get())
+        self._config.set("ui.context_mode", context_mode)
         if model_name:
             self._config.set("whisper.last_model", model_name)
 
@@ -220,6 +239,7 @@ class PipelineCard(ttk.LabelFrame):
             whisper_cli_path=cli_path,
             whisper_model_name=model_name,
             whisper_model_dir=model_dir,
+            context_mode=context_mode,
         )
 
     def _pipeline_step(self, msg):
