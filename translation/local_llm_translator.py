@@ -807,8 +807,11 @@ class LocalLLMTranslator:
                 final_text = matched.get('step2', '') or matched.get('step1', '')
                 s1 = matched.get('step1', '')[:60]
                 s2 = matched.get('step2', '')[:60]
-                _log("INFO", f"  L{entry.line or '?'}: "
-                     f"直译=\"{s1}\" -> 意译=\"{s2}\"")
+                if self.single_step:
+                    _log("INFO", f"  L{entry.line or '?'}: translation=\"{final_text[:60]}\"")
+                else:
+                    _log("INFO", f"  L{entry.line or '?'}: "
+                         f"literal=\"{s1}\" -> paraphrase=\"{s2}\"")
             if not final_text:
                 # The model returned no usable text for this line. Emitting the
                 # source verbatim is precisely the "not translated" symptom, so
