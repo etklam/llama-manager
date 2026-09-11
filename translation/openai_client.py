@@ -116,19 +116,14 @@ class OpenAIClient:
             LengthFinishReasonError: If the response was truncated due to length
             Exception: If the API call fails after retries
         """
-        return self.complete_with_metadata(
+        return self._request_completion(
             messages=messages,
             model=model,
             max_tokens=max_tokens,
             temperature=temperature,
+            allow_empty_length=False,
         ).content
 
-    @retry(
-        stop=stop_after_attempt(RETRY_NUMS),
-        wait=wait_exponential(multiplier=1, min=RETRY_DELAY, max=10),
-        retry=retry_if_not_exception_type(LengthFinishReasonError),
-        before_sleep=before_sleep_log(logger, logging.WARNING)
-    )
     def complete_with_metadata(
         self,
         messages: List[Dict[str, str]],
@@ -142,7 +137,30 @@ class OpenAIClient:
         existing partial-content salvage behavior. Strict structured callers,
         such as story analysis, can reject a length-stopped JSON document.
         """
+        return self._request_completion(
+            messages=messages,
+            model=model,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            allow_empty_length=True,
+        )
+
+    @retry(
+        stop=stop_after_attempt(RETRY_NUMS),
+        wait=wait_exponential(multiplier=1, min=RETRY_DELAY, max=10),
+        retry=retry_if_not_exception_type(LengthFinishReasonError),
+        before_sleep=before_sleep_log(logger, logging.WARNING)
+    )
+    def _request_completion(
+        self,
+        messages: List[Dict[str, str]],
+        model: str,
+        max_tokens: int,
+        temperature: float,
+        allow_empty_length: bool,
+    ) -> CompletionResult:
         client = self._get_client()
+        length_error = None
 
         try:
             response = client.chat.completions.create(
@@ -155,6 +173,18 @@ class OpenAIClient:
 
             logger.debug(f'[OpenAIClient] Response: {response}')
 
+        except LengthFinishReasonError as error:
+            # OpenAI 2.x parses every chat completion before returning it and
+            # raises here when finish_reason is "length". The completion is
+            # still attached to the exception, including any partial content.
+            # Normalize that SDK behavior so metadata callers can shrink a
+            # structured request instead of failing before seeing the reason.
+            response = error.completion
+            length_error = error
+            logger.warning(
+                '[OpenAIClient] SDK reported a length-stopped response; '
+                'recovering its completion metadata'
+            )
         except Exception as e:
             logger.error(f'[OpenAIClient] API call failed: {e}')
             raise
@@ -182,6 +212,10 @@ class OpenAIClient:
                     'the partial content for parsing'
                 )
                 return CompletionResult(content.strip(), "length")
+            if allow_empty_length:
+                return CompletionResult('', "length")
+            if length_error is not None:
+                raise length_error
             raise LengthFinishReasonError(completion=response)
 
         if content is None:

@@ -230,6 +230,53 @@ class TestTruncatedResponseHandling:
         assert result == "- id: 1\n  translation: 完整的一行"
 
     @patch('translation.openai_client.OpenAI')
+    def test_sdk_length_error_is_normalized_for_metadata_callers(self, mock_openai):
+        """OpenAI 2.x may raise before returning the completion object."""
+        from openai import LengthFinishReasonError
+
+        mock_client = MagicMock()
+        mock_openai.return_value = mock_client
+        response = _truncated_response('{"summary": "partial')
+        response.usage = None
+        mock_client.chat.completions.create.side_effect = (
+            LengthFinishReasonError(completion=response)
+        )
+
+        result = OpenAIClient(
+            api_url="http://localhost:8080/v1", model="m"
+        ).complete_with_metadata(
+            messages=[{'role': 'user', 'content': 'Test'}],
+            model="m", max_tokens=768, temperature=0.2,
+        )
+
+        assert result.content == '{"summary": "partial'
+        assert result.finish_reason == 'length'
+        assert mock_client.chat.completions.create.call_count == 1
+
+    @patch('translation.openai_client.OpenAI')
+    def test_sdk_length_error_without_content_is_metadata_not_retry(self, mock_openai):
+        from openai import LengthFinishReasonError
+
+        mock_client = MagicMock()
+        mock_openai.return_value = mock_client
+        response = _truncated_response(None)
+        response.usage = None
+        mock_client.chat.completions.create.side_effect = (
+            LengthFinishReasonError(completion=response)
+        )
+
+        result = OpenAIClient(
+            api_url="http://localhost:8080/v1", model="m"
+        ).complete_with_metadata(
+            messages=[{'role': 'user', 'content': 'Test'}],
+            model="m", max_tokens=768, temperature=0.2,
+        )
+
+        assert result.content == ''
+        assert result.finish_reason == 'length'
+        assert mock_client.chat.completions.create.call_count == 1
+
+    @patch('translation.openai_client.OpenAI')
     def test_truncation_is_not_retried(self, mock_openai):
         mock_client = MagicMock()
         mock_openai.return_value = mock_client
