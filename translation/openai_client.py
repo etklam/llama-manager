@@ -5,7 +5,7 @@ This module provides the production implementation of the LLMClient port,
 wrapping the OpenAI SDK with retry logic.
 """
 import logging
-from typing import List, Dict
+from typing import List, Dict, Optional
 
 import httpx
 from openai import OpenAI, LengthFinishReasonError, RateLimitError
@@ -145,6 +145,34 @@ class OpenAIClient:
             allow_empty_length=True,
         )
 
+    def complete_analysis(
+        self,
+        messages: List[Dict[str, str]],
+        model: str,
+        max_tokens: int,
+        temperature: float,
+        response_schema: Optional[Dict] = None,
+    ) -> CompletionResult:
+        """Reserve structured-analysis output for JSON instead of reasoning.
+
+        Supporting llama-server templates honor this per-request control.
+        Other completion callers retain their existing template settings, and
+        a template that ignores the control still faces strict length checks.
+        """
+        return self._request_completion(
+            messages=messages,
+            model=model,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            allow_empty_length=True,
+            extra_body={'chat_template_kwargs': {'enable_thinking': False}},
+            response_format=(
+                {'type': 'json_schema', 'json_schema': {
+                    'name': 'story_context', 'strict': True, 'schema': response_schema,
+                }} if response_schema is not None else None
+            ),
+        )
+
     @retry(
         stop=stop_after_attempt(RETRY_NUMS),
         wait=wait_exponential(multiplier=1, min=RETRY_DELAY, max=10),
@@ -158,6 +186,8 @@ class OpenAIClient:
         max_tokens: int,
         temperature: float,
         allow_empty_length: bool,
+        extra_body: Optional[Dict] = None,
+        response_format: Optional[Dict] = None,
     ) -> CompletionResult:
         client = self._get_client()
         length_error = None
@@ -168,14 +198,16 @@ class OpenAIClient:
                 max_tokens=max_tokens,
                 temperature=temperature,
                 frequency_penalty=0,
-                messages=messages
+                messages=messages,
+                **({'extra_body': extra_body} if extra_body is not None else {}),
+                **({'response_format': response_format} if response_format is not None else {}),
             )
 
             logger.debug(f'[OpenAIClient] Response: {response}')
 
         except LengthFinishReasonError as error:
-            # OpenAI 2.x parses every chat completion before returning it and
-            # raises here when finish_reason is "length". The completion is
+            # SDK parsing paths can raise before returning a chat completion
+            # when finish_reason is "length". The completion is
             # still attached to the exception, including any partial content.
             # Normalize that SDK behavior so metadata callers can shrink a
             # structured request instead of failing before seeing the reason.

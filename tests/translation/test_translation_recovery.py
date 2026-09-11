@@ -1,4 +1,5 @@
 """Replay incomplete model responses through the full subtitle translation path."""
+import json
 from unittest.mock import Mock
 
 import pytest
@@ -8,9 +9,10 @@ from translation.local_llm_translator import LocalLLMTranslator
 from utils.srt_parser import Cue
 
 
-def translator_with(*responses):
+def translator_with(*responses, **overrides):
     config = build_translation_config(NoneConfig(), 8080, "test")
     config['max_workers'] = 1
+    config.update(overrides)
     client = Mock()
     client.complete.side_effect = responses
     return LocalLLMTranslator(config, client=client), client
@@ -79,7 +81,8 @@ def test_single_translation_rejects_empty_or_unfinished_structured_response(repl
 
 @pytest.mark.parametrize('route', ['subtitle', 'pipeline'])
 @pytest.mark.parametrize('replace_original', [False, True])
-def test_failed_translation_preserves_existing_files(tmp_path, route, replace_original):
+@pytest.mark.parametrize('failure', ['translation', 'story_schema'])
+def test_failed_translation_preserves_existing_files(tmp_path, route, replace_original, failure):
     from pipeline_runner import PipelineRunner
     from subtitle_tab import SubtitleTranslationTab
     from utils.srt_parser import output_path_for
@@ -91,7 +94,19 @@ def test_failed_translation_preserves_existing_files(tmp_path, route, replace_or
     if not replace_original:
         output.write_text('previous complete translation', encoding='utf-8')
     previous = output.read_bytes()
-    translator, _ = translator_with('- id: 1\n  translation:', RuntimeError('timeout'))
+    if failure == 'story_schema':
+        invalid = json.dumps({
+            'summary': 'A greeting.', 'characters': [],
+            'glossary': [{'source': 'Hello', 'target': '你好', 'note': 'greeting'}],
+            'tone': [], 'uncertainties': [],
+        })
+        translator, client = translator_with(
+            invalid, invalid, context_mode='story', context_size=5632,
+        )
+        expected_error = 'glossary'
+    else:
+        translator, client = translator_with('- id: 1\n  translation:', RuntimeError('timeout'))
+        expected_error = 'L1'
 
     if route == 'subtitle':
         caller = object.__new__(SubtitleTranslationTab)
@@ -108,7 +123,13 @@ def test_failed_translation_preserves_existing_files(tmp_path, route, replace_or
         caller._on_progress = Mock()
         caller._on_log = Mock()
 
-    with pytest.raises(RuntimeError, match='L1'):
+    with pytest.raises(RuntimeError, match=expected_error):
         caller._translate_file(str(source), 'zh-tw', replace_original=replace_original)
     assert output.read_bytes() == previous
     assert source.read_text(encoding='utf-8') == original
+    assert client.complete.call_count == 2
+    if route == 'subtitle':
+        assert not any(call.args[0] == 'SUCCESS' for call in caller._log.call_args_list)
+        assert not any(call.args[-1] == 'completed' for call in caller._on_progress.call_args_list)
+    else:
+        assert not any(call.args[0].startswith('Saved:') for call in caller._on_progress.call_args_list)

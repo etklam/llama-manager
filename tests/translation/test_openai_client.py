@@ -335,5 +335,90 @@ class TestTruncatedResponseHandling:
         assert mock_client.chat.completions.create.call_count == 2
 
 
+class TestAnalysisCompletion:
+    @patch('translation.openai_client.OpenAI')
+    def test_analysis_sends_schema_constraints_to_the_same_completion_endpoint(self, mock_openai):
+        sdk = mock_openai.return_value
+        sdk.chat.completions.create.return_value = MagicMock(choices=[MagicMock(
+            message=MagicMock(content='{"glossary":[]}'), finish_reason='stop',
+        )])
+        schema = {'type': 'object', 'properties': {'glossary': {
+            'type': 'array', 'maxItems': 6, 'items': {'type': 'object'},
+        }}}
+
+        result = OpenAIClient('http://localhost:8080/v1', 'm').complete_analysis(
+            messages=[{'role': 'user', 'content': 'Analyze subtitle data'}],
+            model='m', max_tokens=768, temperature=0.2, response_schema=schema,
+        )
+
+        assert result.content == '{"glossary":[]}'
+        request = sdk.chat.completions.create.call_args.kwargs
+        assert request['response_format'] == {'type': 'json_schema', 'json_schema': {
+            'name': 'story_context', 'strict': True, 'schema': schema,
+        }}
+        assert request['extra_body'] == {'chat_template_kwargs': {'enable_thinking': False}}
+        assert sdk.chat.completions.create.call_count == 1
+
+    @patch('translation.openai_client.OpenAI')
+    def test_analysis_requests_json_without_template_thinking(self, mock_openai):
+        sdk = mock_openai.return_value
+        sdk.chat.completions.create.return_value = MagicMock(choices=[MagicMock(
+            message=MagicMock(content='{"summary":"A greeting"}'), finish_reason='stop',
+        )])
+
+        result = OpenAIClient('http://localhost:8080/v1', 'm').complete_analysis(
+            messages=[{'role': 'user', 'content': 'Analyze subtitle data'}],
+            model='m', max_tokens=768, temperature=0.2,
+        )
+
+        assert result.content == '{"summary":"A greeting"}'
+        assert result.finish_reason == 'stop'
+        request = sdk.chat.completions.create.call_args.kwargs
+        assert request['extra_body'] == {'chat_template_kwargs': {'enable_thinking': False}}
+        assert request['max_tokens'] == 768
+        assert sdk.chat.completions.create.call_count == 1
+
+    @pytest.mark.parametrize('sdk_error', [False, True])
+    @pytest.mark.parametrize('content', [None, '{"summary":'])
+    @patch('translation.openai_client.OpenAI')
+    def test_analysis_still_reports_truncation_without_identical_retry(
+        self, mock_openai, sdk_error, content,
+    ):
+        from openai import LengthFinishReasonError
+
+        sdk = mock_openai.return_value
+        response = _truncated_response(content)
+        response.usage = None
+        if sdk_error:
+            sdk.chat.completions.create.side_effect = LengthFinishReasonError(completion=response)
+        else:
+            sdk.chat.completions.create.return_value = response
+
+        result = OpenAIClient('http://localhost:8080/v1', 'm').complete_analysis(
+            messages=[{'role': 'user', 'content': 'Analyze subtitle data'}],
+            model='m', max_tokens=768, temperature=0.2,
+        )
+
+        assert result.content == (content or '')
+        assert result.finish_reason == 'length'
+        assert sdk.chat.completions.create.call_count == 1
+
+    @pytest.mark.parametrize('method_name', ['complete', 'complete_with_metadata'])
+    @patch('translation.openai_client.OpenAI')
+    def test_other_completion_callers_keep_existing_template_settings(self, mock_openai, method_name):
+        sdk = mock_openai.return_value
+        sdk.chat.completions.create.return_value = MagicMock(choices=[MagicMock(
+            message=MagicMock(content='valid content'), finish_reason='stop',
+        )])
+        client = OpenAIClient('http://localhost:8080/v1', 'm')
+        getattr(client, method_name)(
+            messages=[{'role': 'user', 'content': 'Translate'}],
+            model='m', max_tokens=768, temperature=0.2,
+        )
+
+        assert 'extra_body' not in sdk.chat.completions.create.call_args.kwargs
+        assert 'response_format' not in sdk.chat.completions.create.call_args.kwargs
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "--tb=short"])

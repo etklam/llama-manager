@@ -135,6 +135,10 @@ movie_Traditional Chinese.srt   # 繁體中文翻譯
 
 全文理解模式只適用於 SRT，也適用於工作台的「Whisper → SRT → 翻譯」。TXT 會清楚記錄後使用原本的標準翻譯路徑。長 SRT 若無法放進單一 context window，會按連續 cue 分段全部讀取，再逐層合併背景；「每份檔案分析一次流程」因此不代表永遠只發出一個 API request，也不會只抽樣開頭或靜默截尾。
 
+全文分析、合併與 JSON 修復共用同一份完整欄位規格。若模型的 chat template 支援 thinking 控制，這些結構化分析請求會逐次停用 thinking，將輸出額度留給 JSON；不需重啟伺服器，也不會改動一般字幕翻譯的設定。
+
+支援標準 `response_format` 的伺服器會以 strict JSON Schema 約束背景輸出：最多保留 4 位人物、6 個術語、2 個語氣及 2 項不確定資訊，優先選擇重複出現且會影響翻譯的內容。這些上限只壓縮背景，不會少讀、截斷或略過來源字幕；程式仍會追蹤並驗證全文涵蓋範圍，也不會把不合規項目靜默刪除。伺服器拒絕 schema 或輸出仍無法驗證時，分析會明確失敗。
+
 分析與翻譯會分別顯示進度。Stop 會在模型請求之間生效；已送出的同步 HTTP request 仍需等待回覆或 timeout。分析失敗、取消或翻譯不完整時不會寫入輸出，也不會沿用上一個檔案的背景或自動降級成標準模式。
 
 工作台管線也接受 SRT，會直接跳過 Whisper；一般文字 `.txt` 請使用「字幕翻譯」分頁。
@@ -252,7 +256,7 @@ curl http://localhost:8080/v1/chat/completions \
 
 排查時請保留 `Batch ... failed`、`retry failed` 附近的日誌：連線／timeout、context 超限、回覆格式問題需要不同處理方式，單靠「保留原句」無法判斷上游原因。
 
-全文分析 JSON 若為空、格式無效、超過欄位上限或因 `finish_reason=length` 截斷，程式最多作一次格式修復後令該檔失敗，不會把半份摘要送入翻譯。容量使用 llama-server `/props` 回報的每個 request／slot `n_ctx`；不會把輸出用的 Max Tokens 當 context，也不會再按 Workers 除一次。舊 build 未回報容量時會在日誌明示使用保守估算；最小合法請求仍放不下時會明確失敗，不截斷原句。
+全文分析 JSON 若因 `finish_reason=length` 截斷，程式會縮小輸入並作有上限的分段分析；若 JSON 為空、格式無效或超過欄位上限，每次請求最多作一次格式修復，仍無法驗證便令該檔失敗，不會把半份摘要送入翻譯。容量使用 llama-server `/props` 回報的每個 request／slot `n_ctx`；不會把輸出用的 Max Tokens 當 context，也不會再按 Workers 除一次。舊 build 未回報容量時會在日誌明示使用保守估算；最小合法請求仍放不下時會明確失敗，不截斷原句。
 
 ### 伺服器無法啟動
 
