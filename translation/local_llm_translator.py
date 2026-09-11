@@ -836,6 +836,7 @@ class LocalLLMTranslator:
         recovery_contexts: Optional[List[str]] = None,
         cancel_check: Optional[Callable[[], bool]] = None,
         progress_callback: Optional[Callable] = None,
+        background_reduced: bool = False,
     ) -> List[Cue]:
         """Translate a batch of subtitle lines using YAML two-step format."""
         def _log(level, msg):
@@ -861,6 +862,7 @@ class LocalLLMTranslator:
                     return self._translate_batch_lines(
                         batch, target_language, log_callback, reduced_context,
                         recovery_contexts, cancel_check, progress_callback,
+                        background_reduced,
                     )
             if self._is_context_limit_error(error) and len(batch) > 1:
                 middle = len(batch) // 2
@@ -870,12 +872,21 @@ class LocalLLMTranslator:
                     self._translate_batch_lines(
                         batch[:middle], target_language, log_callback, context,
                         left_contexts, cancel_check, progress_callback,
+                        background_reduced,
                     )
                     + self._translate_batch_lines(
                         batch[middle:], target_language, log_callback, context,
                         right_contexts, cancel_check, progress_callback,
+                        background_reduced,
                     )
                 )
+            if self._is_context_limit_error(error) and not background_reduced:
+                reduced_context = self._compact_story_context(context)
+                if reduced_context != context:
+                    return self._translate_batch_lines(
+                        batch, target_language, log_callback, reduced_context,
+                        recovery_contexts, cancel_check, progress_callback, True,
+                    )
             if self._is_context_limit_error(error):
                 line = batch[0].line or 1
                 raise TranslationIncompleteError([
@@ -1086,6 +1097,27 @@ class LocalLLMTranslator:
             return context
         payload['nearby_source'] = []
         return json.dumps(payload, ensure_ascii=False, separators=(',', ':'))
+
+    @staticmethod
+    def _compact_story_context(context):
+        """Make one schema-preserving final fallback for a minimum request."""
+        if not context:
+            return context
+        try:
+            payload = json.loads(context)
+        except (TypeError, json.JSONDecodeError):
+            return context
+        story = payload.get('story_context') if isinstance(payload, dict) else None
+        if not isinstance(story, dict):
+            return context
+        summary = story.get('summary', '')
+        story['summary'] = summary[:128] if summary else ''
+        for field in ('characters', 'glossary', 'tone', 'uncertainties'):
+            value = story.get(field)
+            if isinstance(value, list):
+                story[field] = []
+        compact = json.dumps(payload, ensure_ascii=False, separators=(',', ':'))
+        return compact if compact != context else context
 
     @staticmethod
     def _parse_numbered_result(raw: str, expected_count: int) -> List[str]:

@@ -240,10 +240,14 @@ def test_server_context_error_splits_batch_instead_of_retrying_same_request():
 def test_minimum_request_context_error_fails_without_identical_retry():
     client = RecordingClient(
         _story_reply(), RuntimeError("n_ctx exceeded"),
+        RuntimeError("n_ctx exceeded after compact background"),
     )
     with pytest.raises(RuntimeError, match="context limit"):
         _story_translator(client).translate_srt(_cues("One"), "zh-tw")
-    assert len(client.calls) == 2
+    assert len(client.calls) == 3
+    first = client.calls[1]["messages"][1]["content"]
+    compact = client.calls[2]["messages"][1]["content"]
+    assert first != compact
 
 
 def test_failed_batch_recovers_each_line_with_the_same_story_context():
