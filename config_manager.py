@@ -54,6 +54,15 @@ DEFAULT_CONFIG = {
         'last_model': '',
         'language': 'auto',
         'threads': 8
+    },
+    # Where translation LLM requests go. `local` is the llama-server this app
+    # launches; `remote` is a saved OpenAI-compatible profile. Profiles never
+    # carry the key itself — only the name of the environment variable to read
+    # it from (see llm_target.py).
+    'llm': {
+        'mode': 'local',
+        'active_profile_id': '',
+        'profiles': []
     }
 }
 
@@ -269,6 +278,20 @@ class ConfigManager:
             if 'enabled' in trans_config:
                 if not isinstance(trans_config['enabled'], bool):
                     errors.append(f"'translation.enabled' must be a boolean, got {type(trans_config['enabled']).__name__}")
+
+        # Validate llm section if it exists
+        if 'llm' in self._config:
+            llm_config = self._config['llm']
+            if llm_config.get('mode', 'local') not in ('local', 'remote'):
+                errors.append("'llm.mode' must be 'local' or 'remote'")
+            if not isinstance(llm_config.get('profiles', []), list):
+                errors.append("'llm.profiles' must be a list")
+            for profile in llm_config.get('profiles', []) or []:
+                if not isinstance(profile, dict):
+                    errors.append("'llm.profiles' entries must be objects")
+                    break
+                if 'api_key' in profile or 'session_api_key' in profile:
+                    errors.append("llm profiles must not store API keys in config.json")
 
         return errors
 

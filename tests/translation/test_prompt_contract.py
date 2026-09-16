@@ -7,6 +7,7 @@ import pytest
 
 from constants import TARGET_LANGUAGES
 from config_helpers import build_translation_config
+from llm_target import LLMTarget, api_url_for_port
 from translation.local_llm_translator import LocalLLMTranslator
 from utils.srt_parser import Cue
 
@@ -14,7 +15,9 @@ from utils.srt_parser import Cue
 def make_translator(single_step=True):
     config = Mock()
     config.get.side_effect = lambda key, default: default
-    values = build_translation_config(config, 8080, 'test')
+    values = build_translation_config(config, LLMTarget(
+        mode='local', name='llama-server (local)',
+        api_url=api_url_for_port(8080), model='test'))
     values['single_step'] = single_step
     return LocalLLMTranslator(values, client=Mock())
 

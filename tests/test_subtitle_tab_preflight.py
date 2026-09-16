@@ -13,6 +13,7 @@ from unittest.mock import Mock, patch
 import time
 
 from subtitle_tab import SubtitleTranslationTab
+from llm_target import LLMTarget
 from translation.preflight import PreflightPlan
 from translation.server_probe import ServerInfo
 
@@ -39,15 +40,29 @@ class FakeConfig:
         self.values[key] = value
 
 
-def _config_for(*, workers=3, api_url='http://localhost:8080/v1'):
+def _target_for(api_url='http://localhost:8080/v1', model='test-model'):
+    return LLMTarget(mode='local', name='llama-server (local)',
+                     api_url=api_url, model=model)
+
+
+def _config_for(*, workers=3, api_url='http://localhost:8080/v1', target=None):
     """The dict _start_translation assembles on the UI thread and hands off.
 
     Built here rather than by calling _start_translation so these tests exercise
-    the preflight in isolation, without needing a real Tk thread.
+    the preflight in isolation, without needing a real Tk thread. Endpoint
+    fields mirror the target, the way build_translation_config would fill them.
     """
+    if target is not None:
+        api_url = target.api_url
+        model = target.model
+    else:
+        model = 'test-model'
     return {
         'api_url': api_url,
-        'model': 'test-model',
+        'model': model,
+        'api_key': target.api_key if target is not None else '',
+        'proxy': target.proxy if target is not None else None,
+        'target': target if target is not None else _target_for(api_url, model),
         'max_tokens': 16384,
         'temperature': 0.2,
         'batch_size': 15,
@@ -118,7 +133,7 @@ class TestPreflightBlocksRun:
                      info=ServerInfo(reachable=False,
                                      error="ConnectError: refused"))
 
-        with patch('subtitle_tab.run_preflight', return_value=plan), \
+        with patch('subtitle_tab.plan_for_target', return_value=plan), \
              patch('subtitle_tab.messagebox.showerror') as show_error, \
              patch('subtitle_tab.LocalLLMTranslator') as translator_cls:
             tab._preflight_and_translate(_config_for(workers=tab._workers_var.get()))
@@ -138,7 +153,7 @@ class TestPreflightBlocksRun:
         plan = _plan(reachable=False, workers=3, note="down",
                      info=ServerInfo(reachable=False, error="down"))
 
-        with patch('subtitle_tab.run_preflight', return_value=plan), \
+        with patch('subtitle_tab.plan_for_target', return_value=plan), \
              patch('subtitle_tab.messagebox.showerror'):
             tab._preflight_and_translate(_config_for(workers=tab._workers_var.get()))
 
@@ -150,7 +165,7 @@ class TestPreflightBlocksRun:
         tab = _make_tab()
         plan = _plan(reachable=True, workers=3, note=None)
 
-        with patch('subtitle_tab.run_preflight', return_value=plan), \
+        with patch('subtitle_tab.plan_for_target', return_value=plan), \
              patch('subtitle_tab.LocalLLMTranslator') as translator_cls:
             tab._preflight_and_translate(_config_for(workers=tab._workers_var.get()))
 
@@ -158,17 +173,17 @@ class TestPreflightBlocksRun:
         translator_cls.assert_called_once()
 
     def test_asks_for_one_plan_with_the_requested_workers(self):
-        """The tab calls the preflight module with the URL and requested count."""
+        """The tab hands the resolved target and requested count to preflight."""
         tab = _make_tab(workers=3)
         plan = _plan(reachable=True, workers=3, note=None)
 
-        with patch('subtitle_tab.run_preflight',
+        with patch('subtitle_tab.plan_for_target',
                    return_value=plan) as preflight, \
              patch('subtitle_tab.LocalLLMTranslator'):
             config = _config_for(workers=tab._workers_var.get())
             tab._preflight_and_translate(config)
 
-        preflight.assert_called_once_with(config['api_url'], 3)
+        preflight.assert_called_once_with(config['target'], 3)
 
     def test_unreachable_messagebox_shows_the_plan_note(self):
         """The plan's note is the text the user sees; the tab must not re-derive it."""
@@ -177,7 +192,7 @@ class TestPreflightBlocksRun:
         plan = _plan(reachable=False, workers=3, note=note,
                      info=ServerInfo(reachable=False, error="down"))
 
-        with patch('subtitle_tab.run_preflight', return_value=plan), \
+        with patch('subtitle_tab.plan_for_target', return_value=plan), \
              patch('subtitle_tab.messagebox.showerror') as show_error, \
              patch('subtitle_tab.LocalLLMTranslator'):
             tab._preflight_and_translate(_config_for(workers=tab._workers_var.get()))
@@ -194,7 +209,7 @@ class TestWorkerClamping:
         tab = _make_tab(workers=3)
         plan = _plan(reachable=True, workers=1, note="clamped")
 
-        with patch('subtitle_tab.run_preflight', return_value=plan), \
+        with patch('subtitle_tab.plan_for_target', return_value=plan), \
              patch('subtitle_tab.LocalLLMTranslator') as translator_cls:
             tab._preflight_and_translate(_config_for(workers=tab._workers_var.get()))
 
@@ -207,7 +222,7 @@ class TestWorkerClamping:
             info=ServerInfo(reachable=True, slots=3, context_size=5461),
         )
 
-        with patch('subtitle_tab.run_preflight', return_value=plan), \
+        with patch('subtitle_tab.plan_for_target', return_value=plan), \
              patch('subtitle_tab.LocalLLMTranslator') as translator_cls:
             tab._preflight_and_translate(_config_for(workers=3))
 
@@ -219,7 +234,7 @@ class TestWorkerClamping:
         plan = _plan(reachable=True, workers=1,
                      note="workers 3 → server 只有 1 slot，已調整為 1")
 
-        with patch('subtitle_tab.run_preflight', return_value=plan), \
+        with patch('subtitle_tab.plan_for_target', return_value=plan), \
              patch('subtitle_tab.LocalLLMTranslator'):
             tab._preflight_and_translate(_config_for(workers=tab._workers_var.get()))
 
@@ -229,7 +244,7 @@ class TestWorkerClamping:
         tab = _make_tab(workers=3)
         plan = _plan(reachable=True, workers=3, note=None)
 
-        with patch('subtitle_tab.run_preflight', return_value=plan), \
+        with patch('subtitle_tab.plan_for_target', return_value=plan), \
              patch('subtitle_tab.LocalLLMTranslator') as translator_cls:
             tab._preflight_and_translate(_config_for(workers=tab._workers_var.get()))
 
@@ -240,7 +255,7 @@ class TestWorkerClamping:
         tab = _make_tab(workers=3)
         plan = _plan(reachable=True, workers=3, note=None)
 
-        with patch('subtitle_tab.run_preflight', return_value=plan), \
+        with patch('subtitle_tab.plan_for_target', return_value=plan), \
              patch('subtitle_tab.LocalLLMTranslator') as translator_cls:
             tab._preflight_and_translate(_config_for(workers=tab._workers_var.get()))
 
@@ -259,7 +274,7 @@ class TestWorkerPersistence:
         tab = _make_tab(workers=3)
         plan = _plan(reachable=True, workers=1, note="clamped")
 
-        with patch('subtitle_tab.run_preflight', return_value=plan), \
+        with patch('subtitle_tab.plan_for_target', return_value=plan), \
              patch('subtitle_tab.LocalLLMTranslator'):
             config = _config_for(workers=tab._workers_var.get())
             tab._config_manager.set("ui.max_workers", config['max_workers'])
@@ -293,3 +308,50 @@ def test_analysis_progress_is_labeled_without_advancing_translation_fraction():
     label = tab._progress_label.config.call_args.kwargs['text']
     assert '分析第 4/4 段' in label
     assert 'lines/s' not in label
+
+
+class TestRemotePreflight:
+    """Remote targets go through plan_for_target's configuration check.
+
+    These do not patch plan_for_target: the point is that a remote run never
+    touches llama-server /props, and that a half-configured profile surfaces
+    as a plan naming the profile rather than a per-batch retry storm.
+    """
+
+    def test_incomplete_remote_profile_blocks_run_without_probing_props(self):
+        tab = _make_tab()
+        target = LLMTarget(mode='remote', name='OpenRouter', api_url='',
+                           model='', key_env='OPENROUTER_API_KEY')
+
+        with patch('subtitle_tab.LocalLLMTranslator') as translator_cls, \
+             patch('subtitle_tab.messagebox.showerror') as show_error, \
+             patch('translation.preflight.probe_server') as probe:
+            tab._preflight_and_translate(_config_for(target=target, workers=3))
+
+        probe.assert_not_called()
+        tab._run_translation.assert_not_called()
+        translator_cls.assert_not_called()
+        show_error.assert_called_once()
+        note = show_error.call_args[0][1]
+        assert 'OpenRouter' in note
+        assert 'OPENROUTER_API_KEY' in note
+
+    def test_configured_remote_profile_runs_without_local_server(self):
+        tab = _make_tab()
+        target = LLMTarget(mode='remote', name='OpenRouter',
+                           api_url='https://openrouter.ai/api/v1',
+                           model='provider/model', api_key='sk-session',
+                           max_workers=2)
+
+        with patch('subtitle_tab.LocalLLMTranslator') as translator_cls, \
+             patch('translation.preflight.probe_server') as probe:
+            tab._preflight_and_translate(_config_for(target=target, workers=2))
+
+        probe.assert_not_called()
+        tab._run_translation.assert_called_once()
+        config = translator_cls.call_args[0][0]
+        assert config['api_url'] == 'https://openrouter.ai/api/v1'
+        assert config['model'] == 'provider/model'
+        assert config['api_key'] == 'sk-session'
+        # Remote workers are the profile's decision; no slot clamp applies.
+        assert config['max_workers'] == 2

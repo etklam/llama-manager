@@ -13,7 +13,7 @@ from tkinterdnd2 import DND_FILES
 
 from utils.srt_parser import parse_srt_from_file, generate_srt_from_list, output_path_for
 from translation.local_llm_translator import LocalLLMTranslator
-from translation.preflight import run_preflight
+from translation.preflight import plan_for_target
 
 from constants import SUPPORTED_SUBTITLE, TARGET_LANGUAGES, SOURCE_LANGUAGES
 from ui_helpers import (
@@ -24,7 +24,19 @@ from config_helpers import (
     build_translation_config,
     context_mode_from_label,
 )
+from llm_target import (
+    MODE_LOCAL, MODE_REMOTE,
+    active_profile, current_mode, list_profiles, resolve_llm_target,
+    set_active_profile, set_mode,
+)
+from llm_settings_dialog import LLMSettingsDialog
 from file_listbox import FileListbox
+
+LLM_MODE_LABELS = {
+    MODE_LOCAL: '本地 llama-server',
+    MODE_REMOTE: '遠端 API',
+}
+LLM_MODE_FROM_LABEL = {label: mode for mode, label in LLM_MODE_LABELS.items()}
 
 
 class SubtitleTranslationTab(LogMixin, ttk.Frame):
@@ -50,10 +62,14 @@ class SubtitleTranslationTab(LogMixin, ttk.Frame):
         self._init_translator()
         self._create_ui()
 
+    def _current_target(self):
+        """The LLM endpoint this tab's next run uses, from the shared resolver."""
+        return resolve_llm_target(
+            self._config_manager, self._get_port, self._get_model)
+
     def _build_translation_config(self) -> dict:
         return build_translation_config(
-            self._config_manager, self._get_port(), self._get_model()
-        )
+            self._config_manager, self._current_target())
 
     def _init_translator(self):
         """Initialize the translator with current config."""
@@ -61,10 +77,11 @@ class SubtitleTranslationTab(LogMixin, ttk.Frame):
         self._translator = LocalLLMTranslator(config)
 
     def refresh_model(self):
-        """Refresh from current server model."""
+        """Refresh from current server model and LLM connection settings."""
         self._init_translator()
         self._update_model_display()
         self._sync_workers_from_config()
+        self._refresh_llm_profile_combo()
 
     def _sync_workers_from_config(self):
         """Pull ui.max_workers back into the slider.
@@ -223,13 +240,13 @@ class SubtitleTranslationTab(LogMixin, ttk.Frame):
         ttk.Label(self._adv_frame, text="并发数:").grid(
             row=1, column=3, sticky=tk.W, padx=(20, 5))
         self._workers_var = tk.IntVar(value=saved_workers)
-        workers_scale = ttk.Scale(self._adv_frame, from_=1, to=8,
+        self._workers_scale = ttk.Scale(self._adv_frame, from_=1, to=8,
                   variable=self._workers_var, orient=tk.HORIZONTAL,
                   length=120)
-        workers_scale.grid(row=1, column=4, sticky=tk.W)
+        self._workers_scale.grid(row=1, column=4, sticky=tk.W)
         self._workers_label = ttk.Label(self._adv_frame, text=str(saved_workers))
         self._workers_label.grid(row=1, column=5, padx=5)
-        workers_scale.configure(command=lambda v: self._workers_label.config(
+        self._workers_scale.configure(command=lambda v: self._workers_label.config(
             text=str(int(float(v)))))
 
         # Row 2: Fast mode checkbox
@@ -241,8 +258,42 @@ class SubtitleTranslationTab(LogMixin, ttk.Frame):
         self._adv_frame.grid_remove()  # Hidden by default
 
     def _create_control_section(self):
-        frame = ttk.Frame(self)
-        frame.grid(row=3, column=0, pady=(0, 5), sticky=tk.W)
+        container = ttk.Frame(self)
+        container.grid(row=3, column=0, pady=(0, 5), sticky=tk.W)
+
+        # Row 1: LLM connection. This is the app-wide switch: the pipeline
+        # card and this tab both consume the mode/profile selected here.
+        llm_row = ttk.Frame(container)
+        llm_row.pack(fill=tk.X, pady=(0, 4))
+
+        ttk.Label(llm_row, text="LLM 連線:").pack(side=tk.LEFT, padx=(0, 3))
+        mode = current_mode(self._config_manager)
+        self._llm_mode_var = tk.StringVar(
+            value=LLM_MODE_LABELS.get(mode, LLM_MODE_LABELS[MODE_LOCAL]))
+        self._llm_mode_combo = ttk.Combobox(
+            llm_row, textvariable=self._llm_mode_var,
+            values=list(LLM_MODE_LABELS.values()), state="readonly", width=14,
+        )
+        self._llm_mode_combo.pack(side=tk.LEFT, padx=(0, 6))
+        self._llm_mode_combo.bind(
+            '<<ComboboxSelected>>', self._on_llm_mode_changed)
+
+        self._llm_profile_var = tk.StringVar()
+        self._llm_profile_combo = ttk.Combobox(
+            llm_row, textvariable=self._llm_profile_var,
+            state="readonly", width=22,
+        )
+        self._llm_profile_combo.pack(side=tk.LEFT, padx=(0, 6))
+        self._llm_profile_combo.bind(
+            '<<ComboboxSelected>>', self._on_llm_profile_changed)
+
+        ttk.Button(llm_row, text="設定...",
+                   command=self._open_llm_settings).pack(side=tk.LEFT, padx=2)
+        self._refresh_llm_profile_combo()
+
+        # Row 2: run controls
+        frame = ttk.Frame(container)
+        frame.pack(fill=tk.X)
 
         ttk.Label(frame, text="翻譯模式:").pack(side=tk.LEFT, padx=(0, 3))
         self._context_mode_combo = ttk.Combobox(
@@ -263,6 +314,50 @@ class SubtitleTranslationTab(LogMixin, ttk.Frame):
                                     command=self._stop_translation,
                                     state="disabled")
         self._stop_btn.pack(side=tk.LEFT, padx=2)
+
+    # --- LLM connection controls ---
+
+    def _on_llm_mode_changed(self, event=None):
+        mode = LLM_MODE_FROM_LABEL.get(self._llm_mode_var.get(), MODE_LOCAL)
+        set_mode(self._config_manager, mode)
+        self._refresh_llm_profile_combo()
+        self._update_model_display()
+
+    def _on_llm_profile_changed(self, event=None):
+        name = self._llm_profile_var.get()
+        for profile in list_profiles(self._config_manager):
+            if profile.get('name') == name:
+                set_active_profile(self._config_manager, profile.get('id', ''))
+                break
+        self._update_model_display()
+
+    def _refresh_llm_profile_combo(self):
+        """Show saved profiles; the selector is meaningful only in remote mode."""
+        profiles = list_profiles(self._config_manager)
+        names = [p.get('name', '') for p in profiles]
+        self._llm_profile_combo['values'] = names
+        active = active_profile(self._config_manager)
+        if active is not None:
+            self._llm_profile_var.set(active.get('name', ''))
+        elif names:
+            self._llm_profile_combo.current(0)
+        else:
+            self._llm_profile_var.set('')
+        remote = current_mode(self._config_manager) == MODE_REMOTE
+        state = 'readonly' if remote and names else 'disabled'
+        self._llm_profile_combo.config(state=state)
+        # Worker count for a remote run comes from the profile, so the local
+        # slider would lie about what a run will do; grey it out instead.
+        if hasattr(self, '_workers_scale'):
+            self._workers_scale.state(('disabled',) if remote else ('!disabled',))
+
+    def _open_llm_settings(self):
+        LLMSettingsDialog(
+            self, self._config_manager, on_change=self._on_llm_settings_changed)
+
+    def _on_llm_settings_changed(self):
+        self._refresh_llm_profile_combo()
+        self._update_model_display()
 
     def _create_progress_section(self):
         frame = ttk.Frame(self)
@@ -292,6 +387,13 @@ class SubtitleTranslationTab(LogMixin, ttk.Frame):
         self._target_combo.bind('<<ComboboxSelected>>', self._on_language_changed)
 
     def _update_model_display(self):
+        if current_mode(self._config_manager) == MODE_REMOTE:
+            # In remote mode the translation model is the profile's model,
+            # not whichever GGUF the Server tab last loaded.
+            target = self._current_target()
+            model = target.model or "(no model configured)"
+            self._model_label.config(text=f"{target.name}: {model}")
+            return
         model = self._get_model()
         if model:
             self._model_label.config(text=model)
@@ -339,9 +441,8 @@ class SubtitleTranslationTab(LogMixin, ttk.Frame):
         # Read every Tk variable here, on the UI thread, and hand the plain dict
         # to the worker: the preflight below runs off-thread, and Tk variables
         # are not safe to touch from there.
-        config = build_translation_config(
-            self._config_manager, self._get_port(), self._get_model()
-        )
+        target = self._current_target()
+        config = build_translation_config(self._config_manager, target)
         config['batch_size'] = self._batch_var.get()
         config['temperature'] = self._temp_var.get()
         config['max_tokens'] = self._tokens_var.get()
@@ -350,8 +451,13 @@ class SubtitleTranslationTab(LogMixin, ttk.Frame):
         config['context_mode'] = context_mode_from_label(
             context_var.get() if context_var else config.get('context_mode', 'none')
         )
-        requested_workers = int(float(self._workers_var.get()))
-        config['max_workers'] = requested_workers
+        if target.mode == MODE_LOCAL:
+            requested_workers = int(float(self._workers_var.get()))
+            config['max_workers'] = requested_workers
+        else:
+            # Remote concurrency is the profile's max_workers; the (disabled)
+            # slider describes llama-server workers, not the provider's limits.
+            requested_workers = config['max_workers']
 
         self._translating = True
         self._stop_requested = False
@@ -368,8 +474,10 @@ class SubtitleTranslationTab(LogMixin, ttk.Frame):
             # Persist what the user asked for, not the value the clamp settles
             # on: the clamp reflects the server that happens to be running now,
             # and saving it would silently ratchet the slider down after one run
-            # against a single-slot server.
-            self._config_manager.set("ui.max_workers", requested_workers)
+            # against a single-slot server. Remote runs use the profile's
+            # workers, so the slider is not saved from that path at all.
+            if target.mode == MODE_LOCAL:
+                self._config_manager.set("ui.max_workers", requested_workers)
             self._config_manager.set("ui.single_step", config['single_step'])
             self._config_manager.set("ui.context_mode", config['context_mode'])
 
@@ -378,7 +486,7 @@ class SubtitleTranslationTab(LogMixin, ttk.Frame):
         thread.start()
 
     def _preflight_and_translate(self, config: dict):
-        """Probe the server, then run the batch. Runs on the worker thread.
+        """Preflight the LLM backend, then run the batch. Runs on the worker thread.
 
         The probe is here rather than in _start_translation because it is a
         network call: against a server that is down it costs about a second, and
@@ -387,13 +495,15 @@ class SubtitleTranslationTab(LogMixin, ttk.Frame):
         # Without this check, an unreachable server is discovered one batch at a
         # time: each batch spends three tenacity attempts with exponential
         # backoff before failing, so a long SRT takes minutes to report what was
-        # knowable before the first request.
-        plan = run_preflight(config['api_url'], config['max_workers'])
+        # knowable before the first request. In remote mode the plan is a
+        # configuration check that names the profile, never a llama-server
+        # probe.
+        plan = plan_for_target(config['target'], config['max_workers'])
         if not plan.reachable:
             message = plan.note or "no response"
             self._log("ERROR", message)
             self.winfo_toplevel().after(0, lambda: (
-                messagebox.showerror("Server not reachable", message),
+                messagebox.showerror("LLM not ready", message),
                 self._on_translation_aborted(),
             ))
             return

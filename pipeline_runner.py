@@ -12,12 +12,13 @@ from whisper_transcription import (
 )
 from transcription_runner import TranscriptionPresenter, TranscriptionRunner
 from translation.local_llm_translator import LocalLLMTranslator
-from translation.preflight import PreflightPlan, run_preflight
+from translation.preflight import PreflightPlan, plan_for_target, run_preflight
 from utils.srt_parser import parse_srt_from_file, generate_srt_from_list, output_path_for
 from config_manager import ConfigManager
 
 from constants import SUPPORTED_MEDIA
-from config_helpers import api_url_for_port, build_translation_config
+from config_helpers import build_translation_config
+from llm_target import LLMTarget, resolve_llm_target
 from whisper_policy import chunking_enabled
 
 SERVER_READY_TIMEOUT_SECONDS = 120.0
@@ -108,6 +109,7 @@ class PipelineRunner:
         self._preflight_plan: Optional[PreflightPlan] = None
         self._context_mode_snapshot = 'none'
         self._translation_config_snapshot: Optional[Dict] = None
+        self._target_snapshot: Optional[LLMTarget] = None
 
     @property
     def running(self) -> bool:
@@ -133,6 +135,17 @@ class PipelineRunner:
             if self._stop_event.wait(min(SERVER_READY_POLL_SECONDS, remaining)):
                 break
         return None
+
+    def _wait_for_ready(self, target, requested_workers):
+        """Preflight the backend the target names, waiting only when waiting helps.
+
+        A local llama-server may still be loading a model, so retrying the
+        probe pays off; a remote API has no cold start to wait through, so its
+        plan (a configuration check) is returned immediately.
+        """
+        if target.mode == 'remote':
+            return plan_for_target(target, requested_workers)
+        return self._wait_for_server(target.api_url, requested_workers)
 
     def run(
         self,
@@ -168,14 +181,17 @@ class PipelineRunner:
         try:
             model_path = self._resolve_whisper_model_path(whisper_model_dir, whisper_model_name)
             # Preflight once per run, before any transcription. The caller
-            # checks that the server process is up, but a process that is still
-            # loading a model answers nothing: without this, the failure only
-            # surfaces after Whisper has finished, as a retry storm during
-            # translation. The probe's slot count also sizes the translator's
-            # worker pool.
-            api_url = api_url_for_port(self._get_port())
-            requested_workers = self._config_manager.get('ui.max_workers', 3)
-            plan = self._wait_for_server(api_url, requested_workers)
+            # checks that the server process is up (local mode), but a process
+            # that is still loading a model answers nothing: without this, the
+            # failure only surfaces after Whisper has finished, as a retry
+            # storm during translation. The resolved target decides which
+            # preflight runs — the /props probe and its slot count for a local
+            # llama-server, a configuration check for a remote profile.
+            target = resolve_llm_target(
+                self._config_manager, self._get_port, self._get_current_model
+            )
+            requested_workers = target.max_workers
+            plan = self._wait_for_ready(target, requested_workers)
             if plan is None or self._stop_requested:
                 return
             if not plan.reachable:
@@ -186,8 +202,9 @@ class PipelineRunner:
                 self._on_progress(f"Error: {message}")
                 return
             self._preflight_plan = plan
+            self._target_snapshot = target
             self._translation_config_snapshot = build_translation_config(
-                self._config_manager, self._get_port(), self._get_current_model()
+                self._config_manager, target
             )
             self._translation_config_snapshot['max_workers'] = plan.workers
             self._translation_config_snapshot['context_size'] = plan.info.context_size
@@ -317,11 +334,18 @@ class PipelineRunner:
     ) -> bool:
         """Parse, translate, and save a subtitle file when it completes."""
         snapshot = getattr(self, '_translation_config_snapshot', None)
+        target = getattr(self, '_target_snapshot', None)
         config = dict(snapshot) if snapshot is not None else build_translation_config(
-            self._config_manager, self._get_port(), self._get_current_model()
+            self._config_manager,
+            target or resolve_llm_target(
+                self._config_manager, self._get_port, self._get_current_model
+            ),
         )
 
         if not config.get('model'):
+            if target is not None and target.mode == 'remote':
+                raise RuntimeError(
+                    "No model configured - set one in the active remote profile")
             raise RuntimeError("No model loaded - select a model on the Server tab")
 
         # Align workers with the plan's decision. Workers past the server's slot

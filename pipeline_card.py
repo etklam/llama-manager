@@ -12,6 +12,7 @@ from pipeline_runner import PipelineRunner
 from constants import (
     SUPPORTED_MEDIA, SUPPORTED_SUBTITLE, WHISPER_LANGUAGES, TARGET_LANGUAGES,
 )
+from llm_target import current_mode, resolve_llm_target
 from ui_helpers import populate_language_combo, extract_combo_code
 from config_helpers import CONTEXT_MODE_LABELS, context_mode_from_label
 from file_listbox import FileListbox
@@ -121,6 +122,11 @@ class PipelineCard(ttk.LabelFrame):
         )
         self._pipe_context_mode_combo.pack(side=tk.LEFT)
 
+        # Mirrors the Subtitle tab's selector read-only: this card consumes
+        # whatever LLM backend it selected, it does not offer a second switch.
+        self._llm_label = ttk.Label(mode_row, text="", foreground="gray")
+        self._llm_label.pack(side=tk.RIGHT)
+
         self._pipe_status_label = ttk.Label(self, text="Ready", foreground="gray")
         self._pipe_status_label.grid(row=5, column=0, columnspan=2, sticky=tk.W, pady=(5, 0))
 
@@ -143,6 +149,20 @@ class PipelineCard(ttk.LabelFrame):
             self._pipe_wmodel_var.set(last)
         elif names:
             self._pipe_wmodel_combo.current(0)
+        self._refresh_llm_label()
+
+    def _refresh_llm_label(self):
+        """Show which LLM backend a run will use (remote name, or local)."""
+        try:
+            target = resolve_llm_target(
+                self._config, self._get_port, self._get_current_model)
+            if target.mode == 'remote':
+                self._llm_label.config(
+                    text=f"LLM: {target.name} · {target.model or '(no model)'}")
+            else:
+                self._llm_label.config(text="LLM: 本地 llama-server")
+        except Exception:
+            self._llm_label.config(text="")
 
     # ------------------------------------------------------- File management
     def _sync_pipe_files(self):
@@ -170,7 +190,9 @@ class PipelineCard(ttk.LabelFrame):
     def _start_pipeline(self):
         if self._pipeline_runner and self._pipeline_runner.running:
             return
-        if not self._get_server_running():
+        # The local llama-server is part of the run only in local mode; a
+        # remote profile needs no process to be up.
+        if current_mode(self._config) == 'local' and not self._get_server_running():
             messagebox.showwarning("Warning", "Start the llama server first!")
             return
         if not self._pipe_files:
@@ -189,7 +211,10 @@ class PipelineCard(ttk.LabelFrame):
 
         self._pipe_start_btn.config(state="disabled")
         self._pipe_stop_btn.config(state="normal")
-        self._pipe_status_label.config(text="Checking llama-server...", foreground="blue")
+        self._pipe_status_label.config(
+            text=("Checking LLM connection..." if current_mode(self._config) == 'remote'
+                  else "Checking llama-server..."),
+            foreground="blue")
 
         self._pipeline_runner = PipelineRunner(
             config_manager=self._config,

@@ -5,12 +5,18 @@ from unittest.mock import Mock
 import pytest
 
 from config_helpers import build_translation_config
+from llm_target import LLMTarget, api_url_for_port
 from translation.local_llm_translator import LocalLLMTranslator
 from utils.srt_parser import Cue
 
 
+def _local_target(model='test'):
+    return LLMTarget(mode='local', name='llama-server (local)',
+                     api_url=api_url_for_port(8080), model=model)
+
+
 def translator_with(*responses, **overrides):
-    config = build_translation_config(NoneConfig(), 8080, "test")
+    config = build_translation_config(NoneConfig(), _local_target())
     config['max_workers'] = 1
     config.update(overrides)
     client = Mock()

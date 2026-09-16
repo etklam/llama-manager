@@ -4,6 +4,7 @@ import re
 import pytest
 
 from config_helpers import build_translation_config
+from llm_target import LLMTarget, api_url_for_port
 from translation import story_context as story_context_module
 from translation.local_llm_translator import LocalLLMTranslator
 from translation.llm_client import CompletionResult
@@ -21,6 +22,11 @@ from utils.srt_parser import Cue
 class _Config:
     def get(self, key, default=None):
         return default
+
+
+def _local_target(model="test"):
+    return LLMTarget(mode='local', name='llama-server (local)',
+                     api_url=api_url_for_port(8080), model=model)
 
 
 class RecordingClient:
@@ -73,7 +79,7 @@ def test_story_mode_analyzes_short_srt_before_translating_with_its_context():
         _story_reply(),
         "- id: 1\n  translation: 你好\n- id: 2\n  translation: 再見",
     )
-    config = build_translation_config(_Config(), 8080, "test")
+    config = build_translation_config(_Config(), _local_target())
     config.update({
         "context_mode": "story",
         "context_size": 16384,
@@ -114,7 +120,7 @@ def test_story_mode_propagates_populated_character_and_glossary_context():
 
 
 def _story_translator(client, **overrides):
-    config = build_translation_config(_Config(), 8080, "test")
+    config = build_translation_config(_Config(), _local_target())
     config.update({
         "context_mode": "story", "context_size": 16384,
         "max_workers": 1, "batch_size": 15,
@@ -125,7 +131,7 @@ def _story_translator(client, **overrides):
 
 def test_standard_mode_adds_no_analysis_call():
     client = RecordingClient("- id: 1\n  translation: 你好")
-    config = build_translation_config(_Config(), 8080, "test")
+    config = build_translation_config(_Config(), _local_target())
     config["max_workers"] = 1
     result = LocalLLMTranslator(config, client=client).translate_srt(
         _cues("Hello"), "zh-tw"
@@ -271,7 +277,7 @@ def test_standard_translation_does_not_use_analysis_completion():
             return "- id: 1\n  translation: 你好"
 
     client = DualPurposeClient()
-    config = build_translation_config(_Config(), 8080, "test")
+    config = build_translation_config(_Config(), _local_target())
     config["max_workers"] = 1
 
     result = LocalLLMTranslator(config, client=client).translate_srt(

@@ -17,6 +17,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional
 
+from llm_target import MODE_REMOTE, LLMTarget
 from translation.server_probe import (
     ServerInfo,
     clamp_workers,
@@ -64,4 +65,54 @@ def run_preflight(api_url: str, requested_workers: int) -> PreflightPlan:
         workers=workers,
         info=info,
         note=clamp_note,
+    )
+
+
+def plan_for_target(target: LLMTarget, requested_workers: int) -> PreflightPlan:
+    """Decide the preflight plan for whichever backend `target` names.
+
+    This is the one place the backend split reaches the preflight: local keeps
+    the whole /props probe→clamp→cold-start-tolerant flow above, while remote
+    never calls llama-server /props, never clamps workers to llama-server
+    slots, and never polls for a model load — a remote API is either
+    configured or it is not, and connection failures belong to the
+    OpenAI-compatible client, not to a probe guessing at llama.cpp semantics.
+    """
+    if target.mode == MODE_REMOTE:
+        return _plan_remote(target, requested_workers)
+    return run_preflight(target.api_url, requested_workers)
+
+
+def _plan_remote(target: LLMTarget, requested_workers: int) -> PreflightPlan:
+    """Validate a remote target's configuration, with the profile named.
+
+    No network call: /models and /props semantics differ per provider, so a
+    probe would reject valid endpoints. Instead the plan reports what is
+    knowable locally — profile, base URL, model, and whether a credential was
+    found — and leaves live failures to the client, which reports them with
+    the endpoint attached.
+    """
+    problems = []
+    if not target.api_url:
+        problems.append("base URL is empty")
+    if not target.model:
+        problems.append("model is empty")
+    if target.key_env and not target.api_key:
+        problems.append(
+            f"API key not found (enter a session key or set {target.key_env})"
+        )
+
+    if problems:
+        detail = "; ".join(problems)
+        return PreflightPlan(
+            reachable=False,
+            workers=requested_workers,
+            info=ServerInfo(reachable=False, error=detail),
+            note=f"遠端 LLM 設定不完整 ({target.name}): {detail}",
+        )
+
+    return PreflightPlan(
+        reachable=True,
+        workers=requested_workers,
+        info=ServerInfo(reachable=True),
     )

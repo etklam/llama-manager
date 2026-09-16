@@ -138,3 +138,30 @@ def test_resolve_whisper_model_path_uses_the_shared_registry_lookup():
     assert card._resolve_whisper_model_path("D:/models", "tiny") == "D:/models/tiny.bin"
     assert card._resolve_whisper_model_path("D:/models", "other.bin") == str(
         Path("D:/models") / "other.bin")
+
+
+class TestStartGate:
+    """The llama-server requirement belongs to local mode only."""
+
+    def _card_for_start(self, *, mode):
+        card = object.__new__(PipelineCard)
+        card._config = Mock()
+        card._config.get.side_effect = lambda key, default=None: (
+            mode if key == 'llm.mode' else default)
+        card._pipeline_runner = None
+        card._get_server_running = lambda: False
+        card._pipe_files = []  # empty: the run stops at the next check
+        return card
+
+    def test_local_mode_requires_the_server_process(self):
+        card = self._card_for_start(mode='local')
+        with patch('pipeline_card.messagebox.showwarning') as warn:
+            PipelineCard._start_pipeline(card)
+        assert warn.call_args[0][1] == "Start the llama server first!"
+
+    def test_remote_mode_passes_the_server_gate_without_llama_server(self):
+        card = self._card_for_start(mode='remote')
+        with patch('pipeline_card.messagebox.showwarning') as warn:
+            PipelineCard._start_pipeline(card)
+        # The gate passed; the run stopped only at the empty file list.
+        assert warn.call_args[0][1] == "Select files first!"

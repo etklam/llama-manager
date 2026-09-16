@@ -13,23 +13,25 @@ def context_mode_from_label(value):
     return 'none'
 
 
-def api_url_for_port(port):
-    """Base URL of the local llama-server's OpenAI-compatible API.
+def build_translation_config(config_manager, target):
+    """Translate-run settings, with the LLM endpoint supplied by `target`.
 
-    Shared so the preflight probe and the translator cannot end up pointing at
-    different endpoints.
+    Consumers no longer decide where the LLM lives: llm_target.resolve_llm_target
+    produced the target (local llama-server or a remote profile), and this
+    builder spreads it into the config dict the translator reads. Everything
+    else is UI-level translation tuning, identical for both backends.
     """
-    return f'http://localhost:{port}/v1'
-
-
-def build_translation_config(config_manager, port, model):
     return {
-        'api_url': api_url_for_port(port),
-        'model': model,
+        # Backend selection, concentrated here and in llm_target.
+        'api_url': target.api_url,
+        'model': target.model,
+        'api_key': target.api_key,
+        'proxy': target.proxy,
+        'target': target,
         'max_tokens': config_manager.get('ui.max_tokens', 16384),
         'temperature': config_manager.get('ui.temperature', 0.2),
         'batch_size': config_manager.get('ui.batch_size', 15),
-        'max_workers': config_manager.get('ui.max_workers', 3),
+        'max_workers': target.max_workers,
         'single_step': config_manager.get('ui.single_step', True),
         'context_mode': context_mode_from_label(
             config_manager.get('ui.context_mode', 'none')

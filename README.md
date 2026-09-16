@@ -164,6 +164,15 @@ movie_Traditional Chinese.srt   # 繁體中文翻譯
 
 若要評估實際品質，請固定同一模型、同一 SRT、目標語言、Temperature 與快速／兩步設定，各跑一次標準及全文理解翻譯。人工抽查約 30–50 個省略主語、跨批次指代、重複人名／術語及跨場景同句，分別記錄錯指代、稱呼不一致、誤補劇情、漏句與總耗時。Mock 測試只驗證管線與 prompt contract，不代表翻譯準確度已提升。
 
+### LLM 連線：本地 llama-server 或遠端 API
+
+「字幕翻譯」分頁的 **LLM 連線** 選擇翻譯使用的後端，**字幕翻譯** 與 **Quick Whisper → Translate** 兩處共用同一選擇：
+
+- **本地 llama-server**（預設）：沿用既有流程 — 啟動前探測 `/props`、按伺服器槽數調整 Workers、等待模型載入。
+- **遠端 API**：使用已儲存的 OpenAI 相容端點設定檔，不需要本地 llama-server。Workers 使用設定檔的並發數，不探測 `/props`、不等待冷啟動；設定不完整（缺少 Base URL、模型或金鑰）會在啟動前以設定檔名稱提示。
+
+點 **設定...** 管理設定檔（名稱、Base URL、模型、API Key 環境變數、Proxy、並發數）。Base URL 貼上整條 `/v1/chat/completions` 或 `/chat/completions` 結尾會自動歸一化。API Key 不會存入 `config.json`：填 **API Key 環境變數** 名稱供每次啟動讀取，或在設定檔對話框輸入 **Session API Key**（僅本次執行有效，優先於環境變數）。
+
 ### 日誌與失敗處理
 
 工作台右上角 **診斷日誌** 可查看所有分頁的詳細訊息。分頁內的日誌只顯示對應工作。
@@ -207,6 +216,7 @@ movie_Traditional Chinese.srt   # 繁體中文翻譯
 - `whisper`：CLI 路徑、模型目錄、語言、執行緒數、長音訊分段選項。
 - `ui`：最後選擇的文字模型、目標語言及翻譯參數。
 - `ui.context_mode`：`none`（標準翻譯）或 `story`（全文理解翻譯）；舊設定缺少時使用 `none`。
+- `llm`：翻譯後端 — `mode`（`local`／`remote`）、`active_profile_id` 與 `profiles`（遠端 OpenAI 相容端點設定檔）。設定檔只存 `api_key_env` 環境變數名稱，不存金鑰本身；舊設定缺少時使用 `local`。
 - `pipeline`：管線語言、目標語言與覆寫選項。
 
 一般透過 GUI 設定即可。手動編輯前先關閉程式；llama-server 執行路徑仍須按安裝步驟修改 `llama_manager.py`。

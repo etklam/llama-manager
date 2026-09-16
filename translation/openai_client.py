@@ -218,7 +218,9 @@ class OpenAIClient:
                 'recovering its completion metadata'
             )
         except Exception as e:
-            logger.error(f'[OpenAIClient] API call failed: {e}')
+            # The endpoint rides along so a remote-profile failure names the
+            # provider instead of surfacing as a bare "connection error".
+            logger.error(f'[OpenAIClient] API call failed ({self.api_url}): {e}')
             raise
 
         # Validate response
