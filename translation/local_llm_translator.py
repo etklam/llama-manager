@@ -15,11 +15,10 @@ import logging
 import re
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 from typing import Callable, List, Dict, Optional, TYPE_CHECKING
-
-from tenacity import RetryError
 
 # Import LLMClient port for type checking
 if TYPE_CHECKING:
@@ -32,7 +31,13 @@ from translation.story_context import (
     StoryContextAnalyzer,
     StoryContextError,
     build_translation_context,
+    estimate_messages_tokens,
     request_fits,
+)
+from translation.transport import (
+    ContextLengthError,
+    FatalProviderError,
+    ProviderUnavailableError,
 )
 from utils.srt_parser import Cue, collapse_repeats
 
@@ -77,6 +82,15 @@ class TranslationIncompleteError(RuntimeError):
 
 class TranslationCancelledError(RuntimeError):
     """A translation run was cancelled before it could be committed."""
+
+
+class TxtTooLargeError(RuntimeError):
+    """Full-text input cannot fit the context window.
+
+    Oversized TXT is rejected explicitly instead of being silently
+    truncated; an unbounded long-document implementation is out of scope
+    for this hardening phase.
+    """
 
 
 def _rebuild_cue(entry: Cue, text: str, fallback_line: int = 0) -> Cue:
@@ -155,6 +169,54 @@ class LocalLLMTranslator:
         # Store injected client or create OpenAIClient lazily
         self._injected_client = client
         self._openai_client = None  # OpenAIClient instance (will be created lazily if needed)
+        # The active run's cancellation token, checked before every HTTP
+        # dispatch. Set by translate_srt/translate_full_text for the run's
+        # lifetime only; None between runs.
+        self._run_cancel_check: Optional[Callable[[], bool]] = None
+
+    def close(self) -> None:
+        """Close the HTTP client this translator created.
+
+        Injected clients are never closed here: their owner decides their
+        lifetime. Idempotent.
+        """
+        if self._openai_client is not None:
+            self._openai_client.close()
+            self._openai_client = None
+
+    @contextmanager
+    def _cancellation_scope(self, cancel_check: Optional[Callable[[], bool]]):
+        """Bind the run's cancellation token to this translator and client.
+
+        The token is checked before every HTTP dispatch and between
+        transport retries (the transport policy reads it off the adapter),
+        and by the translator itself before batch dispatches, context-limit
+        splits, and per-line recovery. Restored to the previous state on
+        exit so a reused translator never carries a stale token.
+        """
+        previous_run_token = self._run_cancel_check
+        self._run_cancel_check = cancel_check
+        client = self._get_llm_client()
+        supports_token = hasattr(client, 'cancel_check')
+        previous_client_token = (getattr(client, 'cancel_check', None)
+                                 if supports_token else None)
+        if supports_token:
+            client.cancel_check = cancel_check
+        try:
+            yield
+        finally:
+            # Restore, not clear: translate_srt recurses through itself for
+            # deduplication, and the outer run's token must survive the
+            # inner scope's exit.
+            self._run_cancel_check = previous_run_token
+            if supports_token:
+                client.cancel_check = previous_client_token
+
+    def _check_run_cancelled(self) -> None:
+        """Raise if the active run's token fired. No-op between runs."""
+        if self._run_cancel_check is not None and self._run_cancel_check():
+            raise TranslationCancelledError(
+                'translation cancelled before request dispatch')
 
     def _get_llm_client(self) -> 'LLMClient':
         """
@@ -247,10 +309,11 @@ class LocalLLMTranslator:
         """
         Call the LLM API via the client port.
 
-        Retry semantics belong to the client adapter: OpenAIClient's tenacity
-        decorator owns the retry loop and, once exhausted, raises RetryError.
-        This is the one place the translator unwraps that envelope so callers
-        of the port see the underlying failure, not tenacity's wrapper.
+        Retry semantics belong to the client adapter's transport policy
+        (translation.transport): bounded, classified, cancel-aware retries
+        with no second owner here. The run's cancellation token is checked
+        before the dispatch so a Stop that landed between requests prevents
+        this one from ever leaving.
 
         Args:
             messages: List of message dictionaries
@@ -261,11 +324,15 @@ class LocalLLMTranslator:
             Raw response text
 
         Raises:
+            TranslationCancelledError: The run token fired before dispatch
             RuntimeError: If the API call fails or returns invalid response
-            LengthFinishReasonError: If the client reports a truncated
-                response with no usable content (the adapter does not retry a
-                length stop, so this propagates unwrapped)
+            FatalProviderError / ProviderUnavailableError: The provider
+                rejected the request or stayed unreachable after retries
         """
+        # Checked on the worker thread right before the request leaves, so
+        # cancellation has a boundary at every HTTP dispatch.
+        self._check_run_cancelled()
+
         # Use the LLMClient port (injected or created)
         client = self._get_llm_client()
 
@@ -276,19 +343,13 @@ class LocalLLMTranslator:
                 max_tokens=max_tokens if max_tokens is not None else self.max_tokens,
                 temperature=self.temperature
             )
-
-            logger.debug(f'[LocalLLM] Response: {response}')
-
-        except RetryError as e:
-            # Tenacity wraps the final failure in RetryError once the adapter
-            # exhausts its retries; surface that underlying exception.
-            if e.last_attempt.exception():
-                logger.error(f'[LocalLLM] API call failed after retries: {e.last_attempt.exception()}')
-                raise e.last_attempt.exception()
-            raise
         except Exception as e:
-            logger.error(f'[LocalLLM] API call failed: {e}')
+            logger.error(f'[LocalLLM] API call failed: {type(e).__name__}: {e}')
             raise
+
+        # Log size only: full response text is sensitive source material.
+        if response:
+            logger.debug('[LocalLLM] Response: %d chars', len(response))
 
         # Validate response - response should be a string
         if not isinstance(response, str):
@@ -346,7 +407,10 @@ class LocalLLMTranslator:
             if not item:
                 continue
 
-            # Extract id (optional - the model may omit it)
+            # Extract id (optional - the model may omit it). The fallback id
+            # stays positional for single-entry callers, but the flag records
+            # whether the model actually echoed one: batch mapping must not
+            # trust a position-derived id (see _translate_batch_lines).
             id_match = re.search(r'^[ \t]*id:[ \t]*(\d+)', item, re.MULTILINE)
             item_id = int(id_match.group(1)) if id_match else len(results) + 1
 
@@ -382,6 +446,7 @@ class LocalLLMTranslator:
 
             results.append({
                 'id': item_id,
+                'explicit_id': bool(id_match),
                 'step1': step1,
                 'step2': step2,
             })
@@ -494,6 +559,101 @@ class LocalLLMTranslator:
         # Last resort: return raw result
         return raw_result
 
+    def translate_full_text(
+        self,
+        text: str,
+        target_language: str,
+        cancel_check: Optional[Callable[[], bool]] = None,
+        log_callback: Optional[Callable] = None,
+    ) -> str:
+        """Translate one full text document (TXT path) in a single request.
+
+        Full-text budgets and completeness are deliberately separate from
+        the short-subtitle recovery path: a document is one request, sized
+        against the context window up front, and a response that stopped at
+        the token limit is incomplete output, never a completed file.
+
+        Raises:
+            TxtTooLargeError: the request cannot fit the context window.
+                Oversized documents are rejected explicitly; an unbounded
+                long-document implementation is out of scope here.
+            TranslationIncompleteError: the model stopped at the token
+                limit before finishing, so nothing may be published.
+        """
+        def _log(level, msg):
+            if log_callback:
+                log_callback(level, msg)
+
+        if not text or not text.strip():
+            return ''
+        if target_language is None:
+            raise ValueError("target_language cannot be None")
+
+        messages = self._build_single_prompt(text, target_language, None)
+        # A document is one request with an output budget sized to its
+        # source: a translation runs about as long as its input, so the
+        # configured ceiling only caps genuinely huge documents. The
+        # finish-reason completeness check below is what protects content,
+        # not a generous token budget.
+        output_tokens = min(
+            self.max_tokens,
+            max(MIN_DYNAMIC_MAX_TOKENS, estimate_messages_tokens(messages)),
+        )
+        if not request_fits(messages, self.context_size, output_tokens):
+            raise TxtTooLargeError(
+                "TXT exceeds the model's context window "
+                f"(estimated request + {output_tokens} output tokens does "
+                "not fit); long-document translation is not supported — "
+                "split the file instead"
+            )
+
+        client = self._get_llm_client()
+
+        # Prefer metadata so a token-limit stop can be told apart from a
+        # natural finish; fall back to the plain port for other clients.
+        metadata_method = getattr(type(client), 'complete_with_metadata', None)
+        with self._cancellation_scope(cancel_check):
+            self._check_run_cancelled()
+            if callable(metadata_method):
+                result = client.complete_with_metadata(
+                    messages=messages, model=self._api_model,
+                    max_tokens=output_tokens, temperature=self.temperature,
+                )
+                raw_result, finish_reason = result.content, result.finish_reason
+            else:
+                raw_result = client.complete(
+                    messages=messages, model=self._api_model,
+                    max_tokens=output_tokens, temperature=self.temperature,
+                )
+                finish_reason = None
+
+        if not raw_result or not raw_result.strip():
+            raise RuntimeError("model returned an empty document translation")
+
+        if finish_reason == 'length':
+            # The document stopped mid-generation. Unlike a subtitle batch,
+            # there is no per-cue recovery that could salvage the tail, so
+            # publishing any part of it would present a truncated document
+            # as a complete translation.
+            _log("ERROR", "TXT translation stopped at the max-token limit; "
+                          "output not saved")
+            raise TranslationIncompleteError([
+                (0, 'document translation stopped at the max-token limit')
+            ])
+
+        parsed = self._parse_yaml_result(raw_result)
+        if parsed and parsed[0].get('step2'):
+            return parsed[0]['step2']
+        if parsed and parsed[0].get('step1'):
+            return parsed[0]['step1']
+        match = re.search(
+            r'<TRANSLATE_TEXT>(.*?)</TRANSLATE_TEXT>',
+            raw_result, re.DOTALL | re.IGNORECASE
+        )
+        if match:
+            return match.group(1).strip()
+        return raw_result
+
     def translate_batch(
         self,
         texts: List[str],
@@ -547,6 +707,10 @@ class LocalLLMTranslator:
         Translates in batches with concurrent execution (ThreadPoolExecutor),
         with automatic fallback to individual translation on batch failure.
 
+        The run's cancellation token is bound to the translator and its HTTP
+        client for the duration of the call, so every dispatch, transport
+        retry, split and recovery below can observe it.
+
         Args:
             srt_data: List of Cue objects (see utils.srt_parser)
             target_language: Target language name
@@ -556,6 +720,25 @@ class LocalLLMTranslator:
         Returns:
             List of Cue objects with translated text (step2/意译)
         """
+        if not srt_data:
+            # Return before binding a run scope: no client needs to exist
+            # for an empty input.
+            return []
+        with self._cancellation_scope(cancel_callback):
+            return self._translate_srt_run(
+                srt_data, target_language, progress_callback, log_callback,
+                cancel_callback, _deduplicate)
+
+    def _translate_srt_run(
+        self,
+        srt_data: List[Cue],
+        target_language: str,
+        progress_callback: Optional[Callable] = None,
+        log_callback: Optional[Callable] = None,
+        cancel_callback: Optional[Callable[[], bool]] = None,
+        _deduplicate: bool = True
+    ) -> List[Cue]:
+        """translate_srt's implementation; see there for the contract."""
         if not isinstance(srt_data, list):
             raise ValueError("srt_data must be a list")
 
@@ -722,8 +905,12 @@ class LocalLLMTranslator:
 
         # Keep at most `workers` requests submitted.  This preserves concurrency
         # while giving Stop a request boundary at which no further batch starts.
+        # A fatal or persistent provider failure (auth, invalid model,
+        # retries exhausted) stops dispatching the same way: expanding it
+        # into N per-cue requests would only multiply identical failures.
         batch_results: Dict[int, List[Cue]] = {}
         batch_errors: Dict[int, Exception] = {}
+        fatal_error: Optional[Exception] = None
         done_lines = 0
         with ThreadPoolExecutor(max_workers=workers) as executor:
             futures = {}
@@ -731,7 +918,8 @@ class LocalLLMTranslator:
 
             def submit_next():
                 nonlocal next_batch_idx
-                if next_batch_idx >= len(batch_plan) or _cancelled():
+                if (next_batch_idx >= len(batch_plan) or _cancelled()
+                        or fatal_error is not None):
                     return False
                 batch_idx = next_batch_idx
                 _, batch, context, recovery_contexts = batch_plan[batch_idx]
@@ -760,7 +948,15 @@ class LocalLLMTranslator:
                              f"({batch_start_global}-{batch_end_global})")
                     except Exception as e:
                         batch_errors[batch_idx] = e
-                        if not isinstance(e, TranslationIncompleteError):
+                        if isinstance(e, TranslationCancelledError):
+                            pass  # the loop exit below converts this into a run cancel
+                        elif isinstance(e, (FatalProviderError,
+                                            ProviderUnavailableError)):
+                            if fatal_error is None:
+                                fatal_error = e
+                                _log("ERROR", f"Batch {batch_idx+1} provider "
+                                     f"failure ({e}); aborting the run")
+                        elif not isinstance(e, TranslationIncompleteError):
                             _log("WARNING", f"Batch {batch_idx+1} failed ({e}), "
                                  "falling back to individual translation")
 
@@ -778,6 +974,8 @@ class LocalLLMTranslator:
                     while len(futures) < workers and submit_next():
                         pass
 
+            if fatal_error is not None:
+                raise fatal_error
             if _cancelled():
                 raise TranslationCancelledError("translation cancelled")
 
@@ -811,9 +1009,66 @@ class LocalLLMTranslator:
 
         total_elapsed = time.time() - overall_start
         rate = len(all_translated) / total_elapsed if total_elapsed > 0 else float('inf')
+        request_note = self._request_count_note()
         _log("INFO", f"Translation done: {len(all_translated)} lines in "
-             f"{total_elapsed:.1f}s ({rate:.1f} lines/s)")
+             f"{total_elapsed:.1f}s ({rate:.1f} lines/s){request_note}")
         return all_translated
+
+    def _request_count_note(self) -> str:
+        """Request-count suffix for run summaries, when the client tracks them."""
+        stats = getattr(self._get_llm_client(), 'stats', None)
+        if stats is None:
+            return ''
+        return (f" · {stats.logical_requests} logical / "
+                f"{stats.http_attempts} HTTP request(s)")
+
+    @staticmethod
+    def _map_batch_ids(parsed: List[Dict[str, str]], batch_size: int, log_fn
+                       ) -> Dict[int, Dict[str, str]]:
+        """Decide which parsed entries can be trusted, and onto which line.
+
+        Rules, applied in order:
+
+        - Explicit ids are kept when unique and within 1..batch_size. A
+          duplicate keeps its first entry; later copies are dropped with a
+          warning. Out-of-range ids are dropped with a warning.
+        - A response with no ids at all is mapped positionally only when it
+          has exactly batch_size entries — anything shorter may have dropped
+          any line, so guessing would shift translations onto wrong cues.
+        - A mixed response (some ids, some not) keeps only its explicit
+          entries: an id-less entry's position means nothing once any
+          sibling carried an id.
+        """
+        by_id: Dict[int, Dict[str, str]] = {}
+        explicit = [e for e in parsed if e.get('explicit_id')]
+        implicit = [e for e in parsed if not e.get('explicit_id')]
+
+        for entry in explicit:
+            pid = entry.get('id')
+            if not isinstance(pid, int) or not (1 <= pid <= batch_size):
+                log_fn("WARNING", f"  model returned out-of-range id {pid}; "
+                                 "ignoring that entry")
+                continue
+            if pid in by_id:
+                log_fn("WARNING", f"  model returned duplicate id {pid}; "
+                                 "keeping the first entry")
+                continue
+            by_id[pid] = entry
+
+        if explicit and implicit:
+            log_fn("WARNING",
+                   f"model returned {len(implicit)} id-less entries mixed with "
+                   f"explicit ids; only explicit mappings are trusted")
+        elif implicit and not explicit:
+            if len(implicit) == batch_size:
+                for position, entry in enumerate(implicit, 1):
+                    by_id.setdefault(position, entry)
+            else:
+                log_fn("WARNING",
+                       f"model returned {len(implicit)} id-less entries for "
+                       f"{batch_size} lines; cannot map positionally, "
+                       "recovering individually")
+        return by_id
 
     def _build_batch_yaml(self, batch: List[Cue]) -> str:
         """
@@ -842,6 +1097,13 @@ class LocalLLMTranslator:
         def _log(level, msg):
             if log_callback:
                 log_callback(level, msg)
+
+        # Covers the initial dispatch and every recursive context-limit
+        # split: a cancellation between requests must prevent the split's
+        # second HTTP call, not just the next batch's first one.
+        if cancel_check and cancel_check():
+            raise TranslationCancelledError(
+                'translation cancelled before batch dispatch')
 
         # Build YAML input
         yaml_input = self._build_batch_yaml(batch)
@@ -905,21 +1167,14 @@ class LocalLLMTranslator:
                 batch, translations, target_language, _log, recovery_contexts,
                 cancel_check, progress_callback)
 
-        # Map parsed entries by the id echoed back by the model. The batch YAML
-        # numbers sources 1..N (see _build_batch_yaml), so the source at
-        # position j carries id j+1. Reconstructing by id — not by list
-        # position — means a reordered, dropped, or merged line in the model's
-        # response can no longer shift every following translation onto the
-        # wrong subtitle. That positional shift was exactly what surfaced as
-        # lines "returning the original text": once one line was missing or out
-        # of order, the tail ran off the end of `parsed` and fell back to the
-        # untranslated source. First id wins so a duplicated id can't clobber a
-        # real one.
-        by_id: Dict[int, Dict[str, str]] = {}
-        for parsed_entry in parsed:
-            pid = parsed_entry.get('id')
-            if isinstance(pid, int) and pid not in by_id:
-                by_id[pid] = parsed_entry
+        # Map parsed entries onto the batch. The batch YAML numbers sources
+        # 1..N (see _build_batch_yaml), so the source at position j carries
+        # id j+1 — but only ids the model actually echoed are trustworthy.
+        # Inventing one from result position would silently accept a
+        # reordered or short answer (e.g. ID-less B/C answering A/B/C), so
+        # ambiguous output is treated as missing text and sent to targeted
+        # recovery instead of being guessed onto the wrong subtitle.
+        by_id = self._map_batch_ids(parsed, len(batch), _log)
 
         translations = []
         for j, entry in enumerate(batch):
@@ -971,6 +1226,11 @@ class LocalLLMTranslator:
                     if not text or not text.strip():
                         raise RuntimeError("model returned an empty translation")
                     log_fn("INFO", f"  L{entry.line or j+1}: retried -> \"{text[:60]}\"")
+                except (FatalProviderError, ProviderUnavailableError):
+                    # Retrying the remaining lines against a provider that
+                    # just rejected or dropped us would multiply identical
+                    # failures — abort the run and let the user fix it.
+                    raise
                 except Exception as error:
                     reason = f"{type(error).__name__}: {error}"
                     failures.append((entry.line or j + 1, reason))
@@ -1079,6 +1339,8 @@ class LocalLLMTranslator:
 
     @staticmethod
     def _is_context_limit_error(error):
+        if isinstance(error, ContextLengthError):
+            return True
         text = str(error).lower()
         return any(marker in text for marker in (
             'context limit', 'context length', 'context window',

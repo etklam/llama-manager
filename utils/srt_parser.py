@@ -248,9 +248,23 @@ def parse_srt_from_string(srt_string: str) -> List[Cue]:
                     i += 1
                     break
 
-                # Stop if we hit a line number (start of next subtitle)
-                if re.fullmatch(r'^\d+$', current_line):
-                    break
+                # A digit-only line is the next block's sequence number only
+                # when a timestamp follows it. Without that lookahead, a
+                # spoken number ("Room 123" split across lines, a year read
+                # aloud) would terminate this cue's dialogue and the digits
+                # would be silently dropped.
+                if re.fullmatch(r'\d+', current_line):
+                    lookahead = i + 1
+                    while (lookahead < len(lines)
+                           and not lines[lookahead].strip()):
+                        lookahead += 1
+                    if (lookahead < len(lines)
+                            and re.match(time_pattern, lines[lookahead].strip())):
+                        break
+                    # No timestamp follows: dialogue content, kept as text.
+                    text_lines.append(lines[i])
+                    i += 1
+                    continue
 
                 # Stop if we hit another time pattern
                 if re.match(time_pattern, current_line):

@@ -1,7 +1,22 @@
+# Versions recorded from the tested environment (Python 3.12.10,
+# 2026-09-16). Constraints are compatibility bounds justified below, not
+# guesses: each floor is the oldest line the code is known to exercise and
+# each ceiling excludes a known-incompatible major.
+#
+#   openai 2.8.1  — chat.completions, error taxonomy used by
+#                   translation/transport.py (AuthenticationError,
+#                   RateLimitError, APIConnectionError, LengthFinishReasonError),
+#                   max_retries=0, injected httpx clients.
+#   httpx  0.28.1 — MockTransport-based transport tests, Timeout(connect=...),
+#                   proxy support. openai 2.x itself requires httpx>=0.23.
+#   tenacity      — REMOVED: transport retries have a single owner
+#                   (translation/transport.py); no module imports tenacity.
+#   psutil        — server process lifecycle management only.
+#   tkinterdnd2   — drag-and-drop file lists in the Tk UI.
+
 psutil>=5.9.0
 tkinterdnd2
 
 # Subtitle translation dependencies
-openai>=1.0.0
-httpx>=0.28.0
-tenacity>=9.0.0
+openai>=2.0.0,<3.0.0
+httpx>=0.28.0,<1.0.0

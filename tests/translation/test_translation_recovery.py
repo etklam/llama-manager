@@ -119,6 +119,7 @@ def test_failed_translation_preserves_existing_files(tmp_path, route, replace_or
         caller._translator = translator
         caller._log = Mock()
         caller._on_progress = Mock()
+        caller._stop_requested = False
     else:
         caller = object.__new__(PipelineRunner)
         caller._config_manager = NoneConfig()
@@ -128,9 +129,16 @@ def test_failed_translation_preserves_existing_files(tmp_path, route, replace_or
         caller._get_translator = lambda config: translator
         caller._on_progress = Mock()
         caller._on_log = Mock()
+        caller._stop_requested = False
 
     with pytest.raises(RuntimeError, match=expected_error):
-        caller._translate_file(str(source), 'zh-tw', replace_original=replace_original)
+        if route == 'subtitle':
+            SubtitleTranslationTab._translate_file(
+                caller, translator, str(source), 'zh-tw',
+                replace_original=replace_original)
+        else:
+            caller._translate_file(str(source), 'zh-tw',
+                                   replace_original=replace_original)
     assert output.read_bytes() == previous
     assert source.read_text(encoding='utf-8') == original
     assert client.complete.call_count == 2

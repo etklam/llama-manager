@@ -2,36 +2,40 @@
 OpenAI Client Adapter - Production adapter wrapping OpenAI SDK.
 
 This module provides the production implementation of the LLMClient port,
-wrapping the OpenAI SDK with retry logic.
+wrapping the OpenAI SDK. The SDK client is built with ``max_retries=0``:
+transport retries have exactly one owner, the centralized policy in
+``translation.transport``.
 """
 import logging
-from typing import List, Dict, Optional
+import time
+from typing import Callable, List, Dict, Optional
 
 import httpx
-from openai import OpenAI, LengthFinishReasonError, RateLimitError
-from tenacity import (
-    retry,
-    stop_after_attempt,
-    wait_exponential,
-    retry_if_not_exception_type,
-    before_sleep_log,
-    RetryError
-)
+from openai import OpenAI, LengthFinishReasonError
+
 from translation.llm_client import CompletionResult
+from translation import transport
+from translation.transport import (
+    ProviderUnavailableError,
+    TransportCancelledError,
+    TransportStats,
+    request_with_retry,
+)
 
 logger = logging.getLogger(__name__)
 
-# Constants
-RETRY_NUMS = 3
-RETRY_DELAY = 1  # Initial delay for exponential backoff
+# Kept for callers that report the retry ceiling; the policy owns the value.
+RETRY_NUMS = transport.MAX_ATTEMPTS
 
 
 class OpenAIClient:
     """
-    Production adapter: wraps OpenAI SDK with retry logic.
+    Production adapter: wraps the OpenAI SDK behind the LLMClient port.
 
-    This adapter implements the LLMClient port by wrapping the OpenAI SDK.
-    It handles retry logic, proxy configuration, and timeout management.
+    Transport retries, error classification, the elapsed budget and
+    cancel-aware backoff all live in translation.transport; this adapter
+    only builds the SDK client (with SDK retries disabled) and normalizes
+    responses.
     """
 
     def __init__(
@@ -40,7 +44,11 @@ class OpenAIClient:
         model: str,
         api_key: str = '',
         proxy: str = None,
-        timeout: float = 180.0
+        timeout: float = 180.0,
+        http_client: Optional[httpx.Client] = None,
+        cancel_check: Optional[Callable[[], bool]] = None,
+        sleep_fn: Optional[Callable[[float], None]] = None,
+        clock_fn: Optional[Callable[[], float]] = None,
     ):
         """
         Initialize the OpenAI client adapter.
@@ -51,45 +59,94 @@ class OpenAIClient:
             api_key: API key if required (default: empty string)
             proxy: Proxy URL for HTTP client (default: None)
             timeout: Request timeout in seconds (default: 180.0)
+            http_client: Pre-built httpx client (tests, shared transports).
+                When given, this adapter never closes it; proxy is ignored.
+            cancel_check: Run cancellation token checked before every HTTP
+                dispatch and transport retry (may also be set as an
+                attribute between runs).
+            sleep_fn: Backoff waiter (injectable fake clock for tests).
+            clock_fn: Elapsed-time clock (injectable fake for tests).
         """
         self.api_url = api_url
         self.model = model
         self.api_key = api_key
         self.proxy = proxy
         self.timeout = timeout
+        self.cancel_check = cancel_check
+        self.stats = TransportStats()
+        self._sleep = sleep_fn or time.sleep
+        self._clock = clock_fn or time.monotonic
+        self._injected_http_client = http_client is not None
 
-        # Initialize OpenAI client (will be created lazily)
-        self._client = None
+        # Deterministic initialization: the SDK client (and its connection
+        # pool) exists from construction, not on first use.
+        client_kwargs = {
+            'api_key': self.api_key,
+            'base_url': self.api_url,
+            'timeout': self.timeout,
+            # One retry owner: the transport policy in translation.transport.
+            'max_retries': 0,
+        }
+        self._owns_http_client = False
+        if http_client is not None:
+            client_kwargs['http_client'] = http_client
+        elif self.proxy:
+            client_kwargs['http_client'] = httpx.Client(
+                proxy=self.proxy,
+                timeout=httpx.Timeout(self.timeout, connect=30.0),
+            )
+            self._owns_http_client = True
+
+        self._client = OpenAI(**client_kwargs)
+        self._closed = False
 
     def _get_client(self) -> OpenAI:
-        """
-        Get or create the OpenAI client.
-
-        Returns:
-            OpenAI client instance configured with the API URL, timeout, and optional proxy
-        """
-        if self._client is None:
-            client_kwargs = {
-                'api_key': self.api_key,
-                'base_url': self.api_url,
-                'timeout': self.timeout,
-            }
-
-            if self.proxy:
-                client_kwargs['http_client'] = httpx.Client(
-                    proxy=self.proxy,
-                    timeout=httpx.Timeout(self.timeout, connect=30.0)
-                )
-
-            self._client = OpenAI(**client_kwargs)
-
+        """Return the SDK client built at construction time."""
         return self._client
+
+    def close(self) -> None:
+        """Close the clients this adapter created.
+
+        Idempotent. The SDK's close() also closes the httpx client riding
+        inside it, so with an injected http_client the SDK close is skipped
+        entirely: the injected transport's owner decides its lifetime.
+        """
+        if self._closed:
+            return
+        self._closed = True
+        if self._injected_http_client:
+            return
+        try:
+            self._client.close()
+        except Exception:  # pragma: no cover - defensive on SDK changes
+            logger.debug('[OpenAIClient] close ignored an SDK error', exc_info=True)
+
+    def _counted_dispatch(self, kwargs: dict):
+        """One logical request through the transport retry policy."""
+        self.stats.logical_requests += 1
+        client = self._get_client()
+        return request_with_retry(
+            lambda: client.chat.completions.create(**kwargs),
+            cancel_check=self.cancel_check,
+            sleeper=self._sleep,
+            clock=self._clock,
+            stats=self.stats,
+            on_event=self._log_attempt,
+        )
+
+    @staticmethod
+    def _log_attempt(event: dict) -> None:
+        # Attempt diagnostics only: status, error type, timing. Never the
+        # request body, credentials, or the provider's response payload.
+        level_name = event.pop('level', 'DEBUG')
+        level = getattr(logging, level_name if level_name in ('DEBUG', 'INFO') else 'WARNING')
+        logger.log(level, '[OpenAIClient] %s', event)
 
     # Retries exist for transient faults (connection drops, rate limits). A
     # length stop is not transient: the same prompt at the same temperature
     # produces the same over-long generation, so re-sending it only adds the
-    # backoff delay before failing identically. Excluding it turns three
-    # identical failures per line into one.
+    # backoff delay before failing identically. The transport policy
+    # classifies it as context-length and never retries it.
     def complete(
         self,
         messages: List[Dict[str, str]],
@@ -99,8 +156,6 @@ class OpenAIClient:
     ) -> str:
         """
         Send messages and return the raw text response.
-
-        This method implements retry logic using tenacity for transient errors.
 
         Args:
             messages: List of message dictionaries with 'role' and 'content' keys
@@ -112,9 +167,12 @@ class OpenAIClient:
             Raw text content from the LLM response
 
         Raises:
-            RuntimeError: If the API call fails or returns invalid response
-            LengthFinishReasonError: If the response was truncated due to length
-            Exception: If the API call fails after retries
+            RuntimeError: If the response has no usable shape
+            LengthFinishReasonError: If the response was truncated with no
+                usable content
+            ProviderUnavailableError: Transport retries exhausted
+            FatalProviderError: The provider rejected the request outright
+            TransportCancelledError: The run was cancelled before dispatch
         """
         return self._request_completion(
             messages=messages,
@@ -173,12 +231,6 @@ class OpenAIClient:
             ),
         )
 
-    @retry(
-        stop=stop_after_attempt(RETRY_NUMS),
-        wait=wait_exponential(multiplier=1, min=RETRY_DELAY, max=10),
-        retry=retry_if_not_exception_type(LengthFinishReasonError),
-        before_sleep=before_sleep_log(logger, logging.WARNING)
-    )
     def _request_completion(
         self,
         messages: List[Dict[str, str]],
@@ -189,22 +241,22 @@ class OpenAIClient:
         extra_body: Optional[Dict] = None,
         response_format: Optional[Dict] = None,
     ) -> CompletionResult:
-        client = self._get_client()
+        kwargs = {
+            'model': model,
+            'max_tokens': max_tokens,
+            'temperature': temperature,
+            'frequency_penalty': 0,
+            'messages': messages,
+        }
+        if extra_body is not None:
+            kwargs['extra_body'] = extra_body
+        if response_format is not None:
+            kwargs['response_format'] = response_format
+
         length_error = None
 
         try:
-            response = client.chat.completions.create(
-                model=model,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                frequency_penalty=0,
-                messages=messages,
-                **({'extra_body': extra_body} if extra_body is not None else {}),
-                **({'response_format': response_format} if response_format is not None else {}),
-            )
-
-            logger.debug(f'[OpenAIClient] Response: {response}')
-
+            response = self._counted_dispatch(kwargs)
         except LengthFinishReasonError as error:
             # SDK parsing paths can raise before returning a chat completion
             # when finish_reason is "length". The completion is
@@ -217,18 +269,23 @@ class OpenAIClient:
                 '[OpenAIClient] SDK reported a length-stopped response; '
                 'recovering its completion metadata'
             )
-        except Exception as e:
+        except (ProviderUnavailableError, TransportCancelledError) as error:
             # The endpoint rides along so a remote-profile failure names the
             # provider instead of surfacing as a bare "connection error".
+            logger.error(f'[OpenAIClient] API call failed ({self.api_url}): {error}')
+            raise
+        except Exception as e:
             logger.error(f'[OpenAIClient] API call failed ({self.api_url}): {e}')
             raise
 
-        # Validate response
+        # Validate response. A malformed body is a content problem for the
+        # caller's recovery path, not a transport fault, so it is never
+        # retried here.
         if isinstance(response, str):
             raise RuntimeError(f'Invalid response type: {response}')
 
         if not hasattr(response, 'choices') or not response.choices:
-            raise RuntimeError(f'Invalid response - no choices: {response}')
+            raise RuntimeError('Invalid response - no choices')
 
         content = response.choices[0].message.content
 
@@ -264,7 +321,7 @@ class OpenAIClient:
         return CompletionResult(content.strip(), response.choices[0].finish_reason)
 
     def __repr__(self) -> str:
-        """String representation of the client."""
+        """String representation of the client (never includes the key)."""
         return (
             f"OpenAIClient("
             f"api_url='{self.api_url}', "

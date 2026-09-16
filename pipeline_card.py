@@ -216,6 +216,30 @@ class PipelineCard(ttk.LabelFrame):
                   else "Checking llama-server..."),
             foreground="blue")
 
+        # Read every Tk variable here, on the UI thread, and freeze it for
+        # the run: the worker thread never touches a mutable Tk variable.
+        run = {
+            'files': list(self._pipe_files),
+            'cli_path': Path(self._config.get("whisper.cli_path", "")),
+            'model_name': self._pipe_wmodel_var.get(),
+            'model_dir': self._config.get("whisper.model_dir", ""),
+            'language': extract_combo_code(self._pipe_lang_var.get()),
+            'target_lang': extract_combo_code(self._pipe_target_var.get()),
+            'replace_original': self._pipe_replace_var.get(),
+            'context_mode': context_mode_from_label(
+                self._pipe_context_mode_var.get()
+                if hasattr(self, '_pipe_context_mode_var')
+                else self._config.get('ui.context_mode', 'none')
+            ),
+        }
+
+        self._config.set("pipeline.language", run['language'])
+        self._config.set("pipeline.target_lang", run['target_lang'])
+        self._config.set("pipeline.replace_original", run['replace_original'])
+        self._config.set("ui.context_mode", run['context_mode'])
+        if run['model_name']:
+            self._config.set("whisper.last_model", run['model_name'])
+
         self._pipeline_runner = PipelineRunner(
             config_manager=self._config,
             get_port=self._get_port,
@@ -228,43 +252,25 @@ class PipelineCard(ttk.LabelFrame):
             on_file_completed=self._pipeline_file_completed,
         )
 
-        threading.Thread(target=self._run_pipeline, daemon=True).start()
+        threading.Thread(
+            target=self._run_pipeline, args=(run,), daemon=True).start()
 
     def _stop_pipeline(self):
         if self._pipeline_runner:
             self._pipeline_runner.stop()
         self._pipeline_step("Stopping...")
 
-    def _run_pipeline(self):
-        files = list(self._pipe_files)
-        cli_path = Path(self._config.get("whisper.cli_path", ""))
-        model_name = self._pipe_wmodel_var.get()
-        model_dir = self._config.get("whisper.model_dir", "")
-        lang_val = self._pipe_lang_var.get()
-        language = extract_combo_code(lang_val)
-        target_val = self._pipe_target_var.get()
-        target_lang = extract_combo_code(target_val)
-        context_var = getattr(self, '_pipe_context_mode_var', None)
-        context_mode = context_mode_from_label(
-            context_var.get() if context_var else self._config.get('ui.context_mode', 'none')
-        )
-
-        self._config.set("pipeline.language", language)
-        self._config.set("pipeline.target_lang", target_lang)
-        self._config.set("pipeline.replace_original", self._pipe_replace_var.get())
-        self._config.set("ui.context_mode", context_mode)
-        if model_name:
-            self._config.set("whisper.last_model", model_name)
-
+    def _run_pipeline(self, run: dict):
+        """Execute one run from the UI thread's frozen parameters."""
         self._pipeline_runner.run(
-            files=files,
-            target_lang=target_lang,
-            language=language,
-            replace_original=self._pipe_replace_var.get(),
-            whisper_cli_path=cli_path,
-            whisper_model_name=model_name,
-            whisper_model_dir=model_dir,
-            context_mode=context_mode,
+            files=run['files'],
+            target_lang=run['target_lang'],
+            language=run['language'],
+            replace_original=run['replace_original'],
+            whisper_cli_path=run['cli_path'],
+            whisper_model_name=run['model_name'],
+            whisper_model_dir=run['model_dir'],
+            context_mode=run['context_mode'],
         )
 
     def _pipeline_step(self, msg):

@@ -1,14 +1,35 @@
 """
 TDD tests for OpenAI client adapter.
 These tests define the behavior of the LLM client port and adapter.
+
+Transport-level retry behavior (attempt bounds, classification, budgets,
+cancellation) lives in test_transport_retry.py, which exercises the real
+SDK over a mocked HTTP transport. The tests here cover the adapter's
+response handling around the transport seam.
 """
 import pytest
 from unittest.mock import patch, MagicMock
-from openai import RateLimitError
+from openai import APIConnectionError, RateLimitError
 
 # These imports will FAIL until we create the modules
 from translation.llm_client import LLMClient
 from translation.openai_client import OpenAIClient, RETRY_NUMS
+from translation.transport import ProviderUnavailableError
+
+import httpx
+
+
+def _connection_error(message='Connection error'):
+    """A typed transient failure the retry policy recognizes."""
+    return APIConnectionError(
+        request=httpx.Request('POST', 'http://localhost:8080/v1/chat/completions'),
+    )
+
+
+def _fake_time(mock_time):
+    """No sleeps and a still clock: budgets and backoffs play out instantly."""
+    mock_time.sleep = lambda seconds: None
+    mock_time.monotonic = lambda: 0.0
 
 
 class TestLLMClientProtocol:
@@ -102,15 +123,17 @@ class TestOpenAIClientComplete:
         assert call_args.kwargs['temperature'] == 0.5
         assert 'messages' in call_args.kwargs
 
+    @patch('translation.openai_client.time')
     @patch('translation.openai_client.OpenAI')
-    def test_complete_with_retry_on_error(self, mock_openai):
+    def test_complete_with_retry_on_error(self, mock_openai, mock_time):
         """Test that complete() retries on transient errors."""
+        _fake_time(mock_time)
         mock_client = MagicMock()
         mock_openai.return_value = mock_client
 
-        # Fail once, then succeed
+        # Fail once with a typed transient error, then succeed
         responses = [
-            Exception('Connection error'),
+            _connection_error(),
             MagicMock(choices=[MagicMock(message=MagicMock(content='Success'))]),
         ]
         mock_client.chat.completions.create.side_effect = responses
@@ -132,16 +155,16 @@ class TestOpenAIClientComplete:
         assert result == 'Success'
         assert mock_client.chat.completions.create.call_count == 2
 
+    @patch('translation.openai_client.time')
     @patch('translation.openai_client.OpenAI')
-    def test_complete_raises_after_max_retries(self, mock_openai):
-        """Test that complete() raises exception after max retries."""
-        from tenacity import RetryError
-
+    def test_complete_raises_after_max_retries(self, mock_openai, mock_time):
+        """Test that complete() raises after the transport budget is spent."""
+        _fake_time(mock_time)
         mock_client = MagicMock()
         mock_openai.return_value = mock_client
 
-        # Always fail
-        mock_client.chat.completions.create.side_effect = Exception('Permanent error')
+        # Always fail with a typed transient error
+        mock_client.chat.completions.create.side_effect = _connection_error()
 
         client = OpenAIClient(
             api_url="http://localhost:8080/v1",
@@ -150,8 +173,7 @@ class TestOpenAIClientComplete:
 
         messages = [{'role': 'user', 'content': 'Test'}]
 
-        # Tenacity wraps exceptions in RetryError
-        with pytest.raises(RetryError):
+        with pytest.raises(ProviderUnavailableError):
             client.complete(
                 messages=messages,
                 model="llama-3.2-3b-instruct",
@@ -159,7 +181,7 @@ class TestOpenAIClientComplete:
                 temperature=0.5
             )
 
-        # Should have retried multiple times (RETRY_NUMS = 3)
+        # Should have retried up to the policy bound (RETRY_NUMS = 3)
         assert mock_client.chat.completions.create.call_count == RETRY_NUMS
 
     @patch('translation.openai_client.OpenAI')
@@ -313,13 +335,15 @@ class TestTruncatedResponseHandling:
 
         assert mock_client.chat.completions.create.call_count == 1
 
+    @patch('translation.openai_client.time')
     @patch('translation.openai_client.OpenAI')
-    def test_transient_errors_are_still_retried(self, mock_openai):
+    def test_transient_errors_are_still_retried(self, mock_openai, mock_time):
         """Excluding length stops must not disable retries in general."""
+        _fake_time(mock_time)
         mock_client = MagicMock()
         mock_openai.return_value = mock_client
         mock_client.chat.completions.create.side_effect = [
-            Exception('Connection reset'),
+            _connection_error('Connection reset'),
             MagicMock(choices=[MagicMock(
                 message=MagicMock(content='ok'), finish_reason='stop')]),
         ]

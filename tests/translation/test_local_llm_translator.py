@@ -10,7 +10,8 @@ BEFORE the implementation exists and will FAIL until the module is created.
 """
 import pytest
 from unittest.mock import patch, MagicMock, Mock
-from openai import OpenAI
+from openai import OpenAI, APIConnectionError
+import httpx
 import sys
 import os
 
@@ -21,6 +22,7 @@ if PROJECT_ROOT not in sys.path:
 
 # This import will FAIL because the module doesn't exist yet - this is expected in TDD!
 from translation.local_llm_translator import LocalLLMTranslator
+from translation.transport import ProviderUnavailableError
 from utils.srt_parser import Cue
 
 
@@ -226,18 +228,21 @@ class TestSRTFormatTranslation:
 
 
 class TestAPIErrorRetry:
-    """Test error handling and retry mechanism."""
+    """Typed transport failures retry inside the adapter; exhaustion surfaces."""
 
+    @patch('translation.openai_client.time')
     @patch('translation.openai_client.OpenAI')
-    def test_api_error_retry_success_after_retries(self, mock_openai):
+    def test_api_error_retry_success_after_retries(self, mock_openai, mock_time):
         """Test that translator retries on API errors and eventually succeeds."""
+        mock_time.sleep = lambda seconds: None
+        mock_time.monotonic = lambda: 0.0
         mock_client = MagicMock()
         mock_openai.return_value = mock_client
 
-        # Setup: fail twice, then succeed
+        # Setup: fail twice with typed transient errors, then succeed
         responses = [
-            Exception('Connection error'),
-            Exception('Timeout'),
+            APIConnectionError(request=httpx.Request('POST', 'http://x/v1')),
+            APIConnectionError(request=httpx.Request('POST', 'http://x/v1')),
             MagicMock(choices=[MagicMock(message=MagicMock(content='Success'))]),
         ]
         mock_client.chat.completions.create.side_effect = responses
@@ -251,20 +256,23 @@ class TestAPIErrorRetry:
         # Verify it retried
         assert mock_client.chat.completions.create.call_count == 3
 
+    @patch('translation.openai_client.time')
     @patch('translation.openai_client.OpenAI')
-    def test_api_error_retry_max_retries_exceeded(self, mock_openai):
-        """Test that translator gives up after max retries."""
+    def test_api_error_retry_max_retries_exceeded(self, mock_openai, mock_time):
+        """Exhausted transport retries raise ProviderUnavailableError."""
+        mock_time.sleep = lambda seconds: None
+        mock_time.monotonic = lambda: 0.0
         mock_client = MagicMock()
         mock_openai.return_value = mock_client
 
-        # Always fail
-        mock_client.chat.completions.create.side_effect = Exception('Permanent error')
+        # Always fail with a typed transient error
+        mock_client.chat.completions.create.side_effect = APIConnectionError(
+            request=httpx.Request('POST', 'http://x/v1'))
 
         config = _full_config()
         translator = LocalLLMTranslator(config)
 
-        # Should raise exception after max retries
-        with pytest.raises(Exception, match='Permanent error'):
+        with pytest.raises(ProviderUnavailableError):
             translator.translate('Test', target_language='French')
 
         # Verify it retried multiple times (typically 3-5 retries)

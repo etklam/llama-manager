@@ -58,3 +58,29 @@ _Avoid_: Character database, cross-file memory, plot truth
 Chronological source Cues around a translation batch or retry. It is context
 data and never creates output IDs.
 _Avoid_: Previous translations, worker context
+
+**Transport Policy**:
+The single owner of HTTP-level retries for one logical request: typed error
+classification, bounded attempts, an elapsed budget, cancel-aware backoff,
+and attempt diagnostics without secrets. The SDK client is built with
+retries disabled so no second owner can multiply attempts.
+_Avoid_: Tenacity config, SDK retries, retry decorator
+
+**Transport Attempt**:
+One HTTP request issued under the Transport Policy. A logical request costs
+at most the policy's attempt bound; providers never see more.
+_Avoid_: Retry (that is the decision, not the request)
+
+**Run Snapshot**:
+The immutable record of one translation run — files, target language,
+replace flag, model/endpoint, context mode, requested workers, generation
+settings — frozen on the UI thread before workers start. UI changes during
+execution configure the next run only.
+_Avoid_: Live config, Tk variables in workers
+
+**Commit Gate**:
+The race-aware boundary deciding whether a finished candidate output is
+published: cancellation and the commit serialize under one lock, so a Stop
+landing at the same instant as the last response produces exactly one
+outcome.
+_Avoid_: Save, write-through, final write

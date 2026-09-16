@@ -67,3 +67,20 @@ def test_destroyed_log_widget_unsubscribes(desktop):
     before = len(log_bus._subscribers)
     tab.destroy()
     assert len(log_bus._subscribers) == before - 1
+
+
+def test_tab_change_routes_by_identity_not_index(desktop):
+    """Tab switching refreshes the right tab regardless of its index."""
+    with patch.object(desktop.subtitle_tab, 'refresh_model') as refresh:
+        desktop.notebook.select(desktop.subtitle_tab)
+        desktop.root.update_idletasks()
+        desktop._on_tab_changed(None)
+        refresh.assert_called()
+
+    # Switching elsewhere must not re-run the subtitle tab's refresh, even
+    # if tab indices were rearranged.
+    with patch.object(desktop.subtitle_tab, 'refresh_model') as refresh:
+        desktop.notebook.select(desktop.main_tab)
+        desktop.root.update_idletasks()
+        desktop._on_tab_changed(None)
+        refresh.assert_not_called()

@@ -6,13 +6,18 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, List, Optional
 
 from tkinterdnd2 import DND_FILES
 
+from utils.atomic_io import CommitGate, atomic_write_text
 from utils.srt_parser import parse_srt_from_file, generate_srt_from_list, output_path_for
-from translation.local_llm_translator import LocalLLMTranslator
+from translation.local_llm_translator import (
+    LocalLLMTranslator,
+    TxtTooLargeError,
+)
 from translation.preflight import plan_for_target
 
 from constants import SUPPORTED_SUBTITLE, TARGET_LANGUAGES, SOURCE_LANGUAGES
@@ -39,6 +44,26 @@ LLM_MODE_LABELS = {
 LLM_MODE_FROM_LABEL = {label: mode for mode, label in LLM_MODE_LABELS.items()}
 
 
+@dataclass(frozen=True)
+class RunSnapshot:
+    """Everything one translation run uses, read on the UI thread up front.
+
+    Tk variables are mutable and thread-unsafe: freezing them into an
+    immutable snapshot before the worker starts means the run cannot be
+    re-targeted mid-flight by a tab switch, a combobox edit, or a slider
+    drag. UI changes during execution configure the *next* run only.
+    """
+
+    files: tuple
+    target_lang: str
+    replace_original: bool
+    # Complete translator config: model/endpoint, context mode, requested
+    # workers and generation settings. Preflight may only add discovered
+    # capacity/effective-worker values to a copy, never re-resolve them.
+    config: dict
+    run_id: int
+
+
 class SubtitleTranslationTab(LogMixin, ttk.Frame):
     """GUI tab for batch subtitle translation."""
 
@@ -54,6 +79,9 @@ class SubtitleTranslationTab(LogMixin, ttk.Frame):
         self._translating = False
         self._stop_requested = False
         self._failed_files = 0
+        # Identifies the current run; late callbacks from an older run
+        # compare against it and never mutate a newer run's UI state.
+        self._run_seq = 0
         # Progress state read by _on_progress (set per-run in _run_translation).
         self._current_file_idx = 0
         self._total_files = 1
@@ -72,13 +100,26 @@ class SubtitleTranslationTab(LogMixin, ttk.Frame):
             self._config_manager, self._current_target())
 
     def _init_translator(self):
-        """Initialize the translator with current config."""
+        """Initialize the idle translator with current config.
+
+        Closes the previous idle translator's HTTP client: the run creates
+        its own translator, so this instance only configures defaults until
+        the next run replaces it.
+        """
         config = self._build_translation_config()
-        self._translator = LocalLLMTranslator(config)
+        previous, self._translator = self._translator, LocalLLMTranslator(config)
+        if previous is not None:
+            previous.close()
 
     def refresh_model(self):
-        """Refresh from current server model and LLM connection settings."""
-        self._init_translator()
+        """Refresh from current server model and LLM connection settings.
+
+        Entering this tab mid-run must not replace an active run's
+        translator: the run keeps the model, endpoint and settings it
+        started with, and these refreshes configure the next run only.
+        """
+        if not self._translating:
+            self._init_translator()
         self._update_model_display()
         self._sync_workers_from_config()
         self._refresh_llm_profile_combo()
@@ -438,9 +479,10 @@ class SubtitleTranslationTab(LogMixin, ttk.Frame):
         if self._translating:
             return
 
-        # Read every Tk variable here, on the UI thread, and hand the plain dict
-        # to the worker: the preflight below runs off-thread, and Tk variables
-        # are not safe to touch from there.
+        # Read every Tk variable here, on the UI thread, and freeze them into
+        # the run's snapshot: the preflight and the workers below run
+        # off-thread, and Tk variables are neither safe to touch from there
+        # nor a stable source of run settings once the run has started.
         target = self._current_target()
         config = build_translation_config(self._config_manager, target)
         config['batch_size'] = self._batch_var.get()
@@ -458,6 +500,15 @@ class SubtitleTranslationTab(LogMixin, ttk.Frame):
             # Remote concurrency is the profile's max_workers; the (disabled)
             # slider describes llama-server workers, not the provider's limits.
             requested_workers = config['max_workers']
+
+        self._run_seq += 1
+        snapshot = RunSnapshot(
+            files=tuple(self._file_list),
+            target_lang=self._get_target_code(),
+            replace_original=self._replace_var.get(),
+            config=config,
+            run_id=self._run_seq,
+        )
 
         self._translating = True
         self._stop_requested = False
@@ -482,10 +533,10 @@ class SubtitleTranslationTab(LogMixin, ttk.Frame):
             self._config_manager.set("ui.context_mode", config['context_mode'])
 
         thread = threading.Thread(
-            target=self._preflight_and_translate, args=(config,), daemon=True)
+            target=self._preflight_and_translate, args=(snapshot,), daemon=True)
         thread.start()
 
-    def _preflight_and_translate(self, config: dict):
+    def _preflight_and_translate(self, snapshot: RunSnapshot):
         """Preflight the LLM backend, then run the batch. Runs on the worker thread.
 
         The probe is here rather than in _start_translation because it is a
@@ -493,37 +544,56 @@ class SubtitleTranslationTab(LogMixin, ttk.Frame):
         on the UI thread that reads as the window locking up on the click.
         """
         # Without this check, an unreachable server is discovered one batch at a
-        # time: each batch spends three tenacity attempts with exponential
+        # time: each batch pays the transport policy's bounded attempts with
         # backoff before failing, so a long SRT takes minutes to report what was
         # knowable before the first request. In remote mode the plan is a
         # configuration check that names the profile, never a llama-server
         # probe.
+        config = snapshot.config
         plan = plan_for_target(config['target'], config['max_workers'])
         if not plan.reachable:
             message = plan.note or "no response"
             self._log("ERROR", message)
             self.winfo_toplevel().after(0, lambda: (
                 messagebox.showerror("LLM not ready", message),
-                self._on_translation_aborted(),
+                self._on_translation_aborted(snapshot.run_id),
             ))
             return
 
         # Align client concurrency with the server's real slot count, as the
-        # plan decided. Each worker holds one request open and llama-server runs
-        # at most total_slots of them at once, so workers beyond that simply
+        # plan decided, and carry the discovered context capacity — applied to
+        # a copy of the snapshot's config, so this run and only this run gets
+        # them. Each worker holds one request open and llama-server runs at
+        # most total_slots of them at once, so workers beyond that simply
         # queue: throughput equal to one worker, while the log claims
         # parallelism. The plan's note is the user-facing explanation, logged
         # once.
-        config['max_workers'] = plan.workers
-        config['context_size'] = plan.info.context_size
+        run_config = dict(config)
+        run_config['max_workers'] = plan.workers
+        run_config['context_size'] = plan.info.context_size
         if plan.note:
             self._log("WARNING", plan.note)
 
-        self._translator = LocalLLMTranslator(config)
-        self._run_translation()
+        # The run owns this translator. Assigning it to self._translator is
+        # display/config compatibility only: an active run is never replaced
+        # (see refresh_model), and the run itself uses the local reference.
+        translator = LocalLLMTranslator(run_config)
+        self._translator = translator
+        try:
+            self._run_translation(translator, snapshot)
+        finally:
+            # Run-owned HTTP client, closed deterministically when the run
+            # ends; injected shared clients are never closed this way.
+            translator.close()
 
-    def _on_translation_aborted(self):
-        """Return the controls to idle after a run that never started."""
+    def _on_translation_aborted(self, run_id: int):
+        """Return the controls to idle after a run that never started.
+
+        A stale abort callback (a newer run already started) must not flip a
+        live run's buttons back on.
+        """
+        if run_id != self._run_seq:
+            return
         self._translating = False
         self._start_btn.config(state="normal")
         self._stop_btn.config(state="disabled")
@@ -534,18 +604,19 @@ class SubtitleTranslationTab(LogMixin, ttk.Frame):
         self._stop_requested = True
         self._log("WARNING", "Stopping after the current model request...")
 
-    def _run_translation(self):
+    def _run_translation(self, translator: LocalLLMTranslator,
+                         snapshot: RunSnapshot):
         self._failed_files = 0
-        total = len(self._file_list)
-        target_lang = self._get_target_code()
-        replace = self._replace_var.get()
+        total = len(snapshot.files)
+        target_lang = snapshot.target_lang
+        replace = snapshot.replace_original
 
         # File-level context read by _on_progress to compute overall percentage
         # (file index + within-file line fraction) and per-file ETA.
         self._total_files = total
         self._file_start_time = time.time()
 
-        for i, filepath in enumerate(self._file_list):
+        for i, filepath in enumerate(snapshot.files):
             if self._stop_requested:
                 self._log("WARNING", "Translation stopped by user")
                 break
@@ -554,7 +625,8 @@ class SubtitleTranslationTab(LogMixin, ttk.Frame):
             self._file_start_time = time.time()
 
             try:
-                self._translate_file(filepath, target_lang, replace_original=replace)
+                self._translate_file(translator, filepath, target_lang,
+                                     replace_original=replace)
             except Exception as e:
                 if self._stop_requested:
                     self._log("WARNING", "Translation stopped by user")
@@ -567,9 +639,14 @@ class SubtitleTranslationTab(LogMixin, ttk.Frame):
             pct = ((i + 1) / total) * 100
             self.winfo_toplevel().after(0, lambda p=pct: self._progress_var.set(p))
 
-        self.winfo_toplevel().after(0, self._on_translation_done)
+        self.winfo_toplevel().after(
+            0, lambda: self._on_translation_done(snapshot.run_id))
 
-    def _on_translation_done(self):
+    def _on_translation_done(self, run_id: int):
+        if run_id != self._run_seq:
+            # A newer run owns the UI; this callback belongs to a run that
+            # already ended and must not flip live controls.
+            return
         self._translating = False
         self._start_btn.config(state="normal")
         self._stop_btn.config(state="disabled")
@@ -586,10 +663,11 @@ class SubtitleTranslationTab(LogMixin, ttk.Frame):
 
     # --- Helper methods ---
 
-    def _translate_file(self, input_path: str, target_lang: str,
+    def _translate_file(self, translator: LocalLLMTranslator,
+                        input_path: str, target_lang: str,
                         output_path: Optional[str] = None,
                         replace_original: bool = False):
-        """Translate a single SRT or TXT file."""
+        """Translate a single SRT or TXT file and commit it atomically."""
         filepath = Path(input_path)
         ext = filepath.suffix.lower()
 
@@ -599,19 +677,31 @@ class SubtitleTranslationTab(LogMixin, ttk.Frame):
         self._log("INFO", f"Translating: {filepath.name}")
         self._on_progress(filepath.name, 0, 1, "starting")
 
+        def log_callback(level, message):
+            self._log(level, message)
+
+        # The commit boundary: a Stop landing between the last response and
+        # the write suppresses publication instead of racing it.
+        commit_gate = CommitGate(lambda: getattr(self, '_stop_requested', False))
+
         if ext == '.srt':
             subtitles = parse_srt_from_file(str(filepath))
             total_lines = len(subtitles)
+            if not subtitles:
+                # A non-empty file that parses to zero cues is corrupt input;
+                # publishing an empty SRT here would report success while
+                # destroying the original under Replace original.
+                raise RuntimeError(
+                    'no valid subtitle cues found'
+                    if filepath.stat().st_size > 0
+                    else 'file is empty')
             self._log("INFO", f"Parsed {total_lines} subtitle lines, "
                               f"translating line by line...")
 
             def file_progress(current, total, status):
                 self._on_progress(filepath.name, current, total, status)
 
-            def log_callback(level, message):
-                self._log(level, message)
-
-            translated = self._translator.translate_srt(
+            translated = translator.translate_srt(
                 subtitles, target_lang,
                 progress_callback=file_progress,
                 log_callback=log_callback,
@@ -620,16 +710,28 @@ class SubtitleTranslationTab(LogMixin, ttk.Frame):
             if getattr(self, '_stop_requested', False):
                 return
             srt_content = generate_srt_from_list(translated)
-            Path(output_path).write_text(srt_content, encoding='utf-8')
+            if not commit_gate.commit(
+                    lambda: atomic_write_text(output_path, srt_content)):
+                self._log("WARNING", f"Cancelled before commit: {filepath.name}")
+                return
         elif ext == '.txt':
             text = filepath.read_text(encoding='utf-8')
             self._log("INFO", f"Text file, {len(text)} chars")
-            if self._translator.context_mode == 'story':
+            if translator.context_mode == 'story':
                 self._log("INFO", "全文理解翻譯只適用於 SRT；TXT 使用標準翻譯")
-            translated = self._translator.translate(text, target_lang)
-            if getattr(self, '_stop_requested', False):
+            # TXT is one full-text request with its own budget and
+            # completeness rules; it never routes through SRT recovery.
+            translated = translator.translate_full_text(
+                text, target_lang,
+                cancel_check=lambda: getattr(self, '_stop_requested', False),
+                log_callback=log_callback,
+            )
+            if not commit_gate.commit(
+                    lambda: atomic_write_text(output_path, translated)):
+                self._log("WARNING", f"Cancelled before commit: {filepath.name}")
                 return
-            Path(output_path).write_text(translated, encoding='utf-8')
+        else:
+            raise RuntimeError(f'unsupported file type: {ext}')
 
         self._on_progress(filepath.name, 1, 1, "completed")
         self._log("SUCCESS", f"Saved: {output_path}")

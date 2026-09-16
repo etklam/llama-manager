@@ -12,7 +12,7 @@ to present the plan, not to re-derive it.
 from unittest.mock import Mock, patch
 import time
 
-from subtitle_tab import SubtitleTranslationTab
+from subtitle_tab import RunSnapshot, SubtitleTranslationTab
 from llm_target import LLMTarget
 from translation.preflight import PreflightPlan
 from translation.server_probe import ServerInfo
@@ -89,6 +89,7 @@ def _make_tab(*, workers=3, files=('/test/a.srt',), config=None):
     tab._file_list = list(files)
     tab._translating = False
     tab._stop_requested = False
+    tab._run_seq = 1
     tab._translator = None
 
     tab._batch_var = FakeVar(15)
@@ -115,11 +116,23 @@ def _make_tab(*, workers=3, files=('/test/a.srt',), config=None):
     return tab
 
 
+def _snapshot_for(config, *, files=('/test/a.srt',)):
+    """A RunSnapshot of the shape _start_translation freezes on the UI thread."""
+    return RunSnapshot(
+        files=tuple(files),
+        target_lang='zh-tw',
+        replace_original=False,
+        config=config,
+        run_id=1,
+    )
+
+
 def test_failed_file_is_not_reported_as_all_translated():
     tab = _make_tab()
-    tab._get_target_code = lambda: 'zh-tw'
+    tab._run_seq = 1
     tab._translate_file = Mock(side_effect=RuntimeError('L12: server timeout'))
-    SubtitleTranslationTab._run_translation(tab)
+    SubtitleTranslationTab._run_translation(
+        tab, Mock(), _snapshot_for(_config_for(), files=tuple(tab._file_list)))
     tab._progress_label.config.assert_called_with(text='Finished with 1 failed file(s)')
     assert not any(args[0] == 'SUCCESS' for args, _ in tab._log.call_args_list)
 
@@ -136,7 +149,8 @@ class TestPreflightBlocksRun:
         with patch('subtitle_tab.plan_for_target', return_value=plan), \
              patch('subtitle_tab.messagebox.showerror') as show_error, \
              patch('subtitle_tab.LocalLLMTranslator') as translator_cls:
-            tab._preflight_and_translate(_config_for(workers=tab._workers_var.get()))
+            tab._preflight_and_translate(
+                _snapshot_for(_config_for(workers=tab._workers_var.get())))
 
         tab._run_translation.assert_not_called()
         translator_cls.assert_not_called()
@@ -155,7 +169,8 @@ class TestPreflightBlocksRun:
 
         with patch('subtitle_tab.plan_for_target', return_value=plan), \
              patch('subtitle_tab.messagebox.showerror'):
-            tab._preflight_and_translate(_config_for(workers=tab._workers_var.get()))
+            tab._preflight_and_translate(
+                _snapshot_for(_config_for(workers=tab._workers_var.get())))
 
         assert tab._translating is False
         tab._start_btn.config.assert_called_with(state="normal")
@@ -167,7 +182,8 @@ class TestPreflightBlocksRun:
 
         with patch('subtitle_tab.plan_for_target', return_value=plan), \
              patch('subtitle_tab.LocalLLMTranslator') as translator_cls:
-            tab._preflight_and_translate(_config_for(workers=tab._workers_var.get()))
+            tab._preflight_and_translate(
+                _snapshot_for(_config_for(workers=tab._workers_var.get())))
 
         tab._run_translation.assert_called_once()
         translator_cls.assert_called_once()
@@ -181,7 +197,8 @@ class TestPreflightBlocksRun:
                    return_value=plan) as preflight, \
              patch('subtitle_tab.LocalLLMTranslator'):
             config = _config_for(workers=tab._workers_var.get())
-            tab._preflight_and_translate(config)
+            tab._preflight_and_translate(_snapshot_for(config))
+            config = _config_for(workers=tab._workers_var.get())
 
         preflight.assert_called_once_with(config['target'], 3)
 
@@ -195,7 +212,8 @@ class TestPreflightBlocksRun:
         with patch('subtitle_tab.plan_for_target', return_value=plan), \
              patch('subtitle_tab.messagebox.showerror') as show_error, \
              patch('subtitle_tab.LocalLLMTranslator'):
-            tab._preflight_and_translate(_config_for(workers=tab._workers_var.get()))
+            tab._preflight_and_translate(
+                _snapshot_for(_config_for(workers=tab._workers_var.get())))
 
         show_error.assert_called_once()
         assert show_error.call_args[0][1] == note
@@ -211,7 +229,8 @@ class TestWorkerClamping:
 
         with patch('subtitle_tab.plan_for_target', return_value=plan), \
              patch('subtitle_tab.LocalLLMTranslator') as translator_cls:
-            tab._preflight_and_translate(_config_for(workers=tab._workers_var.get()))
+            tab._preflight_and_translate(
+                _snapshot_for(_config_for(workers=tab._workers_var.get())))
 
         assert translator_cls.call_args[0][0]['max_workers'] == 1
 
@@ -224,7 +243,7 @@ class TestWorkerClamping:
 
         with patch('subtitle_tab.plan_for_target', return_value=plan), \
              patch('subtitle_tab.LocalLLMTranslator') as translator_cls:
-            tab._preflight_and_translate(_config_for(workers=3))
+            tab._preflight_and_translate(_snapshot_for(_config_for(workers=3)))
 
         assert translator_cls.call_args[0][0]['context_size'] == 5461
 
@@ -236,7 +255,8 @@ class TestWorkerClamping:
 
         with patch('subtitle_tab.plan_for_target', return_value=plan), \
              patch('subtitle_tab.LocalLLMTranslator'):
-            tab._preflight_and_translate(_config_for(workers=tab._workers_var.get()))
+            tab._preflight_and_translate(
+                _snapshot_for(_config_for(workers=tab._workers_var.get())))
 
         assert any(call.args[0] == "WARNING" for call in tab._log.call_args_list)
 
@@ -246,7 +266,8 @@ class TestWorkerClamping:
 
         with patch('subtitle_tab.plan_for_target', return_value=plan), \
              patch('subtitle_tab.LocalLLMTranslator') as translator_cls:
-            tab._preflight_and_translate(_config_for(workers=tab._workers_var.get()))
+            tab._preflight_and_translate(
+                _snapshot_for(_config_for(workers=tab._workers_var.get())))
 
         assert translator_cls.call_args[0][0]['max_workers'] == 3
 
@@ -257,7 +278,8 @@ class TestWorkerClamping:
 
         with patch('subtitle_tab.plan_for_target', return_value=plan), \
              patch('subtitle_tab.LocalLLMTranslator') as translator_cls:
-            tab._preflight_and_translate(_config_for(workers=tab._workers_var.get()))
+            tab._preflight_and_translate(
+                _snapshot_for(_config_for(workers=tab._workers_var.get())))
 
         assert translator_cls.call_args[0][0]['max_workers'] == 3
 
@@ -278,7 +300,7 @@ class TestWorkerPersistence:
              patch('subtitle_tab.LocalLLMTranslator'):
             config = _config_for(workers=tab._workers_var.get())
             tab._config_manager.set("ui.max_workers", config['max_workers'])
-            tab._preflight_and_translate(config)
+            tab._preflight_and_translate(_snapshot_for(config))
 
         assert tab._config_manager.get("ui.max_workers") == 3
 
@@ -326,7 +348,8 @@ class TestRemotePreflight:
         with patch('subtitle_tab.LocalLLMTranslator') as translator_cls, \
              patch('subtitle_tab.messagebox.showerror') as show_error, \
              patch('translation.preflight.probe_server') as probe:
-            tab._preflight_and_translate(_config_for(target=target, workers=3))
+            tab._preflight_and_translate(
+                _snapshot_for(_config_for(target=target, workers=3)))
 
         probe.assert_not_called()
         tab._run_translation.assert_not_called()
@@ -345,7 +368,8 @@ class TestRemotePreflight:
 
         with patch('subtitle_tab.LocalLLMTranslator') as translator_cls, \
              patch('translation.preflight.probe_server') as probe:
-            tab._preflight_and_translate(_config_for(target=target, workers=2))
+            tab._preflight_and_translate(
+                _snapshot_for(_config_for(target=target, workers=2)))
 
         probe.assert_not_called()
         tab._run_translation.assert_called_once()

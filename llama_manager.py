@@ -339,12 +339,15 @@ class LlamaManager(LogMixin):
 
     # ---------------------------------------------- Tab change
     def _on_tab_changed(self, event):
-        selected = self.notebook.select()
-        tab_index = self.notebook.index(selected)
-        if tab_index == 0:
+        # Identity mapping, not index routing: a numeric index breaks the
+        # moment tabs are added, removed, or reordered, and the wrong tab's
+        # refresh (e.g. replacing an active run's translator) is exactly the
+        # kind of silent damage index drift causes.
+        selected = self.notebook.nametowidget(self.notebook.select())
+        if selected is self.main_tab:
             self._populate_quick_start()
             self.pipeline_card.populate_models()
-        elif tab_index == 2:
+        elif selected is self.subtitle_tab:
             self.subtitle_tab.refresh_model()
 
     # ---------------------------------------------- Shared helpers

@@ -4,9 +4,10 @@ Two problems this solves, both of which used to surface as "the translation is
 slow" or "the translation hung":
 
   1. A translation run against a server that is not up spends its whole life in
-     tenacity's retry/backoff loop — three attempts per batch, every batch — so
-     a large SRT takes minutes to report a failure that is knowable in
-     milliseconds. Probing once up front turns that into an immediate message.
+     the transport policy's retry/backoff loop — bounded attempts per batch,
+     every batch — so a large SRT takes minutes to report a failure that is
+     knowable in milliseconds. Probing once up front turns that into an
+     immediate message.
 
   2. Client concurrency and server slots are configured independently. Asking
      for 3 workers against a server started with `--parallel 1` does not fail;

@@ -12,6 +12,8 @@ import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from utils.atomic_io import atomic_write_text
+
 
 # Default configuration structure
 DEFAULT_CONFIG = {
@@ -325,12 +327,24 @@ class ConfigManager:
         """
         Internal method to save configuration to file.
 
+        The write is atomic (temp file + replace via utils.atomic_io), so a
+        crash mid-write can never truncate an existing config.json. On a
+        write or replacement failure the previous file bytes are preserved
+        and the exception propagates to the caller.
+
+        In-memory state on save failure: ``set()`` mutates ``self._config``
+        before saving, so a failed save leaves the in-memory config holding
+        the new value while the file still holds the old one. The next
+        successful save re-publishes the in-memory state; the discrepancy
+        lasts only until then, and reloading from disk is what discards the
+        unsaved values. Unknown keys the file carried are always preserved:
+        ``_merge_configs`` keeps extra user keys and this method writes the
+        merged dict verbatim.
+
         Args:
             config: Configuration dictionary to save
         """
-        # Ensure parent directories exist
         self.config_path.parent.mkdir(parents=True, exist_ok=True)
 
-        # Write to file with proper formatting
-        with open(self.config_path, 'w', encoding='utf-8') as f:
-            json.dump(config, f, indent=2, ensure_ascii=False)
+        payload = json.dumps(config, indent=2, ensure_ascii=False)
+        atomic_write_text(self.config_path, payload)

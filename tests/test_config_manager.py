@@ -768,5 +768,62 @@ class TestEdgeCases:
         assert new_port != initial_port, "Value should be different from initial"
 
 
+class TestAtomicConfigPersistence:
+    """Config commits share the atomic writer: failures never truncate."""
+
+    def test_failed_save_preserves_previous_file_bytes(self, tmp_path, monkeypatch):
+        import utils.atomic_io as atomic_io
+        config_file = tmp_path / 'config.json'
+        manager = ConfigManager(str(config_file))
+        manager.load()
+        original = config_file.read_text(encoding='utf-8')
+
+        def broken_replace(src, dst):
+            raise OSError('replace blocked')
+
+        monkeypatch.setattr(atomic_io.os, 'replace', broken_replace)
+        with pytest.raises(OSError, match='replace blocked'):
+            manager.set('server.port', 9999)
+
+        assert config_file.read_text(encoding='utf-8') == original
+
+    def test_unknown_keys_survive_saves(self, tmp_path):
+        config_file = tmp_path / 'config.json'
+        config_file.write_text(json.dumps({
+            'server': {'port': 8080},
+            'future_section': {'unknown_setting': 'keep me'},
+        }), encoding='utf-8')
+
+        manager = ConfigManager(str(config_file))
+        manager.load()
+        manager.set('server.port', 9090)
+
+        with open(config_file, 'r', encoding='utf-8') as f:
+            saved = json.load(f)
+        assert saved['future_section'] == {'unknown_setting': 'keep me'}
+        assert saved['server']['port'] == 9090
+
+    def test_save_failure_leaves_in_memory_state_documented(self, tmp_path, monkeypatch):
+        """On save failure the file keeps old bytes; in-memory holds the new.
+
+        This is the documented contract (see ConfigManager._save_to_file):
+        the discrepancy lasts until the next successful save or a reload.
+        """
+        import utils.atomic_io as atomic_io
+        config_file = tmp_path / 'config.json'
+        manager = ConfigManager(str(config_file))
+        manager.load()
+
+        monkeypatch.setattr(atomic_io.os, 'fsync',
+                            lambda fd: (_ for _ in ()).throw(OSError('disk full')))
+        with pytest.raises(OSError, match='disk full'):
+            manager.set('server.port', 1234)
+
+        # In-memory value took the change even though the file did not.
+        assert manager.get('server.port') == 1234
+        with open(config_file, 'r', encoding='utf-8') as f:
+            assert json.load(f)['server']['port'] == 8080
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "--tb=short"])

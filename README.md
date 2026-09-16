@@ -27,7 +27,7 @@ py -3.12 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
-依賴包含 `tkinterdnd2`、`psutil`、`openai`、`httpx`、`tenacity`。模型與外部執行檔需另行準備。
+依賴包含 `tkinterdnd2`、`psutil`、`openai`、`httpx`（`requirements.txt` 記錄實際測試版本與相容性依據）。模型與外部執行檔需另行準備。
 
 ### 2. 準備外部工具
 
@@ -141,9 +141,11 @@ movie_Traditional Chinese.srt   # 繁體中文翻譯
 
 分析與翻譯會分別顯示進度。Stop 會在模型請求之間生效；已送出的同步 HTTP request 仍需等待回覆或 timeout。分析失敗、取消或翻譯不完整時不會寫入輸出，也不會沿用上一個檔案的背景或自動降級成標準模式。
 
-工作台管線也接受 SRT，會直接跳過 Whisper；一般文字 `.txt` 請使用「字幕翻譯」分頁。
+工作台管線也接受 SRT，會直接跳過 Whisper；一般文字 `.txt` 兩個入口都走同一條全文翻譯路徑：整份文件一次請求、先檢查 context 預算、以 finish reason 判斷完整性，不會經過 SRT 解析或逐句補譯。超過 context window 的 TXT 會明確失敗（檔案與既有輸出保持原狀），不會截斷或分段；本程式不提供無上限的長文件翻譯。
 
 ### 翻譯設定
+
+開始翻譯時，檔案清單、目標語言、Replace original、模型／端點、翻譯模式與生成設定會在 UI 執行緒凍結成不可變的執行快照（Run Snapshot）：執行中切換分頁或修改設定只會影響下一輪，preflight 探測到的並行數與 context 容量也只套用到當輪。
 
 「伺服器設定」的 **翻譯模式** preset 設為 16,384 context、3 個並行槽、512 batch、FlashAttention 與 q8_0 KV cache，並同步翻譯 Workers。這是程式內建起始設定，可再按模型與硬體調整。
 
@@ -177,7 +179,11 @@ movie_Traditional Chinese.srt   # 繁體中文翻譯
 
 工作台右上角 **診斷日誌** 可查看所有分頁的詳細訊息。分頁內的日誌只顯示對應工作。
 
+翻譯請求的傳輸層重試只有一個擁有者：SDK 用戶端以 `max_retries=0` 建立，重試完全由內建的傳輸政策（`translation/transport.py`）決定 — 最多 3 次 HTTP 嘗試、30 秒累計預算、指數退避並尊重（有上限的）`Retry-After`。認證／權限／模型不存在／不支援參數等錯誤立即失敗；context 超限視為請求過大，由呼叫端縮小請求而非原樣重送。同一輪執行中伺服器持續失敗時，整輪中止，不會展開成逐句請求。
+
 漏掉的字幕會自動逐句補譯；補譯仍失敗時，該檔案不會儲存為成功結果，也不會覆寫既有輸出。請找出 `Batch ... failed` 或 `L12: ... retry failed` 的具體錯誤。管線會保留失敗檔案供重新執行。
+
+輸出檔案與 `config.json` 都以暫存檔＋原子替換寫入：寫入或替換失敗時舊檔案內容保持原狀。非空但解析不到任何字幕的 SRT 會明確失敗，不會寫出空的「成功」輸出（勾選 Replace original 時尤其重要）。
 
 ## 🧪 開發與測試
 
@@ -264,7 +270,7 @@ curl http://localhost:8080/v1/chat/completions \
 
 如果補譯仍失敗，日誌會列出行號與錯誤原因（例如 `L12: RuntimeError: ...`），該檔案不會寫入或覆蓋輸出；管線中仍留在 Pending，介面顯示失敗檔案數。修復伺服器或調整設定後可重新執行。這避免先前「保留原句但回報完成」或儲存空白字幕的情況。
 
-排查時請保留 `Batch ... failed`、`retry failed` 附近的日誌：連線／timeout、context 超限、回覆格式問題需要不同處理方式，單靠「保留原句」無法判斷上游原因。
+排查時請保留 `Batch ... failed`、`retry failed` 附近的日誌：連線／timeout、context 超限、回覆格式問題需要不同處理方式，單靠「保留原句」無法判斷上游原因。批次回覆的字幕 ID 會經過驗證：重排的明確 ID 依 ID 對應；重複 ID 保留第一筆；缺少 ID 或混合明確／缺少 ID 的回覆不會用位置猜測，而是交給逐句補譯，避免譯文錯位。
 
 全文分析 JSON 若因 `finish_reason=length` 截斷，程式會縮小輸入並作有上限的分段分析；若 JSON 為空、格式無效或超過欄位上限，每次請求最多作一次格式修復，仍無法驗證便令該檔失敗，不會把半份摘要送入翻譯。容量使用 llama-server `/props` 回報的每個 request／slot `n_ctx`；不會把輸出用的 Max Tokens 當 context，也不會再按 Workers 除一次。舊 build 未回報容量時會在日誌明示使用保守估算；最小合法請求仍放不下時會明確失敗，不截斷原句。
 

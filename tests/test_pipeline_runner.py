@@ -45,6 +45,26 @@ def reachable_server():
         yield preflight
 
 
+@pytest.fixture(autouse=True)
+def isolated_output(tmp_path):
+    """Keep every output write inside the test's own space.
+
+    These tests use fake '/test/...' input paths with a mocked translator.
+    The atomic writer is real code and would faithfully create those
+    directories on the current drive, so it is redirected here: writes are
+    recorded under tmp_path instead of touching the filesystem outside it.
+    """
+    written = {}
+
+    def fake_write(path, text, encoding='utf-8'):
+        target = tmp_path / Path(path).name
+        target.write_text(text, encoding=encoding)
+        written[str(path)] = text
+
+    with patch('pipeline_runner.atomic_write_text', side_effect=fake_write):
+        yield written
+
+
 @pytest.fixture
 def callbacks():
     """Create mock callbacks for log, progress, and completion."""
@@ -124,34 +144,94 @@ class TestTranslateSrtDirectly:
         mock_generate.assert_called_once()
         callbacks['on_done'].assert_called_once()
 
-    @patch('pipeline_runner.generate_srt_from_list', return_value="1\n00:00:00,000 --> 00:00:01,000\nHello\n")
-    @patch('pipeline_runner.LocalLLMTranslator')
-    @patch('pipeline_runner.parse_srt_from_file')
-    @patch('pathlib.Path.write_text', MagicMock())
     def test_txt_file_translates_directly(
-        self, mock_parse, mock_translator_cls, mock_generate, runner, callbacks
+        self, tmp_path, runner, callbacks, isolated_output
     ):
-        mock_parse.return_value = [
-            {'line': 1, 'text': 'Hello', 'time': '00:00:00,000 --> 00:00:01,000'}
-        ]
-        mock_translator = MagicMock()
-        mock_translator.translate_srt.return_value = [
-            {'line': 1, 'text': 'Hola', 'time': '00:00:00,000 --> 00:00:01,000'}
-        ]
-        mock_translator_cls.return_value = mock_translator
+        """TXT never routes through SRT parsing or generation."""
+        source = tmp_path / 'doc.txt'
+        source.write_text('Hello world document', encoding='utf-8')
 
-        runner.run(
-            files=['/test/subs.txt'],
-            target_lang='zh-cn',
-            language='en',
-            replace_original=False,
-            whisper_cli_path=Path('whisper-cli.exe'),
-            whisper_model_name='tiny',
-            whisper_model_dir='/models',
-        )
+        with patch('pipeline_runner.LocalLLMTranslator') as mock_translator_cls, \
+             patch('pipeline_runner.parse_srt_from_file') as mock_parse:
+            mock_translator = MagicMock()
+            mock_translator.translate_full_text.return_value = '你好，世界'
+            mock_translator_cls.return_value = mock_translator
 
-        mock_parse.assert_called_once_with('/test/subs.txt')
+            runner.run(
+                files=[str(source)],
+                target_lang='zh-cn',
+                language='en',
+                replace_original=False,
+                whisper_cli_path=Path('whisper-cli.exe'),
+                whisper_model_name='tiny',
+                whisper_model_dir='/models',
+            )
+
+            # The full-text path: no SRT parse, no cue translation.
+            mock_parse.assert_not_called()
+            mock_translator.translate_srt.assert_not_called()
+            mock_translator.translate_full_text.assert_called_once()
+            assert mock_translator.translate_full_text.call_args.args[0] \
+                == 'Hello world document'
+
+        out = tmp_path / 'doc_Simplified Chinese.txt'
+        assert out.read_text(encoding='utf-8') == '你好，世界'
         callbacks['on_done'].assert_called_once()
+        callbacks['on_file_completed'].assert_called_once_with(str(source))
+
+    def test_oversized_txt_fails_the_file_without_partial_output(
+        self, tmp_path, runner, callbacks, isolated_output
+    ):
+        """An oversized TXT is rejected explicitly, output preserved."""
+        from translation.local_llm_translator import TxtTooLargeError
+
+        source = tmp_path / 'big.txt'
+        source.write_text('x' * 200, encoding='utf-8')
+
+        with patch('pipeline_runner.LocalLLMTranslator') as mock_translator_cls:
+            mock_translator = MagicMock()
+            mock_translator.translate_full_text.side_effect = TxtTooLargeError(
+                'TXT exceeds the context window')
+            mock_translator_cls.return_value = mock_translator
+
+            runner.run(
+                files=[str(source)],
+                target_lang='zh-cn',
+                language='en',
+                replace_original=False,
+                whisper_cli_path=Path('whisper-cli.exe'),
+                whisper_model_name='tiny',
+                whisper_model_dir='/models',
+            )
+
+        assert runner.failed_files == 1
+        assert isolated_output == {}
+        callbacks['on_file_completed'].assert_not_called()
+
+    def test_nonempty_srt_with_zero_cues_fails_instead_of_empty_success(
+        self, tmp_path, runner, callbacks, isolated_output
+    ):
+        source = tmp_path / 'broken.srt'
+        source.write_text('this is not a subtitle file at all', encoding='utf-8')
+
+        with patch('pipeline_runner.LocalLLMTranslator') as mock_translator_cls:
+            mock_translator_cls.return_value.translate_srt.return_value = []
+
+            runner.run(
+                files=[str(source)],
+                target_lang='zh-cn',
+                language='en',
+                replace_original=False,
+                whisper_cli_path=Path('whisper-cli.exe'),
+                whisper_model_name='tiny',
+                whisper_model_dir='/models',
+            )
+
+        assert runner.failed_files == 1
+        assert isolated_output == {}
+        progress_text = ' '.join(
+            str(c.args[0]) for c in callbacks['on_progress'].call_args_list)
+        assert 'no valid subtitle cues' in progress_text
 
 
 # ---------------------------------------------------------------------------
@@ -705,8 +785,9 @@ class TestPreflight:
     ):
         """An unreachable server must abort the run, not translate file by file.
 
-        Without the preflight this ran the whole batch, spending three tenacity
-        retries per batch on a server that was never going to answer.
+        Without the preflight this ran the whole batch, spending the transport
+        policy's full retry budget per batch on a server that was never going
+        to answer.
         """
         reachable_server.return_value = PreflightPlan(
             reachable=False,

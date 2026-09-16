@@ -13,6 +13,7 @@ from whisper_transcription import (
 from transcription_runner import TranscriptionPresenter, TranscriptionRunner
 from translation.local_llm_translator import LocalLLMTranslator
 from translation.preflight import PreflightPlan, plan_for_target, run_preflight
+from utils.atomic_io import CommitGate, atomic_write_text
 from utils.srt_parser import parse_srt_from_file, generate_srt_from_list, output_path_for
 from config_manager import ConfigManager
 
@@ -258,6 +259,13 @@ class PipelineRunner:
             stopped = self._stop_requested
             self._whisper_runner.reset()
             self._running = False
+            # Run-owned HTTP client: connections were reused across the
+            # run's files and are released deterministically here. The next
+            # run builds a fresh translator from its own snapshot.
+            if self._translator is not None:
+                self._translator.close()
+                self._translator = None
+                self._translator_config = None
             self._on_done(stopped=stopped)
             self._stop_requested = False
             self._stop_event.clear()
@@ -332,7 +340,7 @@ class PipelineRunner:
         target_lang: str,
         replace_original: bool,
     ) -> bool:
-        """Parse, translate, and save a subtitle file when it completes."""
+        """Translate one subtitle file, routing by format, not through SRT."""
         snapshot = getattr(self, '_translation_config_snapshot', None)
         target = getattr(self, '_target_snapshot', None)
         config = dict(snapshot) if snapshot is not None else build_translation_config(
@@ -358,23 +366,51 @@ class PipelineRunner:
             self, '_context_mode_snapshot', config.get('context_mode', 'none')
         )
 
-        if Path(srt_path).suffix.lower() == '.txt' and config['context_mode'] == 'story':
-            self._on_progress("全文理解翻譯只適用於 SRT；TXT 使用標準翻譯")
-            config['context_mode'] = 'none'
+        source = Path(srt_path)
+        out_path = output_path_for(srt_path, target_lang, replace_original)
+        # The commit boundary: a Stop landing between the last response and
+        # the write suppresses publication instead of racing it.
+        commit_gate = CommitGate(lambda: getattr(self, '_stop_requested', False))
+        translator = self._get_translator(config)
+
+        if source.suffix.lower() == '.txt':
+            # TXT is full-text translation: one request with its own budget
+            # and completeness rules. It never routes through SRT parsing,
+            # generation, or per-cue recovery.
+            if config['context_mode'] == 'story':
+                self._on_progress("全文理解翻譯只適用於 SRT；TXT 使用標準翻譯")
+            text = source.read_text(encoding='utf-8')
+            self._on_progress(f"Translating text file ({len(text)} chars): {source.name}")
+            translated = translator.translate_full_text(
+                text, target_lang,
+                cancel_check=lambda: getattr(self, '_stop_requested', False),
+                log_callback=lambda lv, m: self._on_log(f"  [{lv}] {m}"),
+            )
+            if not commit_gate.commit(
+                    lambda: atomic_write_text(out_path, translated)):
+                self._on_progress(f"Cancelled before commit: {source.name}")
+                return False
+            self._on_progress(f"Saved: {Path(out_path).name}")
+            return True
 
         subtitles = parse_srt_from_file(srt_path)
         if not subtitles:
-            self._on_progress(f"Empty SRT, skipping: {Path(srt_path).name}")
+            # An empty file is a skip; a non-empty file with zero valid cues
+            # is corrupt input and must fail loudly — an empty "success"
+            # would destroy the original under Replace original.
+            if source.stat().st_size > 0:
+                raise RuntimeError(
+                    f"no valid subtitle cues found in {source.name}")
+            self._on_progress(f"Empty SRT, skipping: {source.name}")
             return False
 
-        self._on_progress(f"Translating {len(subtitles)} lines: {Path(srt_path).name}")
+        self._on_progress(f"Translating {len(subtitles)} lines: {source.name}")
 
-        translator = self._get_translator(config)
         translated = translator.translate_srt(
             subtitles, target_lang,
             progress_callback=lambda c, t, s: self._on_progress(
-                (f"Translating {Path(srt_path).name}: {c}/{t} {s}"
-                 if c >= 0 else f"{Path(srt_path).name}: {s}")
+                (f"Translating {source.name}: {c}/{t} {s}"
+                 if c >= 0 else f"{source.name}: {s}")
             ),
             log_callback=lambda lv, m: self._on_log(f"  [{lv}] {m}"),
             cancel_callback=lambda: getattr(self, '_stop_requested', False),
@@ -384,7 +420,9 @@ class PipelineRunner:
             return False
 
         srt_content = generate_srt_from_list(translated)
-        out_path = output_path_for(srt_path, target_lang, replace_original)
-        Path(out_path).write_text(srt_content, encoding='utf-8')
+        if not commit_gate.commit(
+                lambda: atomic_write_text(out_path, srt_content)):
+            self._on_progress(f"Cancelled before commit: {source.name}")
+            return False
         self._on_progress(f"Saved: {Path(out_path).name}")
         return True
