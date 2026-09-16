@@ -3,13 +3,32 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 dist/
+build/
+*.spec
+
+# Virtualenvs (README instructs creating .venv)
+.venv/
+venv/
+
+# Test / coverage artifacts
+.pytest_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+temp_test_dir*/
 
 # Project-specific
+# config.json and models.json are intentionally tracked: they carry live
+# local state (model paths, profiles without secrets).
 pyvideotrans/
-temp_test_dir*/
-.pytest_cache/
 *.srt
 !test*.srt
+*.log
+
+# Atomic writer temp candidates (.{name}.*.tmp in output directories)
+*.tmp
+.*.tmp
 
 # Embedded repos
 translation/immersive_prompts_temp/
@@ -19,11 +38,14 @@ whisper.cpp/
 nul
 .agents/
 .claude/
-.coverage
 _fiction_prompt.json
 _prompt_dump.json
 skills-lock.json
 docs/
+
+# Windows
+Thumbs.db
+Desktop.ini
 
 # IDE
 .vscode/
