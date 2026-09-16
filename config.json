@@ -41,6 +41,11 @@
     "threads": 8,
     "chunk_long_audio": false
   },
+  "llm": {
+    "mode": "local",
+    "active_profile_id": "",
+    "profiles": []
+  },
   "models": {
     "models": [
       {
