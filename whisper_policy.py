@@ -5,11 +5,16 @@ config key the Whisper tab and the pipeline share, the duration threshold, the
 probe epsilon, the chunk size, and the checkbox label that renders that size.
 Callers ask the policy and execute the ChunkPlan it returns; the bare config
 key string never leaves this module.
+
+Also owns the skip-existing flag (`whisper.skip_existing_srt`) and the
+sidecar SRT path that filter checks, for the same reason: the key and the
+path the engine commits to must not drift apart.
 """
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from pathlib import Path
 
 from config_manager import ConfigManager
 
@@ -17,6 +22,8 @@ from config_manager import ConfigManager
 CONFIG_KEY = "whisper.chunk_long_audio"
 CHUNK_SECONDS = 30 * 60
 _CHUNK_TIME_EPSILON = 0.001
+
+SKIP_EXISTING_KEY = "whisper.skip_existing_srt"
 
 
 @dataclass(frozen=True)
@@ -69,3 +76,23 @@ def chunking_label() -> str:
     the policy enforces.
     """
     return f"Chunk long audio ({CHUNK_SECONDS // 60} min, anti-repeat)"
+
+
+def skip_existing_enabled(config_manager: ConfigManager) -> bool:
+    """Read the skip-existing flag from config; off when it was never set."""
+    return bool(config_manager.get(SKIP_EXISTING_KEY, False))
+
+
+def set_skip_existing_enabled(config_manager: ConfigManager, enabled: bool) -> None:
+    """Persist the skip-existing flag for the Whisper tab."""
+    config_manager.set(SKIP_EXISTING_KEY, bool(enabled))
+
+
+def existing_srt_for(filepath: str) -> Path:
+    """Where the Committed SRT lands for `filepath` — `<stem>.srt` beside it.
+
+    Must stay in sync with the transcriber's commit target
+    (`output_dir / f"{source.stem}.srt"`); the skip-existing filter asks this
+    so the two cannot drift apart.
+    """
+    return Path(filepath).with_suffix(".srt")

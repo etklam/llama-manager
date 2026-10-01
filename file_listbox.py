@@ -5,14 +5,30 @@ and pipeline_card. Owns a FileListboxModel (pure-Python state) + a tk.Listbox
 Three callers differ only in valid extensions. Subclasses ttk.Frame so it
 composes inside any container; caller wraps in a LabelFrame if it wants a title.
 """
+import os
 import tkinter as tk
 from tkinter import ttk, filedialog
 from pathlib import Path
-from typing import Callable, Optional, Sequence
+from typing import Callable, List, Optional, Sequence, Set
 
 from tkinterdnd2 import DND_FILES
 
 from ui_helpers import parse_dropped_paths
+
+
+def scan_directory(directory: str, valid_extensions: Set[str]) -> List[str]:
+    """Recursively collect supported files under `directory`, subdirs included.
+
+    os.walk (not Path.rglob) so an unreadable subdirectory is skipped instead
+    of aborting the whole scan; sorted for a stable, readable order.
+    """
+    valid = {e.lower() for e in valid_extensions}
+    found = []
+    for root, _dirs, names in os.walk(directory, onerror=lambda _e: None):
+        for name in names:
+            if Path(name).suffix.lower() in valid:
+                found.append(str(Path(root) / name))
+    return sorted(found)
 
 
 class FileListboxModel:
@@ -54,6 +70,10 @@ class FileListboxModel:
         # ponytail: parse_dropped_paths already lives in ui_helpers — reuse it.
         paths = (p.strip() for p in parse_dropped_paths(raw_data))
         return self.add_many([p for p in paths if p])
+
+    def add_directory(self, directory: str) -> int:
+        """Add every supported file under `directory` (recursive)."""
+        return self.add_many(scan_directory(directory, self._valid))
 
     def remove(self, filepath: str) -> bool:
         if filepath not in self._files:
@@ -135,6 +155,13 @@ class FileListbox(ttk.Frame):
 
     def add(self, filepath: str) -> bool:
         return self.model.add(filepath)
+
+    def add_many(self, paths: Sequence[str]) -> int:
+        return self.model.add_many(paths)
+
+    def add_directory(self, directory: str) -> int:
+        """Add every supported file under `directory` (recursive)."""
+        return self.model.add_directory(directory)
 
     def remove(self, filepath: str) -> bool:
         return self.model.remove(filepath)

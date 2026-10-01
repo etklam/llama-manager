@@ -19,8 +19,15 @@ from constants import SUPPORTED_MEDIA, WHISPER_LANGUAGES
 from ui_helpers import (
     CHANNEL_WHISPER, LogMixin, populate_language_combo, extract_combo_code,
 )
-from file_listbox import FileListbox
-from whisper_policy import chunking_enabled, chunking_label, set_chunking_enabled
+from file_listbox import FileListbox, scan_directory
+from whisper_policy import (
+    chunking_enabled,
+    chunking_label,
+    existing_srt_for,
+    set_chunking_enabled,
+    set_skip_existing_enabled,
+    skip_existing_enabled,
+)
 
 
 class _WhisperTabPresenter(TranscriptionPresenter):
@@ -160,6 +167,15 @@ class WhisperTab(LogMixin, ttk.Frame):
         self._file_listbox_widget.grid(row=0, column=0, sticky=(tk.W, tk.E))
         self._file_listbox = self._file_listbox_widget.listbox
 
+        ttk.Button(self._file_listbox_widget.button_row, text="Add Directory",
+                   command=self._browse_directory).pack(side=tk.LEFT, padx=2)
+
+        self._skip_exist_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(self._file_listbox_widget.button_row,
+                        text="Skip existing SRT",
+                        variable=self._skip_exist_var,
+                        command=self._on_setting_changed).pack(side=tk.LEFT, padx=2)
+
     def _create_control_section(self):
         frame = ttk.Frame(self)
         frame.grid(row=2, column=0, pady=(0, 5), sticky=tk.W)
@@ -217,6 +233,7 @@ class WhisperTab(LogMixin, ttk.Frame):
         self._threads_var.set(cm.get("whisper.threads", 8))
         self._threads_label.config(text=str(self._threads_var.get()))
         self._chunk_var.set(chunking_enabled(cm))
+        self._skip_exist_var.set(skip_existing_enabled(cm))
 
     def _save_settings(self):
         cm = self._config_manager
@@ -229,6 +246,7 @@ class WhisperTab(LogMixin, ttk.Frame):
         cm.set("whisper.language", self._get_language_code())
         cm.set("whisper.threads", int(float(self._threads_var.get())))
         set_chunking_enabled(cm, bool(self._chunk_var.get()))
+        set_skip_existing_enabled(cm, bool(self._skip_exist_var.get()))
 
     def _on_setting_changed(self, event=None):
         self._save_settings()
@@ -259,6 +277,26 @@ class WhisperTab(LogMixin, ttk.Frame):
             self._model_combo.current(0)
         self._log("INFO", f"Found {len(names)} model(s)")
 
+    def _browse_directory(self):
+        directory = filedialog.askdirectory(
+            title="Select a directory (subdirectories included)")
+        if not directory:
+            return
+        files = scan_directory(directory, SUPPORTED_MEDIA)
+        skipped = 0
+        if self._skip_exist_var.get():
+            kept = []
+            for f in files:
+                if existing_srt_for(f).exists():
+                    skipped += 1
+                else:
+                    kept.append(f)
+            files = kept
+        added = self._file_listbox_widget.add_many(files)
+        self._log("INFO", f"Added {added} file(s) from {directory}")
+        if skipped:
+            self._log("INFO", f"Skipped {skipped} file(s) with existing SRT")
+
     def _sync_file_list(self):
         """Mirror the widget's file list so _start_transcription reads it."""
         self._file_list = self._file_listbox_widget.files
@@ -281,6 +319,11 @@ class WhisperTab(LogMixin, ttk.Frame):
         if self._runner.running:
             return
 
+        if self._skip_exist_var.get() and not self._transcribable_files():
+            messagebox.showinfo(
+                "Skip existing SRT", "All selected files already have an SRT.")
+            return
+
         self._start_btn.config(state="disabled")
         self._stop_btn.config(state="normal")
         self._progress_var.set(0)
@@ -296,7 +339,22 @@ class WhisperTab(LogMixin, ttk.Frame):
         self._log("WARNING", "Cancelling current transcription...")
 
     def _run_transcription(self):
-        self._runner.run_files(self._file_list, self._build_request)
+        files = self._transcribable_files()
+        for f in self._file_list:
+            if f not in files:
+                self._log("INFO", f"Skipped (SRT exists): {Path(f).name}")
+        self._runner.run_files(files, self._build_request)
+
+    def _transcribable_files(self):
+        """The file list for a run: without SRT-already-exists files when skipping.
+
+        Re-checked at run time (not just at directory-scan time) so a file
+        whose SRT appeared since it was added is still protected.
+        """
+        if not self._skip_exist_var.get():
+            return self._file_list
+        return [f for f in self._file_list
+                if not existing_srt_for(f).exists()]
 
     def _build_request(self, filepath):
         """Build one TranscriptionRequest from the tab's current settings."""

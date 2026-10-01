@@ -22,7 +22,10 @@ from whisper_policy import (
     chunking_enabled,
     chunking_label,
     decide,
+    existing_srt_for,
     set_chunking_enabled,
+    set_skip_existing_enabled,
+    skip_existing_enabled,
 )
 
 
@@ -414,6 +417,26 @@ class TestChunkingPolicy:
         assert chunking_label() == (
             f"Chunk long audio ({CHUNK_SECONDS // 60} min, anti-repeat)"
         )
+
+
+class TestSkipExisting:
+    def test_flag_round_trips_through_config(self, tmp_path):
+        from config_manager import ConfigManager
+        cm = ConfigManager(str(tmp_path / "cfg.json"))
+        cm.load()
+
+        assert skip_existing_enabled(cm) is False
+        set_skip_existing_enabled(cm, True)
+        assert skip_existing_enabled(cm) is True
+        set_skip_existing_enabled(cm, False)
+        assert skip_existing_enabled(cm) is False
+
+    def test_existing_srt_for_sits_beside_media(self, tmp_path):
+        media = tmp_path / "video.mkv"
+        assert existing_srt_for(str(media)) == tmp_path / "video.srt"
+
+    def test_existing_srt_for_replaces_only_last_suffix(self):
+        assert existing_srt_for("/x/a.b.mp4") == Path("/x/a.b.srt")
 
 
 def test_output_directory_failure_is_returned_as_failed_outcome(tmp_path):

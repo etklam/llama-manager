@@ -16,7 +16,7 @@ from pathlib import Path
 import pytest
 
 from constants import SUPPORTED_SUBTITLE, SUPPORTED_MEDIA
-from file_listbox import FileListboxModel
+from file_listbox import FileListboxModel, scan_directory
 
 
 # ---------------------------------------------------------------------------
@@ -56,6 +56,55 @@ class TestAdd:
         added = m.add_many(["/tmp/a.srt", "/tmp/b.srt", "/tmp/c.txt"])
         assert added == 2
         assert m.files == ["/tmp/a.srt", "/tmp/b.srt", "/tmp/c.txt"]
+
+
+# ---------------------------------------------------------------------------
+# add_directory() — recursive scan via scan_directory()
+# ---------------------------------------------------------------------------
+
+class TestAddDirectory:
+    def test_collects_supported_from_subdirectories(self, tmp_path):
+        (tmp_path / "sub" / "deeper").mkdir(parents=True)
+        for rel in ("a.mp4", "sub/b.mkv", "sub/deeper/c.mp3", "d.srt"):
+            (tmp_path / rel).write_bytes(b"x")
+
+        m = FileListboxModel(SUPPORTED_MEDIA)
+        added = m.add_directory(str(tmp_path))
+
+        assert added == 3
+        assert sorted(m.files) == sorted([
+            str(tmp_path / "a.mp4"),
+            str(tmp_path / "sub" / "b.mkv"),
+            str(tmp_path / "sub" / "deeper" / "c.mp3"),
+        ])
+
+    def test_skips_existing_files_in_list(self, tmp_path):
+        (tmp_path / "a.mp4").write_bytes(b"x")
+        m = FileListboxModel(SUPPORTED_MEDIA)
+        m.add(str(tmp_path / "a.mp4"))
+
+        assert m.add_directory(str(tmp_path)) == 0
+        assert len(m.files) == 1
+
+    def test_no_supported_files_adds_none_and_skips_notify(self, tmp_path):
+        (tmp_path / "a.srt").write_bytes(b"x")
+        events = []
+        m = FileListboxModel(SUPPORTED_MEDIA, on_change=lambda: events.append(1))
+
+        assert m.add_directory(str(tmp_path)) == 0
+        assert m.files == []
+        assert events == []
+
+    def test_scan_directory_is_case_insensitive_and_sorted(self, tmp_path):
+        (tmp_path / "b.MP4").write_bytes(b"x")
+        (tmp_path / "a.mp4").write_bytes(b"x")
+
+        found = scan_directory(str(tmp_path), SUPPORTED_MEDIA)
+
+        assert found == [str(tmp_path / "a.mp4"), str(tmp_path / "b.MP4")]
+
+    def test_scan_directory_empty_dir(self, tmp_path):
+        assert scan_directory(str(tmp_path), SUPPORTED_MEDIA) == []
 
 
 # ---------------------------------------------------------------------------

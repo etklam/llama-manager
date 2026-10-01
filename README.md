@@ -114,7 +114,7 @@ movie_Traditional Chinese.srt   # 繁體中文翻譯
 ### 只做語音轉錄
 
 1. 到「語音轉錄」完成 Settings 設定。
-2. 在 File Selection 選音訊／影片（例如 mp4、mkv、mp3、wav、flac、m4a）。
+2. 在 File Selection 選音訊／影片（例如 mp4、mkv、mp3、wav、flac、m4a）。按 **Add Directory** 可一次加入整個目錄下所有支援的檔案（含子目錄），重複檔案會自動略過。勾 **Skip existing SRT** 後，掃目錄與開始轉錄都會跳過已有同名 `.srt` 的檔案（設定存於 `config.json`）。
 3. 日文選 `ja - Japanese`，按 **Start Transcription**。
 4. 程式以 FFmpeg 轉成 16kHz 單聲道 WAV，再交給 whisper-cli 產生同名 SRT；完成後也會加入「字幕翻譯」檔案清單。
 
@@ -219,7 +219,7 @@ movie_Traditional Chinese.srt   # 繁體中文翻譯
 主要設定群組：
 
 - `server`：port、GPU 層數、context、並行槽與加速選項。
-- `whisper`：CLI 路徑、模型目錄、語言、執行緒數、長音訊分段選項。
+- `whisper`：CLI 路徑、模型目錄、語言、執行緒數、長音訊分段選項、跳過已有 SRT 選項。
 - `ui`：最後選擇的文字模型、目標語言及翻譯參數。
 - `ui.context_mode`：`none`（標準翻譯）或 `story`（全文理解翻譯）；舊設定缺少時使用 `none`。
 - `llm`：翻譯後端 — `mode`（`local`／`remote`）、`active_profile_id` 與 `profiles`（遠端 OpenAI 相容端點設定檔）。設定檔只存 `api_key_env` 環境變數名稱，不存金鑰本身；舊設定缺少時使用 `local`。
