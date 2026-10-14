@@ -55,12 +55,12 @@ tinted.
 | `surface` | `#1b1e24` | Section panels — the content plane |
 | `raised` | `#272a31` | Inputs, secondary buttons |
 | `overlay` | `#30343c` | Hover fills |
-| `border` | `#353941` | Hairlines, panel edges |
-| `border_strong` | `#535862` | Button edges, emphasis |
+| `border` | `#70757e` | Hairlines, panel edges |
+| `border_strong` | `#7b808b` | Button edges, emphasis |
 | `focus` | `#739bf5` | Keyboard focus ring |
 | `ink` | `#edeef1` | Body text (not `#fff`: it blooms on dark over long sessions) |
 | `ink_muted` | `#b2b6bd` | Field labels, secondary text |
-| `ink_faint` | `#8b8f97` | Hints, timestamps (large/secondary only) |
+| `ink_faint` | `#8b8f97` | Hints, timestamps |
 | `accent` | `#648eed` | Primary action, selection, progress |
 | `ok` | `#61cb7c` | Success, server running |
 | `warn` | `#f3b539` | Stopped, clamped, unverified |
@@ -74,7 +74,7 @@ tinted.
 | `canvas` | `#f3f5f9` | | `accent` | `#2b53be` |
 | `surface` | `#ffffff` | | `ok` | `#00672c` |
 | `raised` | `#f5f7fb` | | `warn` | `#825100` |
-| `border` | `#d4d7de` | | `danger` | `#b00a1d` |
+| `border` | `#898c92` | | `danger` | `#b00a1d` |
 | `ink` | `#1d2028` | | `info` | `#006485` |
 | `ink_muted` | `#525760` | | `focus` | `#3760c9` |
 
@@ -83,16 +83,18 @@ colors stay equally identifiable against white.
 
 ### Contrast is checked, not asserted
 
-`ui_tokens.audit_palette()` runs 21 text-on-surface pairs against WCAG 2.1 for
-both palettes. **Both pass with zero failures** (body text ≥4.5:1, large text
-and non-text boundaries ≥3:1). Verify after any palette edit:
+`ui_tokens.audit_palette()` runs 35 text, selection and control-boundary pairs
+against WCAG 2.1 for both palettes. **Both pass with zero failures** (all audited
+text ≥4.5:1, control boundaries ≥3:1). Small hints, navigation shortcuts and log
+timestamps use the same text threshold; button borders are checked against
+their normal and hover fills. Verify after any palette edit:
 
 ```bash
 python tools/preview_ui.py --audit    # exits non-zero on any failure
 ```
 
 Lowest passing margins, worth knowing before nudging a lightness value:
-`ink_muted on raised` and `border_strong on surface`.
+`accent on accent_soft` in dark mode and `border on canvas` in light mode.
 
 ### Color is never the only signal
 

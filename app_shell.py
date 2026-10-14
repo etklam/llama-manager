@@ -634,7 +634,11 @@ class AppShell(ttk.Frame):
 
     # --------------------------------------------------------------- state
     def _on_run_state(self, state: RunState) -> None:
-        self.header.set_run(state)
+        # A completion or abort belongs to one channel. Keep showing work
+        # still in flight on another channel before rendering that outcome.
+        active = run_bus.active()
+        displayed = active[-1] if active and not state.active else state
+        self.header.set_run(displayed)
         key = self._channel_owner.get(state.channel)
         if key is not None:
             self.nav.set_busy(key, state.state != "idle", state.state)

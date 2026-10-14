@@ -161,11 +161,12 @@ class MangaTab(LogMixin, ttk.Frame):
             field.pack(anchor="w")
             self._numeric[key] = field
 
-        for key, label, default in (("source", "來源語言", "ja"),
-                                    ("locale", "目標語言", "zh-tw")):
+        for column, (key, label, default) in enumerate(
+                (("source", "來源語言", "ja"),
+                 ("locale", "目標語言", "zh-tw"))):
             self.vars[key] = tk.StringVar(
                 value=self.config.get("manga." + key, default))
-            ttk.Entry(param_grid.add(label), textvariable=self.vars[key],
+            ttk.Entry(param_grid.add(label, column=column), textvariable=self.vars[key],
                       width=10).pack(anchor="w")
 
         modes = Section(parent, "處理方式")
@@ -305,13 +306,17 @@ class MangaTab(LogMixin, ttk.Frame):
         self.status.set(message)
         self._render_status(state)
         self._log(level, message)
-        if state in ("ok", "warn", "error"):
-            run_bus.end(CHANNEL_MANGA, "漫畫 OCR／翻譯", state, message)
-        elif self.active:
+        # Diagnostics can be warnings or errors while a worker is still
+        # restoring the server. Only a terminal run may publish an outcome.
+        if self.active:
             run_bus.progress(CHANNEL_MANGA, "漫畫 OCR／翻譯", None, message)
+        elif state in ("ok", "warn", "error"):
+            run_bus.end(CHANNEL_MANGA, "漫畫 OCR／翻譯", state, message)
 
     def _set_running(self, running):
         self.active = running
+        if running:
+            self.progress.configure(value=0, style="Accent.Horizontal.TProgressbar")
         self._start_button.state(("disabled",) if running else ("!disabled",))
         self._resume_button.state(("disabled",) if running else ("!disabled",))
         self._cancel_button.state(("!disabled",) if running else ("disabled",))
@@ -601,7 +606,6 @@ class MangaTab(LogMixin, ttk.Frame):
             verified = report['stages'] and all(
                 x['status'] == 'verified' for x in report['stages'])
             counts = report.get('counts', {})
-            self.progress.configure(value=self.progress.cget('maximum'))
             failures = report['failures']
             message = (
                 f"{report['status']}；OCR 成功 {counts.get('success', 0)}／"
@@ -611,12 +615,29 @@ class MangaTab(LogMixin, ttk.Frame):
                 + ('；' + report['error'] if 'error' in report else '')
                 + ('；還原失敗：' + report['restore_error']
                    if report['restore_error'] else ''))
-            outcome = "error" if (failures or report.get('error')) else "ok"
+            if report.get('restore_error'):
+                outcome = "error"
+            elif report['status'] == 'cancelled':
+                outcome = "warn"
+            elif failures or report.get('error') or report['status'] == 'failed':
+                outcome = "error"
+            elif (report['status'] in ('completed', 'ocr_finished')
+                  and not any(counts.get(key, 0)
+                              for key in ('failed', 'needs_review', 'pending'))):
+                outcome = "ok"
+            else:
+                outcome = "warn"
+            if outcome == "ok":
+                self.progress.configure(value=self.progress.cget('maximum'))
             self.progress.configure(
-                style="Danger.Horizontal.TProgressbar" if outcome == "error"
-                else "Ok.Horizontal.TProgressbar")
+                style={"ok": "Ok.Horizontal.TProgressbar",
+                       "warn": "Warn.Horizontal.TProgressbar",
+                       "error": "Danger.Horizontal.TProgressbar"}[outcome])
             self._set_status(message, state=outcome,
-                             level="ERROR" if outcome == "error" else "SUCCESS")
+                             level={"ok": "SUCCESS", "warn": "WARNING",
+                                    "error": "ERROR"}[outcome])
+        elif stage == 'loading':
+            self._set_status('載入模型：' + event.get('model', ''), state="busy")
         elif stage in ('ocr', 'translation'):
             self.progress.configure(maximum=event['total'],
                                     value=event['current'] - 1)
