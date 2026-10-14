@@ -537,6 +537,18 @@ class SubtitleTranslationTab(LogMixin, ttk.Frame):
         thread.start()
 
     def _preflight_and_translate(self, snapshot: RunSnapshot):
+        from contextlib import nullcontext
+        server = getattr(self, 'local_server', None)
+        local = snapshot.config['target'].mode == 'local'
+        try:
+            with server.lease('subtitle') if server and local else nullcontext():
+                self._preflight_and_translate_owned(snapshot)
+        except Exception as error:
+            self._log('ERROR', str(error))
+            self.winfo_toplevel().after(
+                0, lambda: self._on_translation_aborted(snapshot.run_id))
+
+    def _preflight_and_translate_owned(self, snapshot: RunSnapshot):
         """Preflight the LLM backend, then run the batch. Runs on the worker thread.
 
         The probe is here rather than in _start_translation because it is a

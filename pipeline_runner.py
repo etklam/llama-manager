@@ -179,6 +179,7 @@ class PipelineRunner:
         # A stop requested before run() is honored by the run loop: its first
         # transcribe_file creates a fresh token and cancels it immediately.
 
+        lease = None
         try:
             model_path = self._resolve_whisper_model_path(whisper_model_dir, whisper_model_name)
             # Preflight once per run, before any transcription. The caller
@@ -188,9 +189,14 @@ class PipelineRunner:
             # storm during translation. The resolved target decides which
             # preflight runs — the /props probe and its slot count for a local
             # llama-server, a configuration check for a remote profile.
-            target = resolve_llm_target(
+            target = getattr(self, 'run_target', None) or resolve_llm_target(
                 self._config_manager, self._get_port, self._get_current_model
             )
+            server = getattr(self, 'local_server', None)
+            if server is not None and target.mode == 'local':
+                candidate = server.lease('pipeline')
+                candidate.__enter__()
+                lease = candidate
             requested_workers = target.max_workers
             plan = self._wait_for_ready(target, requested_workers)
             if plan is None or self._stop_requested:
@@ -204,9 +210,9 @@ class PipelineRunner:
                 return
             self._preflight_plan = plan
             self._target_snapshot = target
-            self._translation_config_snapshot = build_translation_config(
+            self._translation_config_snapshot = dict(getattr(self, 'run_config', None) or build_translation_config(
                 self._config_manager, target
-            )
+            ))
             self._translation_config_snapshot['max_workers'] = plan.workers
             self._translation_config_snapshot['context_size'] = plan.info.context_size
             self._translation_config_snapshot['context_mode'] = self._context_mode_snapshot
@@ -256,6 +262,8 @@ class PipelineRunner:
             self.startup_error = f"{type(error).__name__}: {error}"
             self._on_progress(f"Error: {self.startup_error}")
         finally:
+            if lease is not None:
+                lease.__exit__(None, None, None)
             stopped = self._stop_requested
             self._whisper_runner.reset()
             self._running = False

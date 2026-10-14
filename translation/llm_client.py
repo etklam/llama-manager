@@ -32,7 +32,7 @@ class LLMClient(Protocol):
 
     def complete(
         self,
-        messages: List[Dict[str, str]],
+        messages: List[Dict[str, object]],
         model: str,
         max_tokens: int,
         temperature: float

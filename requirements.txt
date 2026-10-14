@@ -20,3 +20,6 @@ tkinterdnd2
 # Subtitle translation dependencies
 openai>=2.0.0,<3.0.0
 httpx>=0.28.0,<1.0.0
+
+# Image decoding/EXIF/native preview only; tested with Pillow 11.3.0.
+Pillow>=11.3,<12

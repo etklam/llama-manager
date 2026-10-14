@@ -18,6 +18,7 @@ from server_tab import ServerTab
 from pipeline_card import PipelineCard
 from config_manager import ConfigManager
 from server_controller import ServerController
+from manga_tab import MangaTab
 from model_registry import ModelRegistry
 from whisper_model_registry import WhisperModelRegistry
 from ui_theme import apply_theme
@@ -71,6 +72,18 @@ class LlamaManager(LogMixin):
 
         # Allow ServerTab to call back to scan_models
         self.root._app = self
+        self.root.protocol("WM_DELETE_WINDOW", self._request_close)
+
+    def _request_close(self):
+        # Keep Tk dispatch alive until the manga worker releases its lease and
+        # finishes restoring the previously owned server after cancellation.
+        self.manga_tab._closing = True
+        if self.manga_tab.active:
+            self.manga_tab.cancel()
+            self.root.after(100, self._request_close)
+            return
+        self._close_debug_win()
+        self.root.destroy()
 
     def scan_models(self):
         if not self.model_dir.exists():
@@ -136,6 +149,10 @@ class LlamaManager(LogMixin):
         )
         self.notebook.add(self.whisper_tab, text="語音轉錄")
 
+        self.subtitle_tab.local_server = self.server
+        self.pipeline_card.local_server = self.server
+        self.manga_tab = MangaTab(self.notebook, self.server, self.config_manager)
+        self.notebook.add(self.manga_tab, text="漫畫 OCR／翻譯")
         self.notebook.bind('<<NotebookTabChanged>>', self._on_tab_changed)
 
     # ---------------------------------------------------- Server Tab callbacks

@@ -49,6 +49,7 @@ class OpenAIClient:
         cancel_check: Optional[Callable[[], bool]] = None,
         sleep_fn: Optional[Callable[[float], None]] = None,
         clock_fn: Optional[Callable[[], float]] = None,
+        redact_errors: bool = False,
     ):
         """
         Initialize the OpenAI client adapter.
@@ -67,6 +68,7 @@ class OpenAIClient:
             sleep_fn: Backoff waiter (injectable fake clock for tests).
             clock_fn: Elapsed-time clock (injectable fake for tests).
         """
+        self.redact_errors = redact_errors
         self.api_url = api_url
         self.model = model
         self.api_key = api_key
@@ -149,7 +151,7 @@ class OpenAIClient:
     # classifies it as context-length and never retries it.
     def complete(
         self,
-        messages: List[Dict[str, str]],
+        messages: List[Dict[str, object]],
         model: str,
         max_tokens: int,
         temperature: float
@@ -184,7 +186,7 @@ class OpenAIClient:
 
     def complete_with_metadata(
         self,
-        messages: List[Dict[str, str]],
+        messages: List[Dict[str, object]],
         model: str,
         max_tokens: int,
         temperature: float,
@@ -205,7 +207,7 @@ class OpenAIClient:
 
     def complete_analysis(
         self,
-        messages: List[Dict[str, str]],
+        messages: List[Dict[str, object]],
         model: str,
         max_tokens: int,
         temperature: float,
@@ -233,7 +235,7 @@ class OpenAIClient:
 
     def _request_completion(
         self,
-        messages: List[Dict[str, str]],
+        messages: List[Dict[str, object]],
         model: str,
         max_tokens: int,
         temperature: float,
@@ -272,17 +274,23 @@ class OpenAIClient:
         except (ProviderUnavailableError, TransportCancelledError) as error:
             # The endpoint rides along so a remote-profile failure names the
             # provider instead of surfacing as a bare "connection error".
-            logger.error(f'[OpenAIClient] API call failed ({self.api_url}): {error}')
+            detail = type(error).__name__ if self.redact_errors else error
+            logger.error(f'[OpenAIClient] API call failed ({self.api_url}): {detail}')
             raise
         except Exception as e:
-            logger.error(f'[OpenAIClient] API call failed ({self.api_url}): {e}')
+            detail = type(e).__name__ if self.redact_errors else e
+            logger.error(f'[OpenAIClient] API call failed ({self.api_url}): {detail}')
+            if self.redact_errors:
+                if isinstance(e, (transport.FatalProviderError, transport.ContextLengthError)):
+                    raise type(e)(f'Provider rejected request ({type(e).__name__}); check runtime/model settings') from e
+                raise RuntimeError(f'Invalid provider response ({type(e).__name__})') from e
             raise
 
         # Validate response. A malformed body is a content problem for the
         # caller's recovery path, not a transport fault, so it is never
         # retried here.
         if isinstance(response, str):
-            raise RuntimeError(f'Invalid response type: {response}')
+            raise RuntimeError(f'Invalid response type: {type(response).__name__}')
 
         if not hasattr(response, 'choices') or not response.choices:
             raise RuntimeError('Invalid response - no choices')

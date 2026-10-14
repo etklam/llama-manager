@@ -12,6 +12,7 @@ Windows 桌面工具，用於啟動本地 llama.cpp 模型、透過 whisper.cpp 
 | 伺服器設定 | 選擇 GGUF 模型、設定 GPU／上下文／並行槽、啟停 llama-server |
 | 字幕翻譯 | 將 `.srt`／`.txt` 翻譯成指定語言，支援批次、單步／兩步及 SRT 全文理解模式 |
 | 語音轉錄 | 使用 whisper.cpp 將音訊／影片轉成 SRT，支援長音訊分段 |
+| 漫畫 OCR／翻譯 | 批量圖片 → GLM-OCR 候選模型 → 本地 Vulkan 文字模型；校正、checkpoint、取消／續跑與雙語文字 |
 
 只做語音轉錄不需要啟動 llama-server；字幕翻譯需要 LLM 伺服器；媒體管線需要兩者。
 
@@ -111,6 +112,16 @@ movie_Traditional Chinese.srt   # 繁體中文翻譯
 
 **Replace original** 在媒體管線中是覆寫產生的 `.srt`，不會覆寫影片。Whisper 轉錄本身會在成功時更新同名 `.srt`。管線的 **Clear** 會清空 Pending 與 Completed 清單；Stop 會取消目前轉錄，翻譯期間則需等待當前翻譯呼叫返回。
 
+### 批量漫畫 OCR → 本地翻譯
+
+開「漫畫 OCR／翻譯」，選 llama-server executable，按「枚舉／診斷」選 Vulkan device，再選 OCR GGUF＋matching mmproj 與翻譯 GGUF。加入圖片／資料夾、調整頁序與文件分組，選語言後按「執行」。漫畫路徑與設定全部可由 GUI 設定，不跟隨全域 remote profile。
+
+支援只做 OCR、OCR 後翻譯、重用 OCR 重新翻譯；可選先校對。每頁／每批立即 atomic checkpoint，原圖唯讀。空結果需要人工確認無文字；不完整文件只發布帶缺漏標記的 partial 譯文。重啟後按「載入工作記錄」選輸出根目錄 `manga-job.json`，再續跑。
+
+第一個候選為 `ggml-org/GLM-OCR-GGUF:Q8_0` 與匹配 projector。**目前完整真機 Vulkan OCR＋翻譯與漫畫品質驗收均為 NOT RUN**；runtime 裝置可見、模型載入或 mocks 通過不等於真機通過。沒有消字、嵌字或翻譯後漫畫圖片。
+
+安裝、模型配對、校正、輸出、限制及 10–20 頁驗收步驟見 [漫畫 OCR Vulkan 文件](docs/manga-ocr-vulkan.md)。本機驗證入口：`python tools/verify_manga_vulkan.py --help`。
+
 ### 只做語音轉錄
 
 1. 到「語音轉錄」完成 Settings 設定。
@@ -187,7 +198,7 @@ movie_Traditional Chinese.srt   # 繁體中文翻譯
 
 ## 🧪 開發與測試
 
-介面使用共用的淺色主題，工作台、伺服器設定、字幕翻譯與語音轉錄四個分頁保留既有工作流程。伺服器參數分組排列，日誌區隨視窗伸展。
+介面使用共用的淺色主題，工作台、伺服器設定、字幕翻譯、語音轉錄與漫畫 OCR／翻譯五個分頁保留既有工作流程。伺服器參數分組排列，日誌區隨視窗伸展。
 
 日誌顯示每 80ms 最多處理 200 筆，以一次 Tk 呼叫批次插入。各顯示佇列最多保留 4,000 筆待處理訊息；超量會略過最舊訊息並顯示略過筆數。向上捲動閱讀時會保留閱讀位置。此優化針對介面回應速度與日誌記憶體用量，不改變模型推論參數。
 
@@ -201,6 +212,12 @@ movie_Traditional Chinese.srt   # 繁體中文翻譯
 # 跳過翻譯子套件的緩慢測試
 .\.venv\Scripts\python.exe -m pytest --ignore=tests/translation --no-cov -q
 ```
+
+本次漫畫 MVP 測試記錄（2026-09-18）：
+
+- Baseline：`python -m pytest --basetemp=temp_test_dir_manga_baseline` → **731 passed**。
+- 最終全套：`python -m pytest --basetemp=temp_test_dir_manga_delivery -rs` → **784 passed，0 failed，0 skipped**（45.26 秒，coverage 90%）。既有字幕、TXT、全文理解、Whisper、local／remote 測試均保留。
+- `python tools/verify_manga_vulkan.py --help`、本機 `--inspect-only` 已執行。完整真機 OCR＋翻譯與漫畫品質仍為 **NOT RUN**，原因及驗收程序見 [完整紀錄](docs/manga-ocr-vulkan.md)。
 
 主要架構模組：
 

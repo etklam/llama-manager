@@ -1,9 +1,27 @@
 """ServerController - Manages llama.cpp server process lifecycle."""
 import subprocess
+import socket
+import os
+from contextlib import contextmanager
+from collections import deque
+from functools import wraps
 import threading
 import time
 from pathlib import Path
 from typing import Optional, Callable
+
+
+class ServerBusyError(RuntimeError):
+    pass
+
+
+def owned_operation(method):
+    @wraps(method)
+    def wrapped(self, *args, **kwargs):
+        with self._state_lock:
+            self._check_owner()
+            return method(self, *args, **kwargs)
+    return wrapped
 
 
 class ServerController:
@@ -16,6 +34,11 @@ class ServerController:
             server_exe: Path to llama-server.exe executable
             log_callback: Function to call with each line of server output
         """
+        self._state_lock = threading.RLock()
+        self._lease_owner = None
+        self._lease_name = None
+        self.last_command = None
+        self.logs = deque(maxlen=4000)
         self._server_exe = server_exe
         self._log_callback = log_callback
         self._process: Optional[subprocess.Popen] = None
@@ -24,6 +47,7 @@ class ServerController:
         self._log_thread: Optional[threading.Thread] = None
         self._log_thread_stopped = False  # Flag to track if log thread ended naturally
 
+    @owned_operation
     def start(self, model_path: str, port: int, host: str,
               gpu_layers: int, context_size: int, batch_size: int,
               parallel: int = 1, flash_attn: bool = True,
@@ -35,7 +59,8 @@ class ServerController:
               dflash_n_max: int = 6,
               dflash_gpu_layers: str = "all",
               dflash_device: str = "Vulkan0",
-              mmproj_path: str = "") -> None:
+              mmproj_path: str = "", device: str = "",
+              extra_args: tuple = ()) -> None:
         """Start the server with given params.
 
         Args:
@@ -119,6 +144,38 @@ class ServerController:
         if mmproj_path:
             cmd += ["--mmproj", mmproj_path]
 
+        if device:
+            cmd += ["--device", device]
+        cmd += list(extra_args)
+        self.start_command(cmd, port)
+
+    @contextmanager
+    def lease(self, name):
+        owner = threading.get_ident()
+        with self._state_lock:
+            if self._lease_owner is not None:
+                raise ServerBusyError(f"Local server busy: {self._lease_name}")
+            self._lease_owner, self._lease_name = owner, name
+        try:
+            yield self
+        finally:
+            with self._state_lock:
+                self._lease_owner = self._lease_name = None
+
+    def _check_owner(self):
+        if self._lease_owner is not None and self._lease_owner != threading.get_ident():
+            raise ServerBusyError(f"Local server busy: {self._lease_name}")
+
+    @owned_operation
+    def start_command(self, cmd, port, isolated=False):
+        if self._process is not None or self._running:
+            raise RuntimeError("Server is already running")
+        # Never attach to an external listener, even if it speaks our API.
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", port))
+        self.logs = deque(maxlen=4000)
+        self._isolated_logs = isolated
+        self.last_command = (tuple(cmd), port, isolated)
         # Start process
         self._process = subprocess.Popen(
             cmd,
@@ -128,7 +185,11 @@ class ServerController:
             bufsize=1,
             universal_newlines=True,
             encoding='utf-8',
-            errors='replace'
+            errors='replace',
+            env=({k: v for k, v in os.environ.items()
+                  if not k.startswith(('LLAMA_ARG_', 'MTMD_', 'GGML_'))}
+                 if isolated else None),
+            creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),
         )
 
         self._running = True
@@ -138,6 +199,7 @@ class ServerController:
         # Start log monitoring thread
         self._log_thread = threading.Thread(
             target=self._monitor_logs,
+            args=(self._process, self.logs, isolated),
             daemon=True
         )
         self._log_thread.start()
@@ -145,27 +207,19 @@ class ServerController:
         # Give the thread a moment to start
         time.sleep(0.01)
 
+    @owned_operation
     def stop(self) -> None:
-        """Stop the running server.
-
-        Safe to call multiple times. Does nothing if server is not running.
-        """
-        if not self._running or not self._process:
+        """Stop only our tracked process; retain ownership on failure."""
+        process = self._process
+        if process is None:
             return
-
+        process.terminate()
         try:
-            # Try graceful termination first
-            self._process.terminate()
-
-            # Wait for process to end
-            try:
-                self._process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                # Force kill if it doesn't terminate
-                self._process.kill()
-                self._process.wait()
-
-        finally:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5)
+        if self._process is process:
             self._running = False
             self._port = None
             self._process = None
@@ -175,27 +229,37 @@ class ServerController:
         """Is the server currently running?"""
         return self._running
 
+    def assert_alive(self):
+        with self._state_lock:
+            if self._process is None or self._process.poll() is not None:
+                raise RuntimeError('Managed server process is no longer alive')
+
     @property
     def port(self) -> Optional[int]:
         """The port the server is running on, or None."""
         return self._port
 
-    def _monitor_logs(self) -> None:
+    def _monitor_logs(self, process=None, log_lines=None, isolated=None) -> None:
         """Monitor server stdout and call log callback for each line.
 
         Runs in a background thread.
         """
-        if not self._process:
+        process = process or self._process
+        log_lines = self.logs if log_lines is None else log_lines
+        isolated = getattr(self, '_isolated_logs', False) if isolated is None else isolated
+        if not process:
             return
 
         try:
-            for line in iter(self._process.stdout.readline, ''):
+            for line in iter(process.stdout.readline, ''):
                 if not line:
                     break
 
                 line = line.strip()
                 if line:
-                    self._log_callback(line)
+                    log_lines.append(line)
+                    if not isolated:
+                        self._log_callback(line)
 
         except Exception as e:
             # Log errors only if server is supposed to be running
@@ -205,8 +269,8 @@ class ServerController:
         # Server process has ended
         # Only mark as stopped if the process actually died (poll returns exit code)
         # In tests with mocks, the process might still be "running"
-        if self._process and self._process.poll() is not None:
-            # Process actually died
-            self._running = False
-            self._port = None
-            self._process = None
+        with self._state_lock:
+            if self._process is process and process.poll() is not None:
+                self._running = False
+                self._port = None
+                self._process = None

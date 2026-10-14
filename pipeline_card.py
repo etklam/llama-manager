@@ -14,7 +14,7 @@ from constants import (
 )
 from llm_target import current_mode, resolve_llm_target
 from ui_helpers import populate_language_combo, extract_combo_code
-from config_helpers import CONTEXT_MODE_LABELS, context_mode_from_label
+from config_helpers import CONTEXT_MODE_LABELS, context_mode_from_label, build_translation_config
 from file_listbox import FileListbox
 
 
@@ -252,6 +252,9 @@ class PipelineCard(ttk.LabelFrame):
             on_file_completed=self._pipeline_file_completed,
         )
 
+        self._pipeline_runner.local_server = getattr(self, 'local_server', None)
+        self._pipeline_runner.run_target = resolve_llm_target(self._config, self._get_port, self._get_current_model)
+        self._pipeline_runner.run_config = build_translation_config(self._config, self._pipeline_runner.run_target)
         threading.Thread(
             target=self._run_pipeline, args=(run,), daemon=True).start()
 

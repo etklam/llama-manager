@@ -50,3 +50,10 @@ Desktop.ini
 # IDE
 .vscode/
 .idea/
+
+# Manga outputs and machine-specific verification artifacts
+output/
+verification-reports/
+!docs/
+docs/*
+!docs/manga-ocr-vulkan.md
