@@ -3,27 +3,27 @@ Subtitle Translation Tab - tkinter GUI for batch SRT/TXT translation.
 """
 
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from tkinter import ttk, messagebox
 import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, List, Optional
-
-from tkinterdnd2 import DND_FILES
+from typing import List, Optional
 
 from utils.atomic_io import CommitGate, atomic_write_text
 from utils.srt_parser import parse_srt_from_file, generate_srt_from_list, output_path_for
-from translation.local_llm_translator import (
-    LocalLLMTranslator,
-    TxtTooLargeError,
-)
+from translation.local_llm_translator import LocalLLMTranslator
 from translation.preflight import plan_for_target
 
 from constants import SUPPORTED_SUBTITLE, TARGET_LANGUAGES, SOURCE_LANGUAGES
 from ui_helpers import (
     CHANNEL_TRANSLATE, LogMixin, populate_language_combo, extract_combo_code,
+    run_bus,
 )
+from ui_kit import (
+    ActionBar, Disclosure, FieldGrid, ScrollArea, Section, labelled_scale,
+)
+from ui_tokens import SPACE
 from config_helpers import (
     CONTEXT_MODE_LABELS,
     build_translation_config,
@@ -70,7 +70,7 @@ class SubtitleTranslationTab(LogMixin, ttk.Frame):
     log_channel = CHANNEL_TRANSLATE
 
     def __init__(self, parent, get_port_callback, get_model_callback, config_manager=None):
-        super().__init__(parent, padding=12)
+        super().__init__(parent, style="Canvas.TFrame")
         self._get_port = get_port_callback
         self._get_model = get_model_callback
         self._config_manager = config_manager
@@ -87,8 +87,20 @@ class SubtitleTranslationTab(LogMixin, ttk.Frame):
         self._total_files = 1
         self._file_start_time = time.time()
 
+        # Built before _create_ui because the target section reads it, and the
+        # advanced section (which used to own it) now renders after that.
+        saved_context_mode = (
+            config_manager.get("ui.context_mode", "none") if config_manager else "none")
+        self._context_mode_var = tk.StringVar(
+            value=CONTEXT_MODE_LABELS.get(saved_context_mode,
+                                          CONTEXT_MODE_LABELS['none']))
+
         self._init_translator()
         self._create_ui()
+
+    def on_surface_shown(self):
+        """Shell hook, replacing the notebook's tab-changed routing."""
+        self.refresh_model()
 
     def _current_target(self):
         """The LLM endpoint this tab's next run uses, from the shared resolver."""
@@ -147,214 +159,182 @@ class SubtitleTranslationTab(LogMixin, ttk.Frame):
     # --- UI Creation ---
 
     def _create_ui(self):
+        """Heading, then queue, then backend, then advanced, then run controls.
+
+        Reading order matches run order: what to translate, into what, through
+        which model, with which tuning, then go. The log is no longer here —
+        it is the shell's drawer, shared by every surface.
+        """
         self.columnconfigure(0, weight=1)
-        self.rowconfigure(5, weight=1)
+        self.rowconfigure(1, weight=1)
 
-        # Row 0: File Selection
-        self._create_file_section()
+        heading = ttk.Frame(self, style="Canvas.TFrame")
+        heading.grid(row=0, column=0, sticky="ew",
+                     padx=SPACE["page"], pady=(SPACE["section"], SPACE["loose"]))
+        ttk.Label(heading, text="字幕翻譯", style="Display.TLabel").pack(anchor="w")
+        ttk.Label(heading, text="批次翻譯 SRT 與 TXT；輸出只在整檔成功後才寫入。",
+                  style="CanvasMuted.TLabel").pack(anchor="w",
+                                                   pady=(SPACE["hair"], 0))
 
-        # Row 1: Language & Model
-        self._create_language_section()
+        body = ScrollArea(self)
+        body.grid(row=1, column=0, sticky="nsew")
+        content = body.body
+        content.columnconfigure(0, weight=1)
 
-        # Row 2: Options
-        self._create_options_section()
+        self._create_file_section(content, row=0)
+        self._create_target_section(content, row=1)
+        self._create_options_section(content, row=2)
+        self._create_control_section(content, row=3)
 
-        # Row 3: Controls
-        self._create_control_section()
-
-        # Row 4: Progress & Log
-        self._create_progress_section()
-
-    def _create_file_section(self):
-        frame = ttk.LabelFrame(self, text="File Selection", padding="5")
-        frame.grid(row=0, column=0, sticky=(tk.W, tk.E), pady=(0, 5))
-        frame.columnconfigure(0, weight=1)
+    def _create_file_section(self, parent, row):
+        section = Section(parent, "來源檔案",
+                          "拖放或選擇 .srt／.txt；整個資料夾可從「語音轉錄」帶入。")
+        section.grid(row=row, column=0, sticky="ew", padx=SPACE["page"],
+                     pady=(0, SPACE["loose"]))
 
         self._file_listbox_widget = FileListbox(
-            frame, valid_extensions=SUPPORTED_SUBTITLE,
-            filetypes_label="Subtitle files",
+            section.body, valid_extensions=SUPPORTED_SUBTITLE,
+            filetypes_label="字幕檔",
             filetypes_exts=[".srt", ".txt"],
             on_change=self._sync_file_list,
+            empty_hint="拖放 .srt 或 .txt 檔到這裡",
+            height=6,
         )
-        self._file_listbox_widget.grid(row=0, column=0, sticky=(tk.W, tk.E))
+        self._file_listbox_widget.grid(row=0, column=0, sticky="ew")
         self._file_listbox = self._file_listbox_widget.listbox
 
-        # ponytail: extra control rides along the widget's existing btn row.
         self._replace_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(self._file_listbox_widget.button_row,
-                        text="Replace original",
-                        variable=self._replace_var).pack(side=tk.LEFT, padx=10)
+                        text="覆寫原檔",
+                        variable=self._replace_var).pack(
+            side=tk.LEFT, padx=(SPACE["base"], 0))
 
-    def _create_language_section(self):
-        frame = ttk.Frame(self)
-        frame.grid(row=1, column=0, sticky=(tk.W, tk.E), pady=(0, 5))
+    def _create_target_section(self, parent, row):
+        """Languages and the LLM backend: everything that decides the output."""
+        section = Section(parent, "翻譯目標與後端")
+        section.grid(row=row, column=0, sticky="ew", padx=SPACE["page"],
+                     pady=(0, SPACE["loose"]))
 
-        # Source language
-        ttk.Label(frame, text="Source:").pack(side=tk.LEFT, padx=(0, 2))
+        grid = FieldGrid(section.body, columns=2, label_width=10)
+        grid.grid(row=0, column=0, sticky="ew")
+
         last_source = self._config_manager.get("ui.last_source_lang", "auto") if self._config_manager else "auto"
         self._source_var = tk.StringVar(value=last_source)
-        self._source_combo = ttk.Combobox(frame, textvariable=self._source_var,
-                                           state="readonly", width=15)
-        self._source_combo.pack(side=tk.LEFT, padx=(0, 10))
+        self._source_combo = ttk.Combobox(
+            grid.add("來源語言"), textvariable=self._source_var, state="readonly")
+        self._source_combo.pack(fill="x")
 
-        # Arrow
-        ttk.Label(frame, text="->").pack(side=tk.LEFT, padx=5)
-
-        # Target language
-        ttk.Label(frame, text="Target:").pack(side=tk.LEFT, padx=(0, 2))
         last_target = self._config_manager.get("ui.last_target_lang", "zh-cn") if self._config_manager else "zh-cn"
         self._target_var = tk.StringVar(value=last_target)
-        self._target_combo = ttk.Combobox(frame, textvariable=self._target_var,
-                                           state="readonly", width=15)
-        self._target_combo.pack(side=tk.LEFT, padx=(0, 10))
+        self._target_combo = ttk.Combobox(
+            grid.add("目標語言", column=1), textvariable=self._target_var,
+            state="readonly")
+        self._target_combo.pack(fill="x")
 
-        # Model display
-        ttk.Label(frame, text="   Model:").pack(side=tk.LEFT, padx=(10, 2))
-        self._model_label = ttk.Label(frame, text="(unknown)",
-                                       foreground="blue")
-        self._model_label.pack(side=tk.LEFT)
+        self._context_mode_combo = ttk.Combobox(
+            grid.add("翻譯模式"), textvariable=self._context_mode_var,
+            values=list(CONTEXT_MODE_LABELS.values()), state="readonly")
+        self._context_mode_combo.pack(fill="x")
+
+        # This is the app-wide backend switch: the Workbench pipeline reads
+        # whatever is selected here rather than offering its own.
+        mode = current_mode(self._config_manager)
+        self._llm_mode_var = tk.StringVar(
+            value=LLM_MODE_LABELS.get(mode, LLM_MODE_LABELS[MODE_LOCAL]))
+        self._llm_mode_combo = ttk.Combobox(
+            grid.add("LLM 連線", column=1), textvariable=self._llm_mode_var,
+            values=list(LLM_MODE_LABELS.values()), state="readonly")
+        self._llm_mode_combo.pack(fill="x")
+        self._llm_mode_combo.bind('<<ComboboxSelected>>',
+                                  self._on_llm_mode_changed)
+
+        profile_cell = grid.add("遠端設定檔")
+        self._llm_profile_var = tk.StringVar()
+        self._llm_profile_combo = ttk.Combobox(
+            profile_cell, textvariable=self._llm_profile_var, state="readonly")
+        self._llm_profile_combo.pack(side="left", fill="x", expand=True)
+        self._llm_profile_combo.bind('<<ComboboxSelected>>',
+                                     self._on_llm_profile_changed)
+        ttk.Button(profile_cell, text="設定…", style="Ghost.TButton",
+                   command=self._open_llm_settings).pack(
+            side="left", padx=(SPACE["snug"], 0))
+
+        model_cell = grid.add("使用模型", column=1)
+        self._model_label = ttk.Label(model_cell, text="(未知)",
+                                      style="MonoMuted.TLabel", anchor="w")
+        self._model_label.pack(fill="x")
 
         self._populate_languages()
         self._update_model_display()
+        self._refresh_llm_profile_combo()
 
-    def _create_options_section(self):
-        self._adv_frame = ttk.LabelFrame(self, text="Advanced Options",
-                                          padding="5")
-        self._adv_frame.grid(row=2, column=0, sticky=(tk.W, tk.E),
-                             pady=(0, 5))
-        self._adv_frame.columnconfigure(1, weight=1)
-
-        # Restore saved values or use defaults
+    def _create_options_section(self, parent, row):
+        """Generation tuning. Collapsed: correct defaults, rarely touched."""
         cm = self._config_manager
         saved_batch = cm.get("ui.batch_size", 15) if cm else 15
         saved_temp = cm.get("ui.temperature", 0.2) if cm else 0.2
         saved_tokens = cm.get("ui.max_tokens", 16384) if cm else 16384
         saved_workers = cm.get("ui.max_workers", 3) if cm else 3
         saved_fast = cm.get("ui.single_step", True) if cm else True
-        saved_context_mode = cm.get("ui.context_mode", "none") if cm else "none"
-        self._context_mode_var = tk.StringVar(
-            value=CONTEXT_MODE_LABELS.get(saved_context_mode, CONTEXT_MODE_LABELS['none'])
-        )
 
-        # Row 0: Batch size
-        ttk.Label(self._adv_frame, text="Batch Size:").grid(
-            row=0, column=0, sticky=tk.W, padx=(0, 5))
+        self._adv_frame = Disclosure(parent, "進階生成設定")
+        self._adv_frame.grid(row=row, column=0, sticky="ew",
+                             padx=SPACE["page"], pady=(0, SPACE["loose"]))
+
+        grid = FieldGrid(self._adv_frame.body, columns=2, label_width=10)
+        grid.grid(row=0, column=0, sticky="ew")
+
         self._batch_var = tk.IntVar(value=saved_batch)
-        batch_scale = ttk.Scale(self._adv_frame, from_=1, to=50,
-                                variable=self._batch_var, orient=tk.HORIZONTAL,
-                                length=150)
-        batch_scale.grid(row=0, column=1, sticky=tk.W)
-        # A Scale writes doubles into its variable even when it is an IntVar, so
-        # a bound textvariable renders "23.548387096774196". Format for display
-        # and leave the var alone — IntVar.get() already truncates for us.
-        self._batch_label = ttk.Label(self._adv_frame, text=str(saved_batch))
-        self._batch_label.grid(row=0, column=2, padx=(5, 20))
-        batch_scale.configure(command=lambda v: self._batch_label.config(
-            text=str(int(float(v)))))
+        holder, self._batch_label = labelled_scale(
+            grid.add("批次行數"), self._batch_var, 1, 50)
+        holder.pack(anchor="w")
 
-        # Row 0: Temperature
-        ttk.Label(self._adv_frame, text="Temperature:").grid(
-            row=0, column=3, sticky=tk.W, padx=(0, 5))
         self._temp_var = tk.DoubleVar(value=saved_temp)
-        temp_scale = ttk.Scale(self._adv_frame, from_=0.0, to=2.0,
-                               variable=self._temp_var, orient=tk.HORIZONTAL,
-                               length=150)
-        temp_scale.grid(row=0, column=4, sticky=tk.W)
-        # Round for display only: bound straight to the DoubleVar, a drag shows
-        # the raw float ("0.36129032258064515") and swamps the row.
-        self._temp_label = ttk.Label(self._adv_frame, text=f"{saved_temp:.2f}")
-        self._temp_label.grid(row=0, column=5, padx=5)
-        temp_scale.configure(command=lambda v: self._temp_label.config(
-            text=f"{float(v):.2f}"))
+        temp_holder, self._temp_label = labelled_scale(
+            grid.add("溫度", column=1), self._temp_var, 0, 2, fmt="{:.2f}")
+        temp_holder.pack(anchor="w")
 
-        # Row 1: Max tokens
-        ttk.Label(self._adv_frame, text="Max Tokens:").grid(
-            row=1, column=0, sticky=tk.W, padx=(0, 5))
         self._tokens_var = tk.IntVar(value=saved_tokens)
-        tokens_combo = ttk.Combobox(
-            self._adv_frame, textvariable=self._tokens_var,
+        ttk.Combobox(
+            grid.add("最大輸出 tokens"), textvariable=self._tokens_var,
             values=[512, 1024, 2048, 4096, 8192, 16384, 32768],
-            width=10, state="readonly")
-        tokens_combo.grid(row=1, column=1, sticky=tk.W)
+            width=10, state="readonly").pack(anchor="w")
 
-        # Row 1: Workers
-        ttk.Label(self._adv_frame, text="并发数:").grid(
-            row=1, column=3, sticky=tk.W, padx=(20, 5))
         self._workers_var = tk.IntVar(value=saved_workers)
-        self._workers_scale = ttk.Scale(self._adv_frame, from_=1, to=8,
-                  variable=self._workers_var, orient=tk.HORIZONTAL,
-                  length=120)
-        self._workers_scale.grid(row=1, column=4, sticky=tk.W)
-        self._workers_label = ttk.Label(self._adv_frame, text=str(saved_workers))
-        self._workers_label.grid(row=1, column=5, padx=5)
-        self._workers_scale.configure(command=lambda v: self._workers_label.config(
-            text=str(int(float(v)))))
+        workers_holder, self._workers_label = labelled_scale(
+            grid.add("並發數", column=1,
+                     hint="實際並發會被伺服器的 slot 數限制。"),
+            self._workers_var, 1, 8, length=120)
+        workers_holder.pack(anchor="w")
+        self._workers_scale = workers_holder.scale
 
-        # Row 2: Fast mode checkbox
         self._fast_mode_var = tk.BooleanVar(value=saved_fast)
-        ttk.Checkbutton(self._adv_frame, text="快速模式 (跳过直译, 仅意译)",
+        ttk.Checkbutton(self._adv_frame.body,
+                        text="快速模式（跳過直譯，只輸出意譯）",
                         variable=self._fast_mode_var).grid(
-            row=2, column=0, columnspan=3, sticky=tk.W, pady=(5, 0))
+            row=1, column=0, sticky="w", pady=(SPACE["snug"], 0))
 
-        self._adv_frame.grid_remove()  # Hidden by default
+    def _create_control_section(self, parent, row):
+        section = Section(parent, "執行", flush=True)
+        section.grid(row=row, column=0, sticky="ew", padx=SPACE["page"],
+                     pady=(0, SPACE["page"]))
 
-    def _create_control_section(self):
-        container = ttk.Frame(self)
-        container.grid(row=3, column=0, pady=(0, 5), sticky=tk.W)
+        self._progress_var = tk.DoubleVar(value=0)
+        self._progress_bar = ttk.Progressbar(
+            section.body, variable=self._progress_var, maximum=100,
+            style="Accent.Horizontal.TProgressbar")
+        self._progress_bar.grid(row=0, column=0, sticky="ew")
 
-        # Row 1: LLM connection. This is the app-wide switch: the pipeline
-        # card and this tab both consume the mode/profile selected here.
-        llm_row = ttk.Frame(container)
-        llm_row.pack(fill=tk.X, pady=(0, 4))
+        self._progress_label = ttk.Label(section.body, text="就緒",
+                                         style="MonoMuted.TLabel", anchor="w")
+        self._progress_label.grid(row=1, column=0, sticky="ew",
+                                  pady=(SPACE["snug"], SPACE["base"]))
 
-        ttk.Label(llm_row, text="LLM 連線:").pack(side=tk.LEFT, padx=(0, 3))
-        mode = current_mode(self._config_manager)
-        self._llm_mode_var = tk.StringVar(
-            value=LLM_MODE_LABELS.get(mode, LLM_MODE_LABELS[MODE_LOCAL]))
-        self._llm_mode_combo = ttk.Combobox(
-            llm_row, textvariable=self._llm_mode_var,
-            values=list(LLM_MODE_LABELS.values()), state="readonly", width=14,
-        )
-        self._llm_mode_combo.pack(side=tk.LEFT, padx=(0, 6))
-        self._llm_mode_combo.bind(
-            '<<ComboboxSelected>>', self._on_llm_mode_changed)
-
-        self._llm_profile_var = tk.StringVar()
-        self._llm_profile_combo = ttk.Combobox(
-            llm_row, textvariable=self._llm_profile_var,
-            state="readonly", width=22,
-        )
-        self._llm_profile_combo.pack(side=tk.LEFT, padx=(0, 6))
-        self._llm_profile_combo.bind(
-            '<<ComboboxSelected>>', self._on_llm_profile_changed)
-
-        ttk.Button(llm_row, text="設定...",
-                   command=self._open_llm_settings).pack(side=tk.LEFT, padx=2)
-        self._refresh_llm_profile_combo()
-
-        # Row 2: run controls
-        frame = ttk.Frame(container)
-        frame.pack(fill=tk.X)
-
-        ttk.Label(frame, text="翻譯模式:").pack(side=tk.LEFT, padx=(0, 3))
-        self._context_mode_combo = ttk.Combobox(
-            frame, textvariable=self._context_mode_var,
-            values=list(CONTEXT_MODE_LABELS.values()), state="readonly", width=16,
-        )
-        self._context_mode_combo.pack(side=tk.LEFT, padx=(0, 10))
-
-        self._toggle_adv_btn = ttk.Button(frame, text="Show Advanced",
-                                          command=self._toggle_advanced)
-        self._toggle_adv_btn.pack(side=tk.LEFT, padx=2)
-
-        self._start_btn = ttk.Button(frame, text="Start Translation",
-                                     command=self._start_translation)
-        self._start_btn.pack(side=tk.LEFT, padx=10)
-
-        self._stop_btn = ttk.Button(frame, text="Stop",
-                                    command=self._stop_translation,
-                                    state="disabled")
-        self._stop_btn.pack(side=tk.LEFT, padx=2)
+        bar = ActionBar(section.body)
+        bar.grid(row=2, column=0, sticky="ew")
+        self._start_btn = bar.primary("開始翻譯", self._start_translation)
+        self._stop_btn = bar.danger("停止", self._stop_translation)
+        self._stop_btn.state(("disabled",))
 
     # --- LLM connection controls ---
 
@@ -399,21 +379,6 @@ class SubtitleTranslationTab(LogMixin, ttk.Frame):
     def _on_llm_settings_changed(self):
         self._refresh_llm_profile_combo()
         self._update_model_display()
-
-    def _create_progress_section(self):
-        frame = ttk.Frame(self)
-        frame.grid(row=4, column=0, sticky=(tk.W, tk.E), pady=(0, 5))
-        frame.columnconfigure(0, weight=1)
-
-        self._progress_var = tk.DoubleVar(value=0)
-        self._progress_bar = ttk.Progressbar(
-            frame, variable=self._progress_var, maximum=100)
-        self._progress_bar.grid(row=0, column=0, sticky=(tk.W, tk.E))
-
-        self._progress_label = ttk.Label(frame, text="Ready")
-        self._progress_label.grid(row=1, column=0, sticky=tk.W)
-
-        self._init_log_widget(self, row=5, column=0)
 
     # --- Language population ---
 
@@ -463,17 +428,9 @@ class SubtitleTranslationTab(LogMixin, ttk.Frame):
         """Mirror the widget's file list so _start_translation reads it."""
         self._file_list = self._file_listbox_widget.files
 
-    def _toggle_advanced(self):
-        if self._adv_frame.winfo_ismapped():
-            self._adv_frame.grid_remove()
-            self._toggle_adv_btn.config(text="Show Advanced")
-        else:
-            self._adv_frame.grid()
-            self._toggle_adv_btn.config(text="Hide Advanced")
-
     def _start_translation(self):
         if not self._file_list:
-            messagebox.showwarning("Warning", "Please select files first!")
+            messagebox.showwarning("沒有檔案", "請先選擇要翻譯的字幕檔。")
             return
 
         if self._translating:
@@ -516,7 +473,9 @@ class SubtitleTranslationTab(LogMixin, ttk.Frame):
         self._stop_btn.config(state="normal")
         self._file_listbox.config(state="disabled")
         self._progress_var.set(0)
-        self._clear_log()
+        self._progress_bar.configure(style="Accent.Horizontal.TProgressbar")
+        run_bus.begin(CHANNEL_TRANSLATE, f"翻譯 {len(snapshot.files)} 個檔案",
+                      "準備中…")
 
         if self._config_manager:
             self._config_manager.set("ui.batch_size", config['batch_size'])
@@ -610,11 +569,12 @@ class SubtitleTranslationTab(LogMixin, ttk.Frame):
         self._start_btn.config(state="normal")
         self._stop_btn.config(state="disabled")
         self._file_listbox.config(state="normal")
-        self._progress_label.config(text="Ready")
+        self._progress_label.config(text="就緒")
+        run_bus.clear(CHANNEL_TRANSLATE)
 
     def _stop_translation(self):
         self._stop_requested = True
-        self._log("WARNING", "Stopping after the current model request...")
+        self._log("WARNING", "正在停止…（等待目前這次模型請求結束）")
 
     def _run_translation(self, translator: LocalLLMTranslator,
                          snapshot: RunSnapshot):
@@ -664,14 +624,25 @@ class SubtitleTranslationTab(LogMixin, ttk.Frame):
         self._stop_btn.config(state="disabled")
         self._file_listbox.config(state="normal")
         if self._stop_requested:
-            self._progress_label.config(text="Stopped")
-            self._log("INFO", "Translation stopped")
+            outcome, message = "warn", "已停止"
+            self._log("INFO", "翻譯已停止")
         elif self._failed_files:
-            self._progress_label.config(text=f"Finished with {self._failed_files} failed file(s)")
-            self._log("ERROR", f"{self._failed_files} file(s) failed; see line errors above. Outputs were not saved for failed translations.")
+            outcome = "error"
+            message = f"完成，但有 {self._failed_files} 個檔案失敗"
+            self._log("ERROR",
+                      f"{self._failed_files} 個檔案失敗；詳見上方逐行錯誤。"
+                      "失敗的檔案不會寫出任何輸出。")
         else:
-            self._progress_label.config(text="Completed")
-            self._log("SUCCESS", "All files translated!")
+            outcome, message = "ok", "全部完成"
+            self._log("SUCCESS", "所有檔案翻譯完成！")
+        self._progress_label.config(text=message)
+        # The bar the operator is already watching reports the outcome, so a
+        # finished run does not require reading the log to learn it failed.
+        self._progress_bar.configure(
+            style={"ok": "Ok.Horizontal.TProgressbar",
+                   "warn": "Warn.Horizontal.TProgressbar",
+                   "error": "Danger.Horizontal.TProgressbar"}[outcome])
+        run_bus.end(CHANNEL_TRANSLATE, "字幕翻譯", outcome, message)
 
     # --- Helper methods ---
 
@@ -758,6 +729,7 @@ class SubtitleTranslationTab(LogMixin, ttk.Frame):
         """
         if current < 0:
             label = f"{file_name} · {status}"
+            run_bus.progress(CHANNEL_TRANSLATE, file_name, None, status)
             self.winfo_toplevel().after(
                 0, lambda t=label: self._progress_label.config(text=t)
             )
@@ -785,6 +757,12 @@ class SubtitleTranslationTab(LogMixin, ttk.Frame):
         label = f"{file_name} ({current}/{total})"
         if detail:
             label = f"{label} · {detail}"
+
+        # The same numbers reach the persistent header, so the operator can
+        # read progress from any surface instead of only this one.
+        run_bus.progress(CHANNEL_TRANSLATE,
+                         f"翻譯 {file_name} ({file_idx + 1}/{total_files})",
+                         overall_pct, detail)
 
         self.winfo_toplevel().after(0, lambda p=overall_pct, t=label: (
             self._progress_var.set(p),

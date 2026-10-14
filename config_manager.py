@@ -36,8 +36,24 @@ DEFAULT_CONFIG = {
         'dflash_device': 'Vulkan0',
         'mmproj_path': ''
     },
+    # Where the llama.cpp build and models live. These were literals in
+    # llama_manager.__init__ ("D:\\AI\\llama\\llama.cpp"), which meant the one
+    # setting the app cannot start without was the only setting not
+    # configurable. Empty means "not configured yet" and the Server surface
+    # shows first-run guidance instead of failing.
+    'paths': {
+        'base_dir': '',
+        'runtime_dir': '',
+        'model_dir': '',
+        'server_exe': ''
+    },
     'ui': {
-        'theme': 'default',
+        # 'dark' | 'light'. Dark by default: the runs this tool starts are long
+        # and checked by glance, usually with the monitor as the main light.
+        'theme': 'dark',
+        # Tk has no prefers-reduced-motion, so the run spinner's animation is
+        # opt-out here instead.
+        'reduce_motion': False,
         'auto_scroll': True,
         'last_model': '',
         'last_source_lang': 'auto',
@@ -271,6 +287,13 @@ class ConfigManager:
                     errors.append(f"'ui.auto_scroll' must be a boolean, got {type(ui_config['auto_scroll']).__name__}")
             if ui_config.get('context_mode', 'none') not in ('none', 'story'):
                 errors.append("'ui.context_mode' must be 'none' or 'story'")
+            if ui_config.get('theme', 'dark') not in ('dark', 'light'):
+                errors.append("'ui.theme' must be 'dark' or 'light'")
+            if 'reduce_motion' in ui_config:
+                if not isinstance(ui_config['reduce_motion'], bool):
+                    errors.append(
+                        "'ui.reduce_motion' must be a boolean, got "
+                        f"{type(ui_config['reduce_motion']).__name__}")
 
         # Validate translation section if it exists
         if 'translation' in self._config:

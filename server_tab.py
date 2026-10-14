@@ -9,11 +9,15 @@ import subprocess
 import threading
 import time
 from pathlib import Path
-from datetime import datetime
 
 import psutil
 
-from ui_helpers import CHANNEL_APP, CHANNEL_SERVER, LogMixin
+from ui_helpers import CHANNEL_SERVER, LogMixin
+from ui_kit import (
+    ActionBar, Disclosure, FieldGrid, Readout, ScrollArea, Section, StatusLine,
+    labelled_scale,
+)
+from ui_tokens import SPACE
 
 
 CONTEXT_SIZE_OPTIONS = (
@@ -64,7 +68,7 @@ class ServerTab(LogMixin, ttk.Frame):
     def __init__(self, parent, server_controller, models_registry,
                  config_manager, base_dir, on_model_selected=None,
                  on_server_state_changed=None):
-        super().__init__(parent, padding="10")
+        super().__init__(parent, style="Canvas.TFrame")
         self._server = server_controller
         self._models = models_registry
         self._config = config_manager
@@ -79,227 +83,36 @@ class ServerTab(LogMixin, ttk.Frame):
         self._create_ui()
 
     def _create_ui(self):
-        main_frame = self
+        """Grouped by how often the operator touches each control.
+
+        Model and port change every session and stay open at the top.
+        Performance parameters are set once per workload and live behind a
+        disclosure, next to the presets that write them. DFlash is configured
+        once, ever. Previously all fourteen fields sat in one open panel, which
+        made the two that matter daily exactly as prominent as the ones that
+        matter yearly.
+        """
         self.columnconfigure(0, weight=1)
-        self.rowconfigure(4, weight=1)
+        self.rowconfigure(1, weight=1)
 
-        title_label = ttk.Label(
-            main_frame,
-            text="伺服器設定",
-            style="Title.TLabel"
-        )
-        title_label.grid(row=0, column=0, sticky=tk.W, pady=(0, 10))
+        heading = ttk.Frame(self, style="Canvas.TFrame")
+        heading.grid(row=0, column=0, sticky="ew",
+                     padx=SPACE["page"], pady=(SPACE["section"], SPACE["loose"]))
+        ttk.Label(heading, text="伺服器設定", style="Display.TLabel").pack(anchor="w")
+        ttk.Label(heading,
+                  text="啟動本機 llama-server，供字幕翻譯與漫畫翻譯使用。",
+                  style="CanvasMuted.TLabel").pack(anchor="w",
+                                                   pady=(SPACE["hair"], 0))
 
-        model_frame = ttk.LabelFrame(main_frame, text="\U0001F4E6 \u6A21\u578B\u9078\u64C7", padding="10")
-        model_frame.grid(row=1, column=0, sticky=(tk.W, tk.E), pady=(0, 10))
-        model_frame.columnconfigure(1, weight=1)
+        body = ScrollArea(self)
+        body.grid(row=1, column=0, sticky="nsew")
+        content = body.body
+        content.columnconfigure(0, weight=1)
 
-        ttk.Label(model_frame, text="\u9078\u64C7\u6A21\u578B:").grid(row=0, column=0, sticky=tk.W)
-        self.model_var = tk.StringVar()
-        self.model_combo = ttk.Combobox(
-            model_frame,
-            textvariable=self.model_var,
-            state="readonly",
-            width=50
-        )
-        self.model_combo.grid(row=0, column=1, sticky=(tk.W, tk.E), padx=(10, 5))
-
-        ttk.Button(
-            model_frame,
-            text="\U0001F504 \u6383\u63CF",
-            command=self._on_scan_models,
-            width=8
-        ).grid(row=0, column=2, padx=5)
-
-        ttk.Button(
-            model_frame,
-            text="\U0001F4C2 \u6DFB\u52A0",
-            command=self.add_model,
-            width=8
-        ).grid(row=0, column=3, padx=5)
-
-        self.model_info_label = ttk.Label(model_frame, text="")
-        self.model_info_label.grid(row=1, column=0, columnspan=4, sticky=tk.W, pady=(5, 0))
-
-        server_frame = ttk.LabelFrame(main_frame, text="\u2699\uFE0F \u670D\u52A1\u5668\u8BBE\u7F6E", padding="10")
-        server_frame.grid(row=2, column=0, sticky=(tk.W, tk.E), pady=(0, 10))
-        server_frame.columnconfigure(0, weight=1)
-
-        params_grid = ttk.Frame(server_frame)
-        params_grid.grid(row=0, column=0, sticky=(tk.W, tk.E))
-        params_grid.columnconfigure(1, weight=1)
-        params_grid.columnconfigure(3, weight=1)
-        for row in range(4):
-            params_grid.rowconfigure(row, pad=6)
-
-        ttk.Label(params_grid, text="\u7AEF\u53E3:").grid(row=0, column=0, sticky=tk.W, padx=(0, 5))
-        self.port_var = tk.IntVar(value=self._config.get("server.port", 8080))
-        ttk.Entry(params_grid, textvariable=self.port_var, width=10).grid(row=0, column=1, padx=(0, 20))
-
-        ttk.Label(params_grid, text="GPU \u5C42\u6570:").grid(row=0, column=2, sticky=tk.W, padx=(0, 5))
-        self.gpu_layers_var = tk.IntVar(value=self._config.get("server.gpu_layers", 99))
-        ttk.Scale(
-            params_grid,
-            from_=0, to=99,
-            variable=self.gpu_layers_var,
-            orient=tk.HORIZONTAL, length=150,
-            command=lambda v: self.gpu_layers_label.config(text=f"{int(float(v))}")
-        ).grid(row=0, column=3, padx=(0, 5))
-        self.gpu_layers_label = ttk.Label(params_grid, text="99")
-        self.gpu_layers_label.grid(row=0, column=4, padx=(0, 20))
-
-        ttk.Label(params_grid, text="\u4E0A\u4E0B\u6587\u5927\u5C0F:").grid(row=1, column=0, sticky=tk.W, padx=(0, 5))
-        self.context_var = tk.IntVar(value=self._config.get("server.context_size", 16384))
-        context_combo = ttk.Combobox(
-            params_grid, textvariable=self.context_var,
-            values=CONTEXT_SIZE_OPTIONS,
-            width=10, state="readonly")
-        context_combo.grid(row=1, column=1, padx=(0, 20))
-
-        ttk.Label(params_grid, text="\u6279\u6B21\u5927\u5C0F:").grid(row=1, column=2, sticky=tk.W, padx=(0, 5))
-        self.batch_var = tk.IntVar(value=self._config.get("server.batch_size", 512))
-        ttk.Entry(params_grid, textvariable=self.batch_var, width=10).grid(row=1, column=3)
-
-        # Concurrency and KV cache settings share the same two field groups.
-        ttk.Label(params_grid, text="\u4E26\u767C\u69FD (-np):").grid(row=2, column=0, sticky=tk.W, padx=(0, 5), pady=(8, 0))
-        self.parallel_var = tk.IntVar(value=self._config.get("server.parallel", 3))
-        ttk.Spinbox(params_grid, from_=1, to=16, textvariable=self.parallel_var,
-                    width=8).grid(row=2, column=1, padx=(0, 20), pady=(8, 0))
-
-        self.flash_attn_var = tk.BooleanVar(value=self._config.get("server.flash_attn", True))
-        ttk.Checkbutton(params_grid, text="FlashAttention",
-                        variable=self.flash_attn_var).grid(row=2, column=2, columnspan=2,
-                                                           sticky=tk.W, padx=(0, 20), pady=(8, 0))
-
-        ttk.Label(params_grid, text="KV \u5FEB\u53D6 K:").grid(row=3, column=0, sticky=tk.W, padx=(0, 5), pady=(8, 0))
-        self.cache_type_k_var = tk.StringVar(value=self._config.get("server.cache_type_k", "q8_0"))
-        ttk.Combobox(params_grid, textvariable=self.cache_type_k_var,
-                     values=["f16", "q8_0", "q4_0"], width=8,
-                     state="readonly").grid(row=3, column=1, padx=(0, 20), pady=(8, 0))
-
-        ttk.Label(params_grid, text="KV \u5FEB\u53D6 V:").grid(row=3, column=2, sticky=tk.W, padx=(0, 5), pady=(8, 0))
-        self.cache_type_v_var = tk.StringVar(value=self._config.get("server.cache_type_v", "q8_0"))
-        ttk.Combobox(params_grid, textvariable=self.cache_type_v_var,
-                     values=["f16", "q8_0", "q4_0"], width=8,
-                     state="readonly").grid(row=3, column=3, sticky=tk.W, pady=(8, 0))
-
-        dflash_frame = ttk.LabelFrame(
-            server_frame, text="DFlash speculative decoding", padding="8"
-        )
-        dflash_frame.grid(row=1, column=0, sticky=(tk.W, tk.E), pady=(10, 0))
-        dflash_frame.columnconfigure(2, weight=1)
-
-        self.dflash_enabled_var = tk.BooleanVar(
-            value=self._config.get("server.dflash_enabled", False)
-        )
-        ttk.Checkbutton(
-            dflash_frame, text="Enable DFlash",
-            variable=self.dflash_enabled_var,
-        ).grid(row=0, column=0, sticky=tk.W, padx=(0, 12))
-
-        ttk.Label(dflash_frame, text="Draft GGUF:").grid(
-            row=0, column=1, sticky=tk.W, padx=(0, 5)
-        )
-        self.dflash_model_path_var = tk.StringVar(value=self._initial_auxiliary_path(
-            "server.dflash_model_path", "dflash-kquant.gguf"
-        ))
-        ttk.Entry(
-            dflash_frame, textvariable=self.dflash_model_path_var, width=48
-        ).grid(row=0, column=2, sticky=(tk.W, tk.E), padx=(0, 5))
-        ttk.Button(
-            dflash_frame, text="Browse...",
-            command=lambda: self._browse_auxiliary_model(
-                self.dflash_model_path_var, "Select DFlash draft model"
-            ),
-        ).grid(row=0, column=3, padx=(0, 12))
-
-        ttk.Label(dflash_frame, text="N max:").grid(
-            row=0, column=4, sticky=tk.W, padx=(0, 5)
-        )
-        self.dflash_n_max_var = tk.IntVar(
-            value=self._config.get("server.dflash_n_max", 6)
-        )
-        ttk.Spinbox(
-            dflash_frame, from_=1, to=15,
-            textvariable=self.dflash_n_max_var, width=5,
-        ).grid(row=0, column=5, sticky=tk.W)
-
-        ttk.Label(dflash_frame, text="mmproj GGUF (optional):").grid(
-            row=1, column=0, columnspan=2, sticky=tk.W, pady=(8, 0),
-            padx=(0, 5)
-        )
-        self.mmproj_path_var = tk.StringVar(value=self._initial_auxiliary_path(
-            "server.mmproj_path", "mmproj-kquant.gguf"
-        ))
-        ttk.Entry(
-            dflash_frame, textvariable=self.mmproj_path_var, width=48
-        ).grid(
-            row=1, column=2, sticky=(tk.W, tk.E), padx=(0, 5), pady=(8, 0)
-        )
-        ttk.Button(
-            dflash_frame, text="Browse...",
-            command=lambda: self._browse_auxiliary_model(
-                self.mmproj_path_var, "Select multimodal projector"
-            ),
-        ).grid(row=1, column=3, padx=(0, 12), pady=(8, 0))
-
-        preset_frame = ttk.Frame(server_frame)
-        preset_frame.grid(row=2, column=0, sticky=tk.W, pady=(10, 0))
-        ttk.Label(preset_frame, text="用途 Preset:").pack(side=tk.LEFT, padx=(0, 6))
-        ttk.Button(
-            preset_frame, text="翻譯模式",
-            command=self._apply_translation_preset,
-            width=14,
-        ).pack(side=tk.LEFT, padx=(0, 6))
-        ttk.Button(
-            preset_frame, text="對話模式",
-            command=self._apply_chat_preset,
-            width=14,
-        ).pack(side=tk.LEFT, padx=(0, 6))
-        ttk.Button(
-            preset_frame, text="128K 長上下文",
-            command=self._apply_long_context_preset,
-            width=16,
-        ).pack(side=tk.LEFT)
-        ttk.Label(
-            server_frame,
-            text="翻譯 16K/3 slots · 對話 32K/2 slots · 長上下文 128K/1 slot",
-            foreground="gray",
-        ).grid(row=3, column=0, sticky=tk.W, pady=(6, 0))
-
-        control_frame = ttk.Frame(main_frame)
-        control_frame.grid(row=3, column=0, pady=(0, 10))
-
-        self.start_button = ttk.Button(
-            control_frame, text="\u25B6\uFE0F \u555F\u52D5\u670D\u52A1\u5668",
-            command=self.start_server, width=20, style="Accent.TButton")
-        self.start_button.grid(row=0, column=0, padx=5)
-
-        self.stop_button = ttk.Button(
-            control_frame, text="\u23F9\uFE0F \u505C\u6B62\u670D\u52A1\u5668",
-            command=self.stop_server, width=20, state="disabled")
-        self.stop_button.grid(row=0, column=1, padx=5)
-
-        self.release_button = ttk.Button(
-            control_frame, text="\U0001F9F9 \u91CB\u653E\u5167\u5B58",
-            command=self.release_memory, width=15, state="normal")
-        self.release_button.grid(row=0, column=2, padx=5)
-
-        self.status_label = ttk.Label(
-            control_frame, text="\u25CF \u672A\u904B\u884C", font=("Arial", 10))
-        self.status_label.grid(row=0, column=3, padx=20)
-
-        # The server log also carries app-level notices (model scan results),
-        # which the Main tab has no log widget of its own to show.
-        self._init_log_widget(main_frame, row=4, column=0,
-                              label="\U0001F4CB \u904B\u884C\u65E5\u8A8C", height=15, max_lines=1000,
-                              channels=(CHANNEL_SERVER, CHANNEL_APP))
-
-        self.resource_label = ttk.Label(
-            main_frame,
-            text="GPU: N/A | VRAM: N/A | RAM: N/A",
-            font=("Consolas", 9))
-        self.resource_label.grid(row=5, column=0, pady=(10, 0), sticky=tk.W)
+        self._create_model_section(content, row=0)
+        self._create_run_section(content, row=1)
+        self._create_performance_section(content, row=2)
+        self._create_dflash_section(content, row=3)
 
         self.refresh_model_list()
 
@@ -309,6 +122,195 @@ class ServerTab(LogMixin, ttk.Frame):
             self.on_model_select(None)
 
         self.model_combo.bind('<<ComboboxSelected>>', self.on_model_select)
+
+    def _wrap(self, parent, row, last=False):
+        """One padded host per section, so every section shares a page margin."""
+        host = ttk.Frame(parent, style="Canvas.TFrame")
+        host.grid(row=row, column=0, sticky="ew", padx=SPACE["page"],
+                  pady=(0, SPACE["page"] if last else SPACE["loose"]))
+        host.columnconfigure(0, weight=1)
+        return host
+
+    def on_surface_shown(self):
+        """Shell hook: a sibling surface may have added a model file."""
+        self.refresh_model_list()
+
+    # ---------------------------------------------------------------- model
+    def _create_model_section(self, parent, row):
+        section = Section(self._wrap(parent, row), "模型",
+                          trailing=self._model_actions)
+        section.grid(row=0, column=0, sticky="ew")
+
+        grid = FieldGrid(section.body, label_width=10)
+        grid.grid(row=0, column=0, sticky="ew")
+
+        self.model_var = tk.StringVar()
+        self.model_combo = ttk.Combobox(
+            grid.add("選擇模型"), textvariable=self.model_var, state="readonly")
+        self.model_combo.pack(fill="x")
+
+        self.model_info_label = ttk.Label(section.body, text="",
+                                          style="MonoMuted.TLabel")
+        self.model_info_label.grid(row=1, column=0, sticky="w")
+
+    def _model_actions(self, host):
+        actions = ttk.Frame(host, style="Surface.TFrame")
+        ttk.Button(actions, text="重新掃描", style="Ghost.TButton",
+                   command=self._on_scan_models).pack(
+            side=tk.LEFT, padx=(0, SPACE["tight"]))
+        ttk.Button(actions, text="加入模型…", style="Ghost.TButton",
+                   command=self.add_model).pack(side=tk.LEFT)
+        return actions
+
+    # ------------------------------------------------------------------ run
+    def _create_run_section(self, parent, row):
+        section = Section(self._wrap(parent, row), "執行")
+        section.grid(row=0, column=0, sticky="ew")
+
+        grid = FieldGrid(section.body, label_width=10)
+        grid.grid(row=0, column=0, sticky="ew")
+        self.port_var = tk.IntVar(value=self._config.get("server.port", 8080))
+        ttk.Entry(grid.add("連接埠"), textvariable=self.port_var, width=10,
+                  style="Mono.TEntry").pack(anchor="w")
+
+        self.status_label = StatusLine(section.body, text="未運行", state="idle",
+                                       mono=True)
+        self.status_label.grid(row=1, column=0, sticky="w",
+                               pady=(0, SPACE["base"]))
+
+        bar = ActionBar(section.body)
+        bar.grid(row=2, column=0, sticky="ew")
+        self.release_button = bar.secondary("釋放記憶體", self.release_memory)
+        self.start_button = bar.primary("啟動伺服器", self.start_server)
+        self.stop_button = bar.danger("停止", self.stop_server)
+        self.stop_button.config(state="disabled")
+
+        # Live resource readouts, one value per cell. The old version packed
+        # RAM, GPU, CPU, process memory and thread count into a single
+        # pipe-delimited string — unreadable at a glance, and a glance is the
+        # only way this line is ever read.
+        meters = ttk.Frame(section.body, style="Surface.TFrame")
+        meters.grid(row=3, column=0, sticky="ew", pady=(SPACE["loose"], 0))
+        self._meters = {}
+        for index, (key, label) in enumerate(
+                (("ram", "系統 RAM"), ("gpu", "GPU"),
+                 ("cpu", "伺服器 CPU"), ("proc", "伺服器記憶體"))):
+            readout = Readout(meters, label)
+            readout.grid(row=0, column=index, sticky="w",
+                         padx=(0, SPACE["section"]))
+            self._meters[key] = readout
+
+    # ---------------------------------------------------------- performance
+    def _create_performance_section(self, parent, row):
+        disclosure = Disclosure(self._wrap(parent, row), "效能參數")
+        disclosure.grid(row=0, column=0, sticky="ew")
+
+        presets = ttk.Frame(disclosure.body, style="Surface.TFrame")
+        presets.grid(row=0, column=0, sticky="ew", pady=(0, SPACE["snug"]))
+        ttk.Label(presets, text="用途預設", style="Field.TLabel").pack(
+            side=tk.LEFT, padx=(0, SPACE["base"]))
+        for text, command in (("翻譯", self._apply_translation_preset),
+                              ("對話", self._apply_chat_preset),
+                              ("128K 長上下文", self._apply_long_context_preset)):
+            ttk.Button(presets, text=text, command=command).pack(
+                side=tk.LEFT, padx=(0, SPACE["snug"]))
+        ttk.Label(disclosure.body,
+                  text="翻譯 16K/3 slots · 對話 32K/2 slots · 長上下文 128K/1 slot。"
+                       "套用預設時也會同步「字幕翻譯」的並發數。",
+                  style="Micro.TLabel", wraplength=560, justify="left").grid(
+            row=1, column=0, sticky="w", pady=(0, SPACE["roomy"]))
+
+        grid = FieldGrid(disclosure.body, columns=2, label_width=12)
+        grid.grid(row=2, column=0, sticky="ew")
+
+        self.gpu_layers_var = tk.IntVar(
+            value=self._config.get("server.gpu_layers", 99))
+        gpu_holder, self.gpu_layers_label = labelled_scale(
+            grid.add("GPU 層數"), self.gpu_layers_var, 0, 99)
+        gpu_holder.pack(anchor="w")
+
+        self.context_var = tk.IntVar(
+            value=self._config.get("server.context_size", 16384))
+        ttk.Combobox(grid.add("上下文大小", column=1),
+                     textvariable=self.context_var,
+                     values=CONTEXT_SIZE_OPTIONS, width=10,
+                     state="readonly").pack(anchor="w")
+
+        self.batch_var = tk.IntVar(
+            value=self._config.get("server.batch_size", 512))
+        ttk.Entry(grid.add("批次大小"), textvariable=self.batch_var, width=10,
+                  style="Mono.TEntry").pack(anchor="w")
+
+        self.parallel_var = tk.IntVar(
+            value=self._config.get("server.parallel", 3))
+        ttk.Spinbox(grid.add("並發槽 (-np)", column=1,
+                             hint="同時可處理的請求數。字幕翻譯的並發數會被它限制。"),
+                    from_=1, to=16, textvariable=self.parallel_var,
+                    width=8).pack(anchor="w")
+
+        self.cache_type_k_var = tk.StringVar(
+            value=self._config.get("server.cache_type_k", "q8_0"))
+        ttk.Combobox(grid.add("KV 快取 K"), textvariable=self.cache_type_k_var,
+                     values=["f16", "q8_0", "q4_0"], width=8,
+                     state="readonly").pack(anchor="w")
+
+        self.cache_type_v_var = tk.StringVar(
+            value=self._config.get("server.cache_type_v", "q8_0"))
+        ttk.Combobox(grid.add("KV 快取 V", column=1),
+                     textvariable=self.cache_type_v_var,
+                     values=["f16", "q8_0", "q4_0"], width=8,
+                     state="readonly").pack(anchor="w")
+
+        self.flash_attn_var = tk.BooleanVar(
+            value=self._config.get("server.flash_attn", True))
+        ttk.Checkbutton(disclosure.body, text="FlashAttention",
+                        variable=self.flash_attn_var).grid(
+            row=3, column=0, sticky="w", pady=(SPACE["snug"], 0))
+
+    # --------------------------------------------------------------- dflash
+    def _create_dflash_section(self, parent, row):
+        disclosure = Disclosure(self._wrap(parent, row, last=True),
+                                "DFlash 推測解碼")
+        disclosure.grid(row=0, column=0, sticky="ew")
+
+        self.dflash_enabled_var = tk.BooleanVar(
+            value=self._config.get("server.dflash_enabled", False))
+        ttk.Checkbutton(disclosure.body, text="啟用 DFlash",
+                        variable=self.dflash_enabled_var).grid(
+            row=0, column=0, sticky="w")
+        ttk.Label(disclosure.body, text="啟用後會強制開啟 --flash-attn。",
+                  style="Micro.TLabel").grid(row=1, column=0, sticky="w",
+                                             pady=(0, SPACE["roomy"]))
+
+        grid = FieldGrid(disclosure.body, label_width=14)
+        grid.grid(row=2, column=0, sticky="ew")
+
+        draft_cell = grid.add("Draft GGUF")
+        self.dflash_model_path_var = tk.StringVar(
+            value=self._initial_auxiliary_path(
+                "server.dflash_model_path", "dflash-kquant.gguf"))
+        ttk.Entry(draft_cell, textvariable=self.dflash_model_path_var,
+                  style="Mono.TEntry").pack(side="left", fill="x", expand=True)
+        ttk.Button(draft_cell, text="瀏覽…", style="Ghost.TButton",
+                   command=lambda: self._browse_auxiliary_model(
+                       self.dflash_model_path_var, "選擇 DFlash draft 模型")).pack(
+            side="left", padx=(SPACE["snug"], 0))
+
+        self.dflash_n_max_var = tk.IntVar(
+            value=self._config.get("server.dflash_n_max", 6))
+        ttk.Spinbox(grid.add("N max"), from_=1, to=15,
+                    textvariable=self.dflash_n_max_var, width=6).pack(anchor="w")
+
+        mmproj_cell = grid.add("mmproj GGUF")
+        self.mmproj_path_var = tk.StringVar(
+            value=self._initial_auxiliary_path(
+                "server.mmproj_path", "mmproj-kquant.gguf"))
+        ttk.Entry(mmproj_cell, textvariable=self.mmproj_path_var,
+                  style="Mono.TEntry").pack(side="left", fill="x", expand=True)
+        ttk.Button(mmproj_cell, text="瀏覽…", style="Ghost.TButton",
+                   command=lambda: self._browse_auxiliary_model(
+                       self.mmproj_path_var, "選擇 multimodal projector")).pack(
+            side="left", padx=(SPACE["snug"], 0))
 
     def log(self, level, message):
         self._log(level, message)
@@ -512,9 +514,9 @@ class ServerTab(LogMixin, ttk.Frame):
             )
             # Keep the start button available while running so selecting another
             # model + pressing it performs the automatic switch above.
-            self.start_button.config(state="normal", text="\U0001F504 \u5207\u63DB\u6A21\u578B")
+            self.start_button.config(state="normal", text="切換模型")
             self.stop_button.config(state="normal")
-            self.status_label.config(text="\u25CF \u904B\u884C\u4E2D", foreground="green")
+            self.status_label.set("ok", f"執行中  :{port}  {model_name}")
             self.start_resource_monitor()
             self._active_model_name = model_name
             self._config.set("ui.last_model", model_name)
@@ -540,9 +542,9 @@ class ServerTab(LogMixin, ttk.Frame):
             return False
 
         self._active_model_name = None
-        self.start_button.config(state="normal", text="\u25B6\uFE0F \u555F\u52D5\u670D\u52D9\u5668")
+        self.start_button.config(state="normal", text="啟動伺服器")
         self.stop_button.config(state="disabled")
-        self.status_label.config(text="\u25CF \u672A\u904B\u884C", foreground="black")
+        self.status_label.set("idle", "未運行")
         self.stop_resource_monitor()
 
         # Notify parent about state change
@@ -615,48 +617,52 @@ class ServerTab(LogMixin, ttk.Frame):
         self._monitor_generation += 1
 
     def monitor_resources(self, generation=None):
+        """Sample host and server-process resources every two seconds.
+
+        Publishes into the four Readout cells rather than one concatenated
+        string, so each number keeps a fixed position and a stable width and
+        can be read without parsing a sentence.
+        """
         if generation is None:
             generation = self._monitor_generation
         while (self._monitor_running
                and generation == self._monitor_generation):
             try:
                 ram = psutil.virtual_memory()
-                ram_used = ram.used / (1024**3)
-                ram_total = ram.total / (1024**3)
-                ram_percent = ram.percent
-
-                gpu_status = "\u672A\u4F7F\u7528"
-                vram_status = "N/A"
-                process_info = ""
+                values = {
+                    "ram": f"{ram.used / (1024 ** 3):.1f} / "
+                           f"{ram.total / (1024 ** 3):.0f} GB",
+                    "gpu": "未使用",
+                    "cpu": "—",
+                    "proc": "—",
+                }
 
                 if self._server.running and self._server._process:
                     try:
                         proc = psutil.Process(self._server._process.pid)
                         cpu_percent = proc.cpu_percent(interval=0.1)
-                        mem_info = proc.memory_info()
-                        proc_mem_mb = mem_info.rss / (1024**2)
+                        proc_mem_mb = proc.memory_info().rss / (1024 ** 2)
                         try:
-                            num_threads = proc.num_threads()
+                            threads = proc.num_threads()
                         except Exception:
-                            num_threads = 0
-                        process_info = (f"\u670D\u52A1\u5668: CPU {cpu_percent:.1f}% | "
-                                        f"\u5167\u5B58 {proc_mem_mb:.0f}MB | \u7EBF\u7A0B {num_threads}")
-                        gpu_status = "\u904B\u884C\u4E2D"
-                        vram_status = "\u5DF2\u8F09\u5165"
+                            threads = 0
+                        values["gpu"] = "已載入"
+                        values["cpu"] = f"{cpu_percent:.0f}%"
+                        values["proc"] = (f"{proc_mem_mb:.0f} MB"
+                                          + (f" · {threads}t" if threads else ""))
                     except (psutil.NoSuchProcess, psutil.AccessDenied):
                         pass
 
-                if process_info:
-                    status_text = (f"RAM: {ram_used:.1f}GB / {ram_total:.1f}GB ({ram_percent}%) | "
-                                   f"GPU: {gpu_status} | {process_info}")
-                else:
-                    status_text = (f"RAM: {ram_used:.1f}GB / {ram_total:.1f}GB ({ram_percent}%) | "
-                                   f"GPU: {gpu_status} | VRAM: {vram_status}")
-
-                self.winfo_toplevel().after(0, lambda text=status_text: self.resource_label.config(text=text))
-            except Exception as e:
-                print(f"Resource monitor error: {e}")
-                self.winfo_toplevel().after(0, lambda: self.resource_label.config(
-                    text=f"\u7CFB\u7D71\u76E3\u63A7\u4E2D... (\u932F\u8AA4: {str(e)[:30]})"))
+                self.winfo_toplevel().after(
+                    0, lambda snapshot=values: self._render_meters(snapshot))
+            except Exception as error:
+                self.log("WARNING", f"資源監控讀取失敗：{error}")
 
             time.sleep(2)
+
+    def _render_meters(self, values):
+        """Apply one monitor sample to the readouts (Tk thread only)."""
+        for key, value in values.items():
+            meter = self._meters.get(key)
+            if meter is not None:
+                meter.set(value)

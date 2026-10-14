@@ -14,6 +14,8 @@ from typing import Callable, List, Optional, Sequence, Set
 from tkinterdnd2 import DND_FILES
 
 from ui_helpers import parse_dropped_paths
+from ui_theme import theme
+from ui_tokens import SPACE
 
 
 def scan_directory(directory: str, valid_extensions: Set[str]) -> List[str]:
@@ -104,38 +106,53 @@ class FileListbox(ttk.Frame):
     def __init__(self, parent, valid_extensions: set,
                  filetypes_label: str = "Files",
                  filetypes_exts: Optional[Sequence[str]] = None,
-                 browse_text: str = "Choose Files",
-                 clear_text: str = "Clear",
+                 browse_text: str = "選擇檔案",
+                 clear_text: str = "清空",
                  on_change: Optional[Callable[[], None]] = None,
-                 on_clear: Optional[Callable[[], None]] = None):
-        super().__init__(parent)
+                 on_clear: Optional[Callable[[], None]] = None,
+                 empty_hint: str = "拖放檔案到這裡",
+                 height: int = 5):
+        super().__init__(parent, style="Surface.TFrame")
         self.columnconfigure(0, weight=1)
+        self.rowconfigure(1, weight=1)
 
         self.model = FileListboxModel(valid_extensions, on_change=self._on_model_changed)
         self._user_on_change = on_change
         self._user_on_clear = on_clear
+        self._empty_hint = empty_hint
 
-        self.button_row = ttk.Frame(self)
+        self.button_row = ttk.Frame(self, style="Surface.TFrame")
         self.button_row.grid(row=0, column=0, sticky=tk.W)
-        ttk.Button(self.button_row, text=browse_text,
-                   command=self._browse).pack(side=tk.LEFT, padx=2)
-        ttk.Button(self.button_row, text=clear_text,
-                   command=self._request_clear).pack(side=tk.LEFT, padx=2)
+        ttk.Button(self.button_row, text=browse_text, style="Ghost.TButton",
+                   command=self._browse).pack(side=tk.LEFT, padx=(0, SPACE["tight"]))
+        ttk.Button(self.button_row, text=clear_text, style="Ghost.TButton",
+                   command=self._request_clear).pack(side=tk.LEFT,
+                                                     padx=(0, SPACE["tight"]))
 
-        list_frame = ttk.Frame(self)
-        list_frame.grid(row=1, column=0, sticky=(tk.W, tk.E), pady=(5, 0))
+        list_frame = ttk.Frame(self, style="Inset.TFrame")
+        list_frame.grid(row=1, column=0, sticky="nsew", pady=(SPACE["tight"], 0))
         list_frame.columnconfigure(0, weight=1)
+        list_frame.rowconfigure(0, weight=1)
 
-        self._listbox = tk.Listbox(list_frame, height=4, selectmode=tk.EXTENDED)
-        self._listbox.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self._listbox = tk.Listbox(list_frame, height=height,
+                                   selectmode=tk.EXTENDED, exportselection=False)
+        theme().register_classic(self._listbox, "listbox")
+        self._listbox.grid(row=0, column=0, sticky="nsew")
 
         self._listbox.drop_target_register(DND_FILES)
         self._listbox.dnd_bind('<<Drop>>', self._on_drop)
 
         scrollbar = ttk.Scrollbar(list_frame, orient=tk.VERTICAL,
                                   command=self._listbox.yview)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        scrollbar.grid(row=0, column=1, sticky="ns")
         self._listbox.config(yscrollcommand=scrollbar.set)
+
+        # An empty list that says "drag files here" teaches the affordance;
+        # drag-and-drop is otherwise invisible, since nothing in a bare listbox
+        # suggests it accepts a drop.
+        self._hint = ttk.Label(list_frame, text=empty_hint, style="Faint.TLabel",
+                               anchor="center")
+        self._render_hint()
 
         if filetypes_exts is None:
             filetypes_exts = sorted(valid_extensions)
@@ -169,6 +186,7 @@ class FileListbox(ttk.Frame):
     def clear(self) -> None:
         self.model.clear()
         self._listbox.delete(0, tk.END)  # always wipe display (matches old behavior)
+        self._render_hint()
 
     def _request_clear(self) -> None:
         if self._user_on_clear is not None:
@@ -188,5 +206,13 @@ class FileListbox(ttk.Frame):
         self._listbox.delete(0, tk.END)
         for f in self.model.files:
             self._listbox.insert(tk.END, Path(f).name)
+        self._render_hint()
         if self._user_on_change is not None:
             self._user_on_change()
+
+    def _render_hint(self) -> None:
+        """Show the drop hint only while the list is empty."""
+        if self.model.files:
+            self._hint.place_forget()
+        else:
+            self._hint.place(relx=0.5, rely=0.5, anchor="center")

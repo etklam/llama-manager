@@ -1,5 +1,6 @@
 import queue
 import re
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Callable, Optional, Sequence
 import tkinter as tk
@@ -68,6 +69,19 @@ CHANNEL_SERVER = "server"
 CHANNEL_TRANSLATE = "translate"
 CHANNEL_WHISPER = "whisper"
 CHANNEL_PIPELINE = "pipeline"
+CHANNEL_MANGA = "manga"
+
+# Display names for the log drawer's channel filter, in the order a reader
+# scans them. The manga surface used to keep its own queue and report failures
+# through message boxes, so its traffic never reached a log at all.
+CHANNEL_LABELS = {
+    CHANNEL_APP: "應用",
+    CHANNEL_SERVER: "伺服器",
+    CHANNEL_TRANSLATE: "翻譯",
+    CHANNEL_WHISPER: "轉錄",
+    CHANNEL_PIPELINE: "管線",
+    CHANNEL_MANGA: "漫畫",
+}
 
 
 class _LogBus:
@@ -120,6 +134,92 @@ class _LogBus:
 log_bus = _LogBus()
 
 
+# ---------------------------------------------------------------------------
+# Run status
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class RunState:
+    """What one subsystem is doing right now, for the persistent header.
+
+    Deliberately not a progress callback: a callback couples the emitter to one
+    widget, which is how run status ended up visible only on the surface that
+    started it. This is a value the shell can render wherever it likes.
+
+    ``percent`` is None when the work has no measurable total yet (probing a
+    server, analysing a file for story context) — the header shows an
+    indeterminate state rather than a misleading 0%.
+    """
+
+    channel: str
+    label: str
+    state: str = "busy"           # busy | ok | warn | error | idle
+    detail: str = ""
+    percent: Optional[float] = None
+
+    @property
+    def active(self) -> bool:
+        return self.state == "busy"
+
+
+class _RunBus:
+    """Fan-out for run status, mirroring :class:`_LogBus`.
+
+    One entry per channel, so a transcription and a translation running back to
+    back (the pipeline does exactly this) each report under their own name and
+    the shell can show whichever is active without the two overwriting each
+    other.
+    """
+
+    def __init__(self):
+        self._subscribers = []
+        self._states: dict = {}
+
+    def subscribe(self, fn: Callable[[RunState], None]):
+        self._subscribers.append(fn)
+
+        def _unsub():
+            try:
+                self._subscribers.remove(fn)
+            except ValueError:
+                pass
+
+        return _unsub
+
+    def states(self):
+        """Current state per channel; the shell reads this when it is built."""
+        return dict(self._states)
+
+    def active(self):
+        """Every channel currently doing work, in emission order."""
+        return [state for state in self._states.values() if state.active]
+
+    def begin(self, channel: str, label: str, detail: str = ""):
+        self._emit(RunState(channel, label, "busy", detail, None))
+
+    def progress(self, channel: str, label: str, percent: Optional[float] = None,
+                 detail: str = ""):
+        self._emit(RunState(channel, label, "busy", detail, percent))
+
+    def end(self, channel: str, label: str, state: str = "ok", detail: str = ""):
+        self._emit(RunState(channel, label, state, detail, None))
+
+    def clear(self, channel: str):
+        self._states.pop(channel, None)
+        self._emit(RunState(channel, "", "idle", "", None))
+
+    def _emit(self, state: RunState):
+        if state.state == "idle":
+            self._states.pop(state.channel, None)
+        else:
+            self._states[state.channel] = state
+        for fn in list(self._subscribers):
+            fn(state)
+
+
+run_bus = _RunBus()
+
+
 def parse_dropped_paths(raw_data):
     paths = re.findall(r'\{([^}]+)\}', raw_data)
     if not paths:
@@ -148,7 +248,18 @@ def extract_combo_code(var_value):
 
 
 class LogMixin:
-    _log_text: scrolledtext.ScrolledText
+    """Emit to the log bus, and optionally own an embedded log widget.
+
+    Since the shell gained a unified log drawer, surfaces emit through
+    :meth:`_log` but no longer call :meth:`_init_log_widget` — the drawer
+    subscribes to every channel instead. The widget half is retained because
+    it is a working, tested component and a surface may still want a local,
+    pre-filtered view; the accessors below therefore tolerate its absence
+    rather than requiring every caller to check.
+    """
+
+    # Set by _init_log_widget. Absent on surfaces that only emit.
+    _log_text: Optional[scrolledtext.ScrolledText] = None
     _log_max_lines: int = 2000
     # Channel this widget emits on and subscribes to. Subclasses override it;
     # the default keeps standalone LogMixin users on the shared app channel.
@@ -167,10 +278,20 @@ class LogMixin:
         self._log_text.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
         self._log_max_lines = max_lines
 
-        self._log_text.tag_config("INFO", foreground="blue")
-        self._log_text.tag_config("ERROR", foreground="red")
-        self._log_text.tag_config("SUCCESS", foreground="green")
-        self._log_text.tag_config("WARNING", foreground="orange")
+        # Level colors come from the palette when a theme is installed. Falls
+        # back to named colors so this helper stays usable in a bare Tk root
+        # (the unit tests build one without the app shell).
+        try:
+            from ui_theme import palette
+            from ui_tokens import LOG_LEVEL_ROLE
+            active = palette()
+            colors = {level: getattr(active, role)
+                      for level, role in LOG_LEVEL_ROLE.items()}
+        except (ImportError, RuntimeError):
+            colors = {"INFO": "blue", "ERROR": "red",
+                      "SUCCESS": "green", "WARNING": "orange"}
+        for level, color in colors.items():
+            self._log_text.tag_config(level, foreground=color)
 
         # Subscribe to this widget's own channel only, so a tab shows its own
         # subsystem's traffic. `channels` overrides it for widgets that need to
@@ -225,6 +346,11 @@ class LogMixin:
         append_log_lines(self._log_text, lines, self._log_max_lines)
 
     def _clear_log(self):
+        # A no-op for surfaces that emit to the shared drawer and own no
+        # widget; clearing shared history on one surface's run would discard
+        # another's diagnostics.
+        if self._log_text is None:
+            return
         self._log_text.config(state="normal")
         self._log_text.delete(1.0, tk.END)
         self._log_text.config(state="disabled")
