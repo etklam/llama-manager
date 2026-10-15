@@ -5,6 +5,7 @@ ServerTab - Server management UI for llama.cpp
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import gc
+import os
 import subprocess
 import threading
 import time
@@ -18,6 +19,7 @@ from ui_kit import (
     labelled_scale,
 )
 from ui_tokens import SPACE
+from setup_wizard import SetupWizard
 
 
 CONTEXT_SIZE_OPTIONS = (
@@ -67,7 +69,8 @@ class ServerTab(LogMixin, ttk.Frame):
 
     def __init__(self, parent, server_controller, models_registry,
                  config_manager, base_dir, on_model_selected=None,
-                 on_server_state_changed=None):
+                 on_server_state_changed=None, on_model_dir_changed=None,
+                 tool_manager=None):
         super().__init__(parent, style="Canvas.TFrame")
         self._server = server_controller
         self._models = models_registry
@@ -75,6 +78,8 @@ class ServerTab(LogMixin, ttk.Frame):
         self._base_dir = base_dir
         self._on_model_selected = on_model_selected
         self._on_server_state_changed = on_server_state_changed
+        self._on_model_dir_changed = on_model_dir_changed
+        self._tool_manager = tool_manager
         self._monitor_thread = None
         self._monitor_running = False
         self._monitor_generation = 0
@@ -103,6 +108,8 @@ class ServerTab(LogMixin, ttk.Frame):
                   text="啟動本機 llama-server，供字幕翻譯與漫畫翻譯使用。",
                   style="CanvasMuted.TLabel").pack(anchor="w",
                                                    pady=(SPACE["hair"], 0))
+        ttk.Button(heading, text="設定精靈", style="Ghost.TButton",
+                   command=self._open_setup_wizard).pack(anchor="e")
 
         body = ScrollArea(self)
         body.grid(row=1, column=0, sticky="nsew")
@@ -152,6 +159,32 @@ class ServerTab(LogMixin, ttk.Frame):
         self.model_info_label = ttk.Label(section.body, text="",
                                           style="MonoMuted.TLabel")
         self.model_info_label.grid(row=1, column=0, sticky="w")
+
+        model_dir_cell = grid.add("模型目錄", hint="可放在其他硬碟；重新掃描後套用。")
+        self.model_dir_var = tk.StringVar(
+            value=self._config.get("paths.model_dir", "") or str(self._base_dir))
+        ttk.Entry(model_dir_cell, textvariable=self.model_dir_var,
+                  style="Mono.TEntry").pack(side="left", fill="x", expand=True)
+        ttk.Button(model_dir_cell, text="瀏覽…", style="Ghost.TButton",
+                   command=self._browse_model_dir).pack(
+            side="left", padx=(SPACE["snug"], 0))
+
+        server_cell = grid.add("llama-server", hint="可留空使用 PATH；啟動前會檢查完整路徑。")
+        configured_server = self._config.get("paths.server_exe", "")
+        if not configured_server:
+            configured_server = str(getattr(self._server, "executable", ""))
+        self.server_exe_var = tk.StringVar(value=configured_server)
+        ttk.Entry(server_cell, textvariable=self.server_exe_var,
+                  style="Mono.TEntry").pack(side="left", fill="x", expand=True)
+        ttk.Button(server_cell, text="瀏覽…", style="Ghost.TButton",
+                   command=self._browse_server_exe).pack(
+            side="left", padx=(SPACE["snug"], 0))
+        ttk.Button(server_cell, text="檢查", style="Ghost.TButton",
+                   command=self._check_server_exe).pack(side="left")
+        self.server_exe_status = ttk.Label(section.body, text="",
+                                           style="Micro.TLabel")
+        self.server_exe_status.grid(row=4, column=0, sticky="w")
+        self._refresh_server_exe_status()
 
     def _model_actions(self, host):
         actions = ttk.Frame(host, style="Surface.TFrame")
@@ -331,6 +364,94 @@ class ServerTab(LogMixin, ttk.Frame):
         if file_path:
             path_var.set(file_path)
 
+    def _open_setup_wizard(self):
+        if self._tool_manager is None:
+            messagebox.showwarning("設定精靈", "工具管理器尚未就緒。")
+            return
+        root = self.winfo_toplevel()
+        app = getattr(root, "_app", None)
+        wizard = SetupWizard(
+            root, self._config, self._tool_manager,
+            on_complete=getattr(app, "_apply_setup_wizard", None),
+        )
+        wizard.grab_set()
+
+    def _browse_model_dir(self):
+        path = filedialog.askdirectory(
+            title="選擇 GGUF 模型目錄",
+            initialdir=self.model_dir_var.get() or str(self._base_dir))
+        if path:
+            self.model_dir_var.set(path)
+            self._apply_model_dir()
+
+    def _apply_model_dir(self):
+        value = getattr(self, "model_dir_var", None)
+        if value is None:
+            return
+        path = value.get().strip()
+        if not path:
+            return
+        model_dir = Path(path).expanduser()
+        self._config.set("paths.model_dir", str(model_dir))
+        self._models.scan_dir = model_dir
+        self._base_dir = model_dir
+        callback = getattr(self, "_on_model_dir_changed", None)
+        if callback:
+            callback(model_dir)
+
+    def _browse_server_exe(self):
+        filetypes = (
+            [("Executable", "*.exe"), ("All files", "*.*")]
+            if os.name == "nt"
+            else [("Executable", "*"), ("All files", "*.*")]
+        )
+        path = filedialog.askopenfilename(
+            title="選擇 llama-server 執行檔", filetypes=filetypes)
+        if path:
+            self.server_exe_var.set(path)
+            self._apply_server_exe()
+
+    def _apply_server_exe(self):
+        value = getattr(self, "server_exe_var", None)
+        if value is None:
+            return
+        path = value.get().strip()
+        if not path:
+            return
+        self._config.set("paths.server_exe", path)
+        if self._tool_manager:
+            self._tool_manager.set_path("llama-server", path)
+        setter = getattr(self._server, "set_executable", None)
+        if setter:
+            try:
+                setter(Path(path).expanduser())
+            except RuntimeError as error:
+                self.log("WARNING", str(error))
+        self._refresh_server_exe_status()
+
+    def _check_server_exe(self):
+        self._apply_server_exe()
+        if self._tool_manager:
+            status = self._tool_manager.check(
+                "llama-server", self.server_exe_var.get().strip(), probe=True)
+            self.server_exe_status.config(text=status.message)
+            (messagebox.showinfo if status.available else messagebox.showwarning)(
+                "工具檢查", status.message)
+            return status.available
+        path = Path(self.server_exe_var.get().strip())
+        available = path.is_file() or (path.parent == Path("."))
+        message = "可用" if available else f"檔案不存在：{path}"
+        self.server_exe_status.config(text=message)
+        return available
+
+    def _refresh_server_exe_status(self):
+        if not hasattr(self, "server_exe_status"):
+            return
+        if self._tool_manager:
+            status = self._tool_manager.check(
+                "llama-server", self.server_exe_var.get().strip())
+            self.server_exe_status.config(text=status.message)
+
     # --------------------------------------------------------- Model management
     def refresh_model_list(self):
         model_list = self._models.list_models()
@@ -356,6 +477,7 @@ class ServerTab(LogMixin, ttk.Frame):
         self.model_info_label.config(text="")
 
     def add_model(self):
+        self._apply_model_dir()
         file_path = filedialog.askopenfilename(
             title="\u9078\u64C7\u6A21\u578B\u6587\u4EF6",
             filetypes=[("GGUF Files", "*.gguf"), ("All Files", "*.*")],
@@ -369,6 +491,7 @@ class ServerTab(LogMixin, ttk.Frame):
         """Callback for the scan button - delegates to the scan_models method
         on the parent LlamaManager via winfo_toplevel()."""
         # The parent manager's scan_models will call refresh_model_list on this tab
+        self._apply_model_dir()
         root = self.winfo_toplevel()
         if hasattr(root, '_app') and hasattr(root._app, 'scan_models'):
             root._app.scan_models()
@@ -417,6 +540,8 @@ class ServerTab(LogMixin, ttk.Frame):
 
     # -------------------------------------------------------- Server control
     def start_server(self):
+        self._apply_model_dir()
+        self._apply_server_exe()
         if not self.model_var.get():
             messagebox.showerror("\u932F\u8AA4", "\u8ACB\u5148\u9078\u64C7\u4E00\u500B\u6A21\u578B\uFF01")
             return
@@ -500,7 +625,7 @@ class ServerTab(LogMixin, ttk.Frame):
         try:
             self._server.start(
                 model_path=model_path, port=port,
-                host=self._config.get("server.host", "0.0.0.0"),
+                host=self._config.get("server.host", "127.0.0.1"),
                 gpu_layers=gpu, context_size=ctx, batch_size=bsz,
                 parallel=parallel, flash_attn=flash_attn,
                 cont_batching=cont_batching,
@@ -558,28 +683,24 @@ class ServerTab(LogMixin, ttk.Frame):
             gc.collect()
 
             killed_count = 0
-            target_names = {'llama-server.exe', 'llama-cli.exe', 'whisper-cli.exe',
-                            'main.exe', 'server.exe'}
-            for proc in psutil.process_iter(['pid', 'name']):
-                try:
-                    proc_info = proc.info
-                    if proc_info['name'] and proc_info['name'].lower() in target_names:
-                        if (self._server.running and self._server._process
-                                and proc_info['pid'] == self._server._process.pid):
-                            continue
-                        proc.terminate()
-                        killed_count += 1
-                        self.log("INFO", f"\u5DF2\u7D42\u6B62\u9032\u7A0B: {proc_info['name']} (PID: {proc_info['pid']})")
-                except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
-                    pass
+            # Only stop the process owned by this controller.  The previous
+            # name-based sweep could terminate another user's llama/Whisper
+            # job, especially on shared Linux hosts.
+            if self._server.running:
+                if self._do_stop_server():
+                    killed_count = 1
+                    self.log("INFO", "已停止本程式管理的 llama-server")
 
-            try:
-                subprocess.run(
-                    ["EmptyStandbyList.exe", "standbylist"],
-                    capture_output=True, timeout=5)
-                self.log("SUCCESS", "\u5DF2\u6E05\u7406\u7CFB\u7D71\u5F85\u6A5F\u5217\u8868")
-            except (FileNotFoundError, subprocess.TimeoutExpired):
-                pass
+            # EmptyStandbyList is a Windows-only optional utility.  Running it
+            # unconditionally made the memory button noisy on macOS/Linux.
+            if os.name == "nt":
+                try:
+                    subprocess.run(
+                        ["EmptyStandbyList.exe", "standbylist"],
+                        capture_output=True, timeout=5)
+                    self.log("SUCCESS", "\u5DF2\u6E05\u7406\u7CFB\u7D71\u5F85\u6A5F\u5217表")
+                except (FileNotFoundError, subprocess.TimeoutExpired):
+                    pass
 
             ram = psutil.virtual_memory()
             ram_available_gb = ram.available / (1024**3)

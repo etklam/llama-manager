@@ -1,6 +1,6 @@
 # llama.cpp Manager
 
-Windows 桌面工具，用於啟動本地 llama.cpp 模型、透過 whisper.cpp 轉錄音訊／影片，再將字幕翻譯成指定語言。
+桌面工具，用於啟動本地 llama.cpp 模型、透過 whisper.cpp 轉錄音訊／影片，再將字幕翻譯成指定語言。主線支援 Windows；macOS／Linux 先以原始碼執行及實機驗收為目標。
 
 **日文語音轉錄推薦使用 `kotoba-whisper-v2.0`。** 本程式使用 whisper.cpp，請下載下方介紹的 GGML `.bin` 版本。
 
@@ -12,7 +12,7 @@ Windows 桌面工具，用於啟動本地 llama.cpp 模型、透過 whisper.cpp 
 | 伺服器設定 | 選擇 GGUF 模型、設定 GPU／上下文／並行槽、啟停 llama-server |
 | 字幕翻譯 | 將 `.srt`／`.txt` 翻譯成指定語言，支援批次、單步／兩步及 SRT 全文理解模式 |
 | 語音轉錄 | 使用 whisper.cpp 將音訊／影片轉成 SRT，支援長音訊分段 |
-| 漫畫 OCR／翻譯 | 批量圖片 → GLM-OCR 候選模型 → 本地 Vulkan 文字模型；校正、checkpoint、取消／續跑與雙語文字 |
+| 漫畫 OCR／翻譯（Beta） | 批量圖片 → GLM-OCR 候選模型 → 本地 Vulkan 文字模型；校正、checkpoint、取消／續跑與雙語文字 |
 
 只做語音轉錄不需要啟動 llama-server；字幕翻譯需要 LLM 伺服器；媒體管線需要兩者。
 
@@ -27,7 +27,7 @@ Windows 桌面工具，用於啟動本地 llama.cpp 模型、透過 whisper.cpp 
 | `Ctrl+L` | 展開／收起執行日誌 |
 | `Ctrl+Shift+T` | 切換深色／淺色主題 |
 
-主題預設為深色，可用狀態列右上角的按鈕或快捷鍵切換，選擇會存入 `config.json` 的 `ui.theme`。
+主題預設為深色，可用狀態列右上角的按鈕或快捷鍵切換，選擇會存入使用者資料目錄的 `config.json`。
 若不想看到執行中的動態指示，可將 `ui.reduce_motion` 設為 `true`。
 
 介面的設計系統（色票、字級、間距、元件）記錄在 [DESIGN.md](DESIGN.md)；
@@ -52,6 +52,10 @@ py -3.12 -m venv .venv
 
 依賴包含 `tkinterdnd2`、`psutil`、`openai`、`httpx`（`requirements.txt` 記錄實際測試版本與相容性依據）。模型與外部執行檔需另行準備。
 
+macOS／Linux 先使用 Python 3.12 的原始碼流程。macOS 需要 Tcl/Tk（Homebrew Python 通常已附）；Ubuntu 需要 `python3-tk`。建立虛擬環境後使用相同的 `pip install -r requirements.txt`，再把 `llama-server`、`whisper-cli`、`ffmpeg` 與 `ffprobe` 的完整路徑填入介面；留空的 FFmpeg 工具會從 PATH 尋找。
+
+`llama-server`（llama.cpp）與 `whisper-cli`（whisper.cpp）都可以使用 Vulkan build，這兩者是各自的推論 backend。macOS 通常由 MoltenVK 將 Vulkan 轉接到 Metal，Linux 可使用原生 Vulkan；目前仍需按工具、作業系統與 GPU 實機驗收。FFmpeg／ffprobe 只負責影音預處理，自己的解碼 hwaccel 不等於 llama.cpp 或 whisper.cpp 已啟用 Vulkan。
+
 ### 2. 準備外部工具
 
 | 工具 | 取得方式 | 本程式用途 |
@@ -60,7 +64,7 @@ py -3.12 -m venv .venv
 | `whisper-cli.exe` | [whisper.cpp Releases](https://github.com/ggml-org/whisper.cpp/releases) | 載入 Whisper GGML 模型並轉錄 |
 | `ffmpeg.exe`、`ffprobe.exe` | [FFmpeg 下載頁](https://ffmpeg.org/download.html)的 Windows builds | 音訊預處理與長音訊時長探測 |
 
-選擇配合電腦與 GPU 的執行版本，保留下載套件內的 DLL。將 FFmpeg 的 `bin` 目錄加入 PATH，重新開啟 PowerShell 後確認：
+llama.cpp 與 whisper.cpp 請分別選擇配合電腦與 GPU 的執行版本，保留下載套件內的 DLL／共享庫。FFmpeg 的 `bin` 目錄可加入 PATH，重新開啟 PowerShell 後確認：
 
 ```powershell
 ffmpeg -version
@@ -69,15 +73,23 @@ ffprobe -version
 
 本程式另有可選的 **DFlash** 加速設定；首次設定先關閉。啟用時需使用支援本程式 `--spec-type draft-dflash` 等參數的 llama-server 與相容 draft 模型，不能假設任何下載版都支援。
 
-### 3. 設定 llama-server 與文字模型路徑
+### 3. 設定工具與文字模型路徑
 
-目前這些路徑仍在 `llama_manager.py` 的 `LlamaManager.__init__` 內指定，GUI 尚未提供執行檔路徑選項。首次使用請改成自己的目錄，例如：
+程式會在使用者資料目錄尋找工具與模型；未設定時不再使用作者機器的固定路徑。最簡單的方式是在「伺服器設定」選擇模型目錄與 `llama-server`，再在「語音轉錄」選擇 `whisper-cli`、FFmpeg、ffprobe。也可在 `config.json` 的 `paths` 區段填入自己的路徑，例如：
 
-```python
-self.base_dir = Path(r"C:\AI\llama.cpp")
-self.runtime_dir = Path(r"C:\AI\llama.cpp\bin")
-self.model_dir = Path(r"C:\AI\models\llm")
-self.server_exe = self.runtime_dir / "llama-server.exe"
+沒有既有設定的首次啟動會自動開啟「設定精靈」；日後可在「伺服器設定」按同名按鈕重新開啟。
+
+```json
+{
+  "paths": {
+    "base_dir": "C:\\AI\\llama.cpp",
+    "runtime_dir": "C:\\AI\\llama.cpp\\bin",
+    "model_dir": "C:\\AI\\models\\llm",
+    "server_exe": "C:\\AI\\llama.cpp\\bin\\llama-server.exe",
+    "ffmpeg": "C:\\AI\\ffmpeg\\bin\\ffmpeg.exe",
+    "ffprobe": "C:\\AI\\ffmpeg\\bin\\ffprobe.exe"
+  }
+}
 ```
 
 把文字模型的 `.gguf` 放入 `model_dir`，或啟動後在「伺服器設定」按「新增」選取模型。LLM 的 GGUF 與 Whisper 的 GGML `.bin` 是兩種不同模型，不能互換。
@@ -103,12 +115,14 @@ curl.exe -L --fail --output .\models\whisper\ggml-kotoba-whisper-v2.0.bin https:
 
 打開「語音轉錄」→ **Settings**：
 
-1. **whisper-cli**：按 Browse，選擇 `whisper-cli.exe`。
+1. **whisper-cli**：按 Browse，選擇 `whisper-cli.exe`（macOS/Linux 選無副檔名的可執行檔）。
 2. **Model Dir**：選剛才的 `models\whisper` 目錄，再按 **Scan**。掃描目錄內的 `.bin` 檔，請勿放在更深層子目錄。
 3. **Model**：選 `kotoba-whisper-v2.0`（清單會移除檔名的 `ggml-` 前綴與 `.bin`）。
 4. **Language**：日文音訊選 **ja - Japanese**。
 5. **Threads**：預設 8，可按電腦資源調整。
 6. 長音訊可勾 **Chunk long audio (30 min, anti-repeat)**。設定會存入 `config.json`，管線共用 Whisper 設定。
+
+「語音轉錄」的 FFmpeg 與 ffprobe 欄位支援完整路徑及檢查；留空代表使用 PATH。這兩個欄位與工作台共用同一個轉錄器，修改後下一次工作即生效。
 
 日後可繼續用上述 Python 指令啟動，不需啟用虛擬環境。`start.bat` 使用 PATH 中的 `python`，不會自動選 `.venv`，而且只檢查 `psutil`；使用該捷徑前，請確保同一個 Python 已安裝完整 `requirements.txt`。
 
@@ -134,7 +148,9 @@ movie_Traditional Chinese.srt   # 繁體中文翻譯
 
 **Replace original** 在媒體管線中是覆寫產生的 `.srt`，不會覆寫影片。Whisper 轉錄本身會在成功時更新同名 `.srt`。管線的 **Clear** 會清空 Pending 與 Completed 清單；Stop 會取消目前轉錄，翻譯期間則需等待當前翻譯呼叫返回。
 
-### 批量漫畫 OCR → 本地翻譯
+### 批量漫畫 OCR → 本地翻譯（Beta）
+
+**不穩定功能：可能執行失敗或產生不準確的結果，請人工核對輸出。**
 
 開「漫畫 OCR／翻譯」，選 llama-server executable，按「枚舉／診斷」選 Vulkan device，再選 OCR GGUF＋matching mmproj 與翻譯 GGUF。加入圖片／資料夾、調整頁序與文件分組，選語言後按「執行」。漫畫路徑與設定全部可由 GUI 設定，不跟隨全域 remote profile。
 
@@ -220,7 +236,7 @@ movie_Traditional Chinese.srt   # 繁體中文翻譯
 
 ## 🧪 開發與測試
 
-介面使用共用的淺色主題，工作台、伺服器設定、字幕翻譯、語音轉錄與漫畫 OCR／翻譯五個分頁保留既有工作流程。伺服器參數分組排列，日誌區隨視窗伸展。
+介面使用共用的主題系統（預設深色），工作台、伺服器設定、字幕翻譯、語音轉錄與漫畫 OCR／翻譯五個分頁保留既有工作流程。伺服器參數分組排列，日誌區隨視窗伸展。
 
 日誌顯示每 80ms 最多處理 200 筆，以一次 Tk 呼叫批次插入。各顯示佇列最多保留 4,000 筆待處理訊息；超量會略過最舊訊息並顯示略過筆數。向上捲動閱讀時會保留閱讀位置。此優化針對介面回應速度與日誌記憶體用量，不改變模型推論參數。
 
@@ -228,24 +244,27 @@ movie_Traditional Chinese.srt   # 繁體中文翻譯
 
 ```powershell
 # 跑全套測試（pytest + coverage）
-.\.venv\Scripts\python.exe -m pip install pytest pytest-cov
+.\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
 .\.venv\Scripts\python.exe -m pytest
 
 # 跳過翻譯子套件的緩慢測試
 .\.venv\Scripts\python.exe -m pytest --ignore=tests/translation --no-cov -q
 ```
 
-本次漫畫 MVP 測試記錄（2026-09-18）：
+歷史漫畫 MVP 測試記錄（2026-09-18，非目前工作樹基線）：
 
 - Baseline：`python -m pytest --basetemp=temp_test_dir_manga_baseline` → **731 passed**。
 - 最終全套：`python -m pytest --basetemp=temp_test_dir_manga_delivery -rs` → **784 passed，0 failed，0 skipped**（45.26 秒，coverage 90%）。既有字幕、TXT、全文理解、Whisper、local／remote 測試均保留。
 - `python tools/verify_manga_vulkan.py --help`、本機 `--inspect-only` 已執行。完整真機 OCR＋翻譯與漫畫品質仍為 **NOT RUN**，原因及驗收程序見 [完整紀錄](docs/manga-ocr-vulkan.md)。
+
+目前工作樹的測試紀錄（macOS、Python 3.14.7、`.venv` 安裝 `requirements-dev.txt`，排除 10 個需要 Tk 的 GUI 測試模組）：**671 passed、13 failed**。13 個失敗全部源自環境，不是本次改動：12 個來自 `subtitle_tab` 延遲 import 觸發缺少的 `_tkinter`，1 個是 `test_srt_parser.py::test_windows_backslashes` 在 POSIX 上沒有 `C:` drive letter。真 Tk 測試與完整數字仍需 Python 3.12＋Tcl/Tk 的 CI（見 `.github/workflows/test-matrix.yml`）。
 
 主要架構模組：
 
 - `log_bus`（在 `ui_helpers.py`）- 統一的日誌 pub/sub，所有分頁共用
 - `FileListbox`（`file_listbox.py`）- 共用的檔案清單 widget（清單 + 瀏覽 + 拖放 + 副檔名過濾）
 - `TranscriptionRunner`（`transcription_runner.py`）- Whisper 與管線共用的轉錄生命週期
+- `ToolManager`／`SetupWizard`（`tool_manager.py`、`setup_wizard.py`）- 外部工具路徑檢查與首次設定
 - `build_translation_config`（`config_helpers.py`）- 翻譯設定的單一來源
 - `output_path_for`（`utils/srt_parser.py`）- 翻譯輸出路徑的單一來源
 
@@ -253,18 +272,21 @@ movie_Traditional Chinese.srt   # 繁體中文翻譯
 
 ### config.json
 
-設定儲存在程式目錄的 `config.json`。目前模型清單也存於這個檔案的 `models.models` 與 `whisper_models.models`；根目錄的 `models.json` 不是目前 registry 的讀取來源。
+設定儲存在使用者資料目錄的 `config.json`，不會寫入程式安裝目錄。預設位置是 Windows `%LOCALAPPDATA%/llama-manager`、macOS `~/Library/Application Support/llama-manager`、Linux `$XDG_DATA_HOME/llama-manager`（未設定時 `~/.local/share/llama-manager`）。目前模型清單也存於這個檔案的 `models.models` 與 `whisper_models.models`；根目錄的 `models.json` 不是目前 registry 的讀取來源。從舊版本升級時，程式會首次啟動時匯入程式目錄的舊 `config.json`。
+
+版本庫內的 `config.default.json` 與 `models.default.json` 只有空白預設值；`config.json`／`models.json` 是執行時狀態，不能拿來當發布設定。
 
 主要設定群組：
 
 - `server`：port、GPU 層數、context、並行槽與加速選項。
 - `whisper`：CLI 路徑、模型目錄、語言、執行緒數、長音訊分段選項、跳過已有 SRT 選項。
+- `paths`：llama-server、模型、FFmpeg 與 ffprobe 的完整路徑；FFmpeg／ffprobe 留空時會嘗試使用系統 PATH。
 - `ui`：最後選擇的文字模型、目標語言及翻譯參數。
 - `ui.context_mode`：`none`（標準翻譯）或 `story`（全文理解翻譯）；舊設定缺少時使用 `none`。
 - `llm`：翻譯後端 — `mode`（`local`／`remote`）、`active_profile_id` 與 `profiles`（遠端 OpenAI 相容端點設定檔）。設定檔只存 `api_key_env` 環境變數名稱，不存金鑰本身；舊設定缺少時使用 `local`。
 - `pipeline`：管線語言、目標語言與覆寫選項。
 
-一般透過 GUI 設定即可。手動編輯前先關閉程式；llama-server 執行路徑仍須按安裝步驟修改 `llama_manager.py`。
+一般透過 GUI 設定即可。手動編輯前先關閉程式；路徑變更會在下一次工作啟動時生效。
 
 ## 🔌 API 使用
 
@@ -366,22 +388,22 @@ curl http://localhost:8080/v1/chat/completions \
 
 ## 📊 系統需求
 
-- **作業系統**: Windows 10/11
+- **作業系統**: Windows 10/11；macOS Apple Silicon、Ubuntu 24.04 先支援原始碼執行與手動工具配置
 - **Python**: 建議 Python 3.12 64-bit（目前測試版本）
 - **GPU／RAM／VRAM**：需求取決於文字模型、Whisper 模型及所用執行後端；沒有固定必須使用的 GPU 型號。
 
 ## 🔧 進階選項
 
-### 打包為 .exe
+### 打包為 Windows 發布包
 
 如需打包為獨立可執行檔：
 
 ```bash
-pip install pyinstaller
-pyinstaller --onefile --windowed --name="llama-manager" llama_manager.py
+pip install -r requirements-dev.txt
+python packaging/build.py --zip
 ```
 
-產生的 `llama-manager.exe` 將在 `dist` 目錄中。
+產生的 `dist/llama-manager/` 目錄包含可執行檔及 Tcl/Tk、tkinterdnd2 等資源；Windows、macOS、Linux 必須在各自平台分別建置。正式發布前仍需驗證外部 llama／Whisper／FFmpeg 工具及其共享庫。
 
 ## 📝 更新日誌
 

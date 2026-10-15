@@ -45,6 +45,12 @@ class TestLLMClientProtocol:
 class TestOpenAIClientInitialization:
     """Test OpenAI client adapter initialization."""
 
+    @pytest.mark.parametrize('key, expected', [('', 'local-only'), ('secret', 'secret')])
+    @patch('translation.openai_client.OpenAI')
+    def test_sdk_receives_nonempty_key(self, sdk, key, expected):
+        OpenAIClient('http://127.0.0.1:8080/v1', 'local', api_key=key)
+        assert sdk.call_args.kwargs['api_key'] == expected
+
     def test_initialization_with_basic_params(self):
         """Test client initialization with basic parameters."""
         client = OpenAIClient(

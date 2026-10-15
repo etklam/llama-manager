@@ -29,6 +29,9 @@ from server_controller import ServerController
 from manga_tab import MangaTab
 from model_registry import ModelRegistry
 from whisper_model_registry import WhisperModelRegistry
+from app_paths import default_tool_paths, resource_dir, user_data_dir
+from tool_manager import ToolManager
+from whisper_transcription import FfmpegMediaAdapter, WhisperTranscriber
 from ui_theme import apply_theme
 from ui_helpers import (
     CHANNEL_APP,
@@ -41,16 +44,6 @@ from ui_helpers import (
     log_bus,
 )
 
-# The author's build layout, kept as the default so an existing install keeps
-# working with no config edit. These used to be literals in __init__, which
-# made the one thing the app cannot start without the only thing not
-# configurable — see config_manager.DEFAULT_CONFIG['paths'].
-FALLBACK_BASE_DIR = r"D:\AI\llama\llama.cpp"
-FALLBACK_RUNTIME_DIR = r"D:\AI\llama\llama.cpp-dflash\build-vulkan-msvc\bin"
-FALLBACK_MODEL_SUBDIR = "llama-hip"
-SERVER_EXE_NAME = "llama-server.exe"
-
-
 class LlamaManager(LogMixin):
     def __init__(self, root):
         self.root = root
@@ -58,8 +51,17 @@ class LlamaManager(LogMixin):
         self.root.geometry("1280x860")
         self.root.minsize(1100, 720)
 
-        self.config_manager = ConfigManager(str(Path(__file__).parent / "config.json"))
+        self.resource_dir = resource_dir(__file__)
+        self.data_dir = user_data_dir()
+        config_path = self.data_dir / "config.json"
+        legacy_config = self.resource_dir / "config.json"
+        self.first_run = not config_path.exists() and not legacy_config.is_file()
+        self.config_manager = ConfigManager(
+            str(config_path),
+            legacy_paths=[legacy_config],
+        )
         self.config_manager.load()
+        self.tools = ToolManager(self.config_manager, self.data_dir)
 
         # Theme before any widget exists: ttk styles have to be registered
         # before the widgets that reference them are constructed.
@@ -74,10 +76,12 @@ class LlamaManager(LogMixin):
         )
         self.models = ModelRegistry(self.model_dir, self.config_manager)
 
-        whisper_model_dir = Path(
-            self.config_manager.get("whisper.model_dir", str(self.model_dir)))
-        self.whisper_models = WhisperModelRegistry(whisper_model_dir,
+        self.whisper_models = WhisperModelRegistry(self.whisper_model_dir,
                                                    self.config_manager)
+        ffmpeg = self.tools.resolve("ffmpeg")
+        ffprobe = self.tools.resolve("ffprobe")
+        self.transcriber = WhisperTranscriber(
+            media=FfmpegMediaAdapter(ffmpeg_path=ffmpeg, ffprobe_path=ffprobe))
 
         self.create_ui()
         self.scan_models()
@@ -85,34 +89,26 @@ class LlamaManager(LogMixin):
         # ServerTab reaches back for scan_models via the toplevel.
         self.root._app = self
         self.root.protocol("WM_DELETE_WINDOW", self._request_close)
+        if self.first_run:
+            self.root.after(250, self.server_tab._open_setup_wizard)
 
     # --------------------------------------------------------------- paths
     def _resolve_paths(self):
-        """Read install paths from config, falling back to the known layout.
-
-        Writing the resolved values back means the first launch materializes
-        them into config.json, so they are visible and editable instead of
-        buried in source.
-        """
+        """Resolve configured paths against the writable user data directory."""
         cm = self.config_manager
-        base = cm.get("paths.base_dir", "") or FALLBACK_BASE_DIR
-        runtime = cm.get("paths.runtime_dir", "") or FALLBACK_RUNTIME_DIR
-        model_dir = cm.get("paths.model_dir", "") or str(
-            Path(base) / FALLBACK_MODEL_SUBDIR)
-        server_exe = cm.get("paths.server_exe", "") or str(
-            Path(runtime) / SERVER_EXE_NAME)
+        defaults = default_tool_paths(self.data_dir)
+        base = Path(cm.get("paths.base_dir", "") or defaults["base_dir"])
+        runtime = Path(cm.get("paths.runtime_dir", "") or defaults["runtime_dir"])
+        model_dir = Path(cm.get("paths.model_dir", "") or defaults["model_dir"])
+        server_exe = self.tools.resolve("llama-server")
+        whisper_model_dir = Path(
+            cm.get("whisper.model_dir", "") or defaults["whisper_model_dir"])
 
-        self.base_dir = Path(base)
-        self.runtime_dir = Path(runtime)
-        self.model_dir = Path(model_dir)
-        self.server_exe = Path(server_exe)
-
-        for key, value in (("paths.base_dir", base),
-                           ("paths.runtime_dir", runtime),
-                           ("paths.model_dir", model_dir),
-                           ("paths.server_exe", server_exe)):
-            if not cm.get(key, ""):
-                cm.set(key, value)
+        self.base_dir = base
+        self.runtime_dir = runtime
+        self.model_dir = model_dir
+        self.whisper_model_dir = whisper_model_dir
+        self.server_exe = server_exe
 
     # ------------------------------------------------------------ lifecycle
     def _request_close(self):
@@ -170,6 +166,8 @@ class LlamaManager(LogMixin):
             base_dir=self.model_dir,
             on_model_selected=self._on_server_model_selected,
             on_server_state_changed=self._on_server_state_changed,
+            on_model_dir_changed=self._set_model_dir,
+            tool_manager=self.tools,
         )
 
         self.main_tab = WorkbenchSurface(
@@ -184,6 +182,7 @@ class LlamaManager(LogMixin):
             on_goto_server=lambda: self.shell.select("server"),
             on_log=lambda level, msg: log_bus.emit(level, msg, CHANNEL_PIPELINE),
             on_debug_log=self._debug_log,
+            transcriber=self.transcriber,
         )
 
         self.subtitle_tab = SubtitleTranslationTab(
@@ -199,6 +198,9 @@ class LlamaManager(LogMixin):
             get_whisper_models=self.get_whisper_models,
             scan_whisper_models=lambda: self.get_whisper_models(do_scan=True),
             on_srt_generated=self._on_srt_generated,
+            transcriber=self.transcriber,
+            on_tools_changed=self._on_whisper_tools_changed,
+            tool_manager=self.tools,
         )
 
         self.manga_tab = MangaTab(parent, self.server, self.config_manager)
@@ -215,7 +217,7 @@ class LlamaManager(LogMixin):
                             channels=(CHANNEL_TRANSLATE,))
         self.shell.register("whisper", self.whisper_tab, "語音轉錄",
                             channels=(CHANNEL_WHISPER,))
-        self.shell.register("manga", self.manga_tab, "漫畫 OCR／翻譯",
+        self.shell.register("manga", self.manga_tab, "漫畫 OCR／翻譯 Beta",
                             channels=(CHANNEL_MANGA,))
         self.shell.select("workbench")
 
@@ -291,12 +293,56 @@ class LlamaManager(LogMixin):
     def get_current_model(self):
         return self.server_tab.model_var.get()
 
+    def _set_model_dir(self, path):
+        """Apply the model directory selected on the Server surface."""
+        value = str(path).strip()
+        if not value:
+            return
+        self.model_dir = Path(value).expanduser()
+        self.models.scan_dir = self.model_dir
+        self.config_manager.set("paths.model_dir", str(self.model_dir))
+        self.server_tab._base_dir = self.model_dir
+        self.scan_models()
+
+    def _on_whisper_tools_changed(self):
+        """Refresh the shared media adapter after Whisper settings change."""
+        ffmpeg = self.tools.resolve("ffmpeg")
+        ffprobe = self.tools.resolve("ffprobe")
+        self.transcriber.set_media_tools(ffmpeg, ffprobe)
+        self.log("INFO", f"媒體工具：ffmpeg={ffmpeg}；ffprobe={ffprobe}")
+
+    def _apply_setup_wizard(self, values):
+        """Refresh live surfaces after the first-run setup dialog closes."""
+        model_dir = values.get("model_dir", "").strip()
+        if model_dir:
+            self.server_tab.model_dir_var.set(model_dir)
+            self.server_tab._apply_model_dir()
+
+        server_exe = values.get("llama-server", "").strip()
+        if server_exe:
+            self.server_tab.server_exe_var.set(server_exe)
+            self.server_tab._apply_server_exe()
+
+        whisper = self.whisper_tab
+        whisper_dir = values.get("whisper_model_dir", "").strip()
+        if whisper_dir:
+            whisper._model_dir_var.set(whisper_dir)
+        whisper_cli = values.get("whisper-cli", "").strip()
+        if whisper_cli:
+            whisper._cli_var.set(whisper_cli)
+        whisper._ffmpeg_var.set(values.get("ffmpeg", "").strip())
+        whisper._ffprobe_var.set(values.get("ffprobe", "").strip())
+        whisper._save_settings()
+        whisper._populate_models()
+
     def get_whisper_models(self, do_scan=False):
         model_dir = self.config_manager.get("whisper.model_dir", "")
         if model_dir:
             self.whisper_models.scan_dir = Path(model_dir)
         if do_scan:
             self.whisper_models.scan()
+            if self.whisper_models.last_scan_error:
+                self.log("WARNING", self.whisper_models.last_scan_error)
         return self.whisper_models.list_models()
 
     def _on_srt_generated(self, srt_path):

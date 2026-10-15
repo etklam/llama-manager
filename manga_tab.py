@@ -17,7 +17,6 @@ Brought onto the app's shared conventions in this pass. What changed and why:
   :class:`ui_kit.ValidatedSpin` marks the offending field and names it.
 """
 from pathlib import Path
-import os
 import queue
 import re
 import threading
@@ -35,6 +34,7 @@ from ui_kit import (
 )
 from ui_theme import theme
 from ui_tokens import SPACE
+from platform_utils import open_path
 
 # (value, label) pairs. The value is what the runner sees and what lands in
 # manga-job.json; the label is only ever shown.
@@ -92,11 +92,11 @@ class MangaTab(LogMixin, ttk.Frame):
         heading = ttk.Frame(self, style="Canvas.TFrame")
         heading.grid(row=0, column=0, sticky="ew", padx=SPACE["page"],
                      pady=(SPACE["section"], SPACE["loose"]))
-        ttk.Label(heading, text="漫畫 OCR／翻譯",
+        ttk.Label(heading, text="漫畫 OCR／翻譯 Beta",
                   style="Display.TLabel").pack(anchor="w")
         ttk.Label(heading,
-                  text="用本地 Vulkan llama-server 辨識頁面文字再翻譯；"
-                       "GLM-OCR 為候選模型，成品仍需人工驗收。",
+                  text="Beta・不穩定功能，可能失敗或產生不準確的結果，請人工核對輸出。\n"
+                       "使用本地 Vulkan llama-server；GLM-OCR 為候選模型，尚未完成品質驗收。",
                   style="CanvasMuted.TLabel").pack(anchor="w",
                                                    pady=(SPACE["hair"], 0))
 
@@ -577,7 +577,11 @@ class MangaTab(LogMixin, ttk.Frame):
     def open_output(self):
         path = Path(self.vars['output'].get()).resolve()
         path.mkdir(parents=True, exist_ok=True)
-        os.startfile(path)
+        try:
+            open_path(path)
+        except (OSError, RuntimeError) as error:
+            self._set_status('無法開啟輸出目錄：' + str(error), state="error",
+                             level="ERROR")
 
     # -------------------------------------------------------------- events
     def poll(self):

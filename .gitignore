@@ -5,6 +5,7 @@ __pycache__/
 dist/
 build/
 *.spec
+!packaging/*.spec
 
 # Virtualenvs (README instructs creating .venv)
 .venv/
@@ -19,8 +20,12 @@ htmlcov/
 temp_test_dir*/
 
 # Project-specific
-# config.json and models.json are intentionally tracked: they carry live
-# local state (model paths, profiles without secrets).
+# Runtime state belongs in the per-user data directory.  Keep clean templates
+# in version control instead of publishing a developer's model paths.
+config.json
+models.json
+!config.default.json
+!models.default.json
 pyvideotrans/
 *.srt
 !test*.srt

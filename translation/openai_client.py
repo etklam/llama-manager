@@ -83,7 +83,7 @@ class OpenAIClient:
         # Deterministic initialization: the SDK client (and its connection
         # pool) exists from construction, not on first use.
         client_kwargs = {
-            'api_key': self.api_key,
+            'api_key': self.api_key or 'local-only',
             'base_url': self.api_url,
             'timeout': self.timeout,
             # One retry owner: the transport policy in translation.transport.

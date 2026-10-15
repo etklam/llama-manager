@@ -18,7 +18,7 @@ psutil>=5.9.0
 tkinterdnd2
 
 # Subtitle translation dependencies
-openai>=2.0.0,<3.0.0
+openai>=2.8.1,<2.9.0
 httpx>=0.28.0,<1.0.0
 
 # Image decoding/EXIF/native preview only; tested with Pillow 11.3.0.

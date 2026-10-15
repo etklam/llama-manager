@@ -125,6 +125,19 @@ class TestServerStart:
                 batch_size=256
             )
 
+    def test_start_raises_if_configured_executable_doesnt_exist(self, temp_model_file, tmp_path):
+        controller = ServerController(tmp_path / "bin" / "llama-server", Mock())
+
+        with pytest.raises(FileNotFoundError, match="llama-server executable not found"):
+            controller.start(
+                model_path=temp_model_file,
+                port=8080,
+                host="127.0.0.1",
+                gpu_layers=0,
+                context_size=2048,
+                batch_size=128,
+            )
+
     @patch('server_controller.subprocess.Popen')
     def test_start_raises_if_already_running(self, mock_popen, temp_model_file):
         """start() should raise if server is already running."""

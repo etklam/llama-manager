@@ -618,8 +618,8 @@ class TestConfigFileCreation:
 
         # Check default values
         assert config["server"]["port"] == 8080, "Should have default port"
-        assert config["server"]["host"] == "0.0.0.0", "Should have default host"
-        assert config["ui"]["theme"] == "default", "Should have default theme"
+        assert config["server"]["host"] == "127.0.0.1", "Should have default host"
+        assert config["ui"]["theme"] == "dark", "Should have default theme"
 
     def test_create_parent_directories_if_needed(self, tmp_path):
         """Test that parent directories are created."""

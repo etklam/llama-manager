@@ -2,6 +2,7 @@
 import subprocess
 import socket
 import os
+import signal
 from contextlib import contextmanager
 from collections import deque
 from functools import wraps
@@ -31,7 +32,7 @@ class ServerController:
         """Create controller.
 
         Args:
-            server_exe: Path to llama-server.exe executable
+            server_exe: Path to the platform's llama-server executable
             log_callback: Function to call with each line of server output
         """
         self._state_lock = threading.RLock()
@@ -46,6 +47,17 @@ class ServerController:
         self._port: Optional[int] = None
         self._log_thread: Optional[threading.Thread] = None
         self._log_thread_stopped = False  # Flag to track if log thread ended naturally
+
+    def set_executable(self, server_exe: Path) -> None:
+        """Use a different server binary for the next start."""
+        with self._state_lock:
+            if self._running:
+                raise RuntimeError("Cannot change the server executable while running")
+            self._server_exe = Path(server_exe)
+
+    @property
+    def executable(self) -> Path:
+        return Path(self._server_exe)
 
     @owned_operation
     def start(self, model_path: str, port: int, host: str,
@@ -92,6 +104,8 @@ class ServerController:
         """
         if self._running:
             raise RuntimeError("Server is already running")
+
+        self._validate_executable()
 
         # Check model file exists
         model_file = Path(model_path)
@@ -149,6 +163,21 @@ class ServerController:
         cmd += list(extra_args)
         self.start_command(cmd, port)
 
+    def _validate_executable(self) -> None:
+        """Fail before touching the port when a configured binary is absent.
+
+        A bare name is intentionally allowed so advanced users can keep a
+        server on PATH; ``Popen`` then resolves it using the platform rules.
+        Configured paths (the normal GUI path) are checked here to turn a
+        cryptic process error into an actionable message.
+        """
+        executable = Path(self._server_exe)
+        if executable.parent == Path("."):
+            return
+        if not executable.is_file():
+            raise FileNotFoundError(
+                f"llama-server executable not found: {executable}")
+
     @contextmanager
     def lease(self, name):
         owner = threading.get_ident()
@@ -177,8 +206,7 @@ class ServerController:
         self._isolated_logs = isolated
         self.last_command = (tuple(cmd), port, isolated)
         # Start process
-        self._process = subprocess.Popen(
-            cmd,
+        popen_kwargs = dict(
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
@@ -190,6 +218,15 @@ class ServerController:
                   if not k.startswith(('LLAMA_ARG_', 'MTMD_', 'GGML_'))}
                  if isolated else None),
             creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),
+        )
+        if os.name != "nt":
+            # A server build may launch helper threads/processes.  Starting a
+            # new session lets shutdown cover the whole process group without
+            # touching unrelated tools on the host.
+            popen_kwargs["start_new_session"] = True
+        self._process = subprocess.Popen(
+            cmd,
+            **popen_kwargs,
         )
 
         self._running = True
@@ -213,11 +250,25 @@ class ServerController:
         process = self._process
         if process is None:
             return
-        process.terminate()
+        pid = getattr(process, "pid", None)
+        grouped = os.name != "nt" and isinstance(pid, int) and pid > 0
+        if grouped:
+            try:
+                os.killpg(os.getpgid(pid), signal.SIGTERM)
+            except (OSError, ProcessLookupError):
+                process.terminate()
+        else:
+            process.terminate()
         try:
             process.wait(timeout=5)
         except subprocess.TimeoutExpired:
-            process.kill()
+            if grouped:
+                try:
+                    os.killpg(os.getpgid(pid), signal.SIGKILL)
+                except (OSError, ProcessLookupError):
+                    process.kill()
+            else:
+                process.kill()
             process.wait(timeout=5)
         if self._process is process:
             self._running = False

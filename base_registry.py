@@ -12,6 +12,7 @@ class BaseModelRegistry:
     def __init__(self, scan_dir: Path, config_manager):
         self.scan_dir = Path(scan_dir)
         self.config_manager = config_manager
+        self.last_scan_error: Optional[str] = None
 
     def _build_model_info(self, filepath: Path) -> dict:
         size_value = filepath.stat().st_size / (1024 ** self.size_divisor)
@@ -29,7 +30,12 @@ class BaseModelRegistry:
         return True
 
     def scan(self) -> tuple:
+        self.last_scan_error = None
         if not self.scan_dir.exists():
+            self.last_scan_error = f"Model directory does not exist: {self.scan_dir}"
+            return [], 0, 0
+        if not self.scan_dir.is_dir():
+            self.last_scan_error = f"Model path is not a directory: {self.scan_dir}"
             return [], 0, 0
 
         files = [

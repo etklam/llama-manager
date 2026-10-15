@@ -21,6 +21,7 @@ from tkinter import ttk
 from typing import Callable
 
 from pipeline_card import PipelineCard
+from whisper_transcription import WhisperTranscriber
 from ui_kit import Section, StatusLine
 from ui_tokens import SPACE
 
@@ -33,7 +34,8 @@ class WorkbenchSurface(ttk.Frame):
                  on_start_server: Callable[[], None],
                  on_stop_server: Callable[[], None],
                  on_goto_server: Callable[[], None],
-                 on_log, on_debug_log=None):
+                 on_log, on_debug_log=None,
+                 transcriber: WhisperTranscriber | None = None):
         super().__init__(parent, style="Canvas.TFrame")
         self._get_server_running = get_server_running
         self._get_port = get_port
@@ -56,7 +58,7 @@ class WorkbenchSurface(ttk.Frame):
 
         self._create_server_strip()
         self._create_pipeline(config_manager, get_whisper_models,
-                              on_log, on_debug_log)
+                              on_log, on_debug_log, transcriber)
 
     # ------------------------------------------------------- server strip
     def _create_server_strip(self):
@@ -91,7 +93,7 @@ class WorkbenchSurface(ttk.Frame):
 
     # ----------------------------------------------------------- pipeline
     def _create_pipeline(self, config_manager, get_whisper_models,
-                         on_log, on_debug_log):
+                         on_log, on_debug_log, transcriber):
         section = Section(
             self, "語音轉錄 → 翻譯",
             "影音檔會先轉錄成字幕再翻譯；已有的 SRT／TXT 會直接翻譯。")
@@ -107,6 +109,7 @@ class WorkbenchSurface(ttk.Frame):
             get_whisper_models=get_whisper_models,
             on_log=on_log,
             on_debug_log=on_debug_log,
+            transcriber=transcriber,
         )
         self.pipeline_card.grid(row=0, column=0, sticky="nsew")
         section.body.rowconfigure(0, weight=1)

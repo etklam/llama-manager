@@ -187,12 +187,12 @@ def _run_process(
     return "\n".join(lines)
 
 
-def _detect_hwaccel_args() -> List[str]:
+def _detect_hwaccel_args(ffmpeg_path: str = "ffmpeg") -> List[str]:
     if platform.system() != "Windows":
         return []
     try:
         result = subprocess.run(
-            ["ffmpeg", "-hide_banner", "-hwaccels"],
+            [ffmpeg_path, "-hide_banner", "-hwaccels"],
             capture_output=True,
             text=True,
             timeout=5,
@@ -207,13 +207,15 @@ def _detect_hwaccel_args() -> List[str]:
 
 
 class FfmpegMediaAdapter:
-    _hwaccel_args: Optional[List[str]] = None
+    def __init__(self, ffmpeg_path: str = "ffmpeg", ffprobe_path: str = "ffprobe"):
+        self.ffmpeg_path = str(ffmpeg_path)
+        self.ffprobe_path = str(ffprobe_path)
+        self._hwaccel_args: Optional[List[str]] = None
 
-    @classmethod
-    def get_hwaccel_args(cls) -> List[str]:
-        if cls._hwaccel_args is None:
-            cls._hwaccel_args = _detect_hwaccel_args()
-        return cls._hwaccel_args
+    def get_hwaccel_args(self) -> List[str]:
+        if self._hwaccel_args is None:
+            self._hwaccel_args = _detect_hwaccel_args(self.ffmpeg_path)
+        return self._hwaccel_args
 
     def prepare_audio(
         self,
@@ -225,7 +227,7 @@ class FfmpegMediaAdapter:
         if source.suffix.lower() == ".wav":
             return source
 
-        command = ["ffmpeg", "-y"]
+        command = [self.ffmpeg_path, "-y"]
         if source.suffix.lower() in VIDEO_EXTENSIONS:
             command.extend(self.get_hwaccel_args())
         command.extend([
@@ -248,7 +250,7 @@ class FfmpegMediaAdapter:
         emit: Callable[[TranscriptionEvent], None],
     ) -> float:
         output = _run_process([
-            "ffprobe", "-v", "error",
+            self.ffprobe_path, "-v", "error",
             "-show_entries", "format=duration",
             "-of", "default=noprint_wrappers=1:nokey=1",
             str(source),
@@ -268,7 +270,7 @@ class FfmpegMediaAdapter:
         emit: Callable[[TranscriptionEvent], None],
     ) -> None:
         _run_process([
-            "ffmpeg", "-y",
+            self.ffmpeg_path, "-y",
             "-ss", f"{start_seconds:.3f}",
             "-t", f"{duration_seconds:.3f}",
             "-i", str(source),
@@ -403,6 +405,19 @@ class WhisperTranscriber:
     ):
         self._media = media or FfmpegMediaAdapter()
         self._whisper = whisper or WhisperCliAdapter()
+
+    def set_media_tools(self, ffmpeg_path: str | Path,
+                        ffprobe_path: str | Path) -> None:
+        """Apply new media tool paths to future runs.
+
+        The application shares one transcriber between the Whisper tab and the
+        Workbench.  Replacing only the built-in FFmpeg adapter keeps that
+        sharing intact while allowing a user to change tools without restarting
+        the GUI.  Test/custom adapters are intentionally left untouched.
+        """
+        if isinstance(self._media, FfmpegMediaAdapter):
+            self._media = FfmpegMediaAdapter(
+                ffmpeg_path=str(ffmpeg_path), ffprobe_path=str(ffprobe_path))
 
     def transcribe(
         self,

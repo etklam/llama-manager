@@ -1,0 +1,69 @@
+{
+  "server": {
+    "port": 8080,
+    "host": "127.0.0.1",
+    "gpu_layers": 99,
+    "context_size": 16384,
+    "batch_size": 512,
+    "threads": -1,
+    "parallel": 3,
+    "flash_attn": true,
+    "cont_batching": true,
+    "cache_type_k": "q8_0",
+    "cache_type_v": "q8_0",
+    "dflash_enabled": false,
+    "dflash_model_path": "",
+    "dflash_n_max": 6,
+    "dflash_gpu_layers": "all",
+    "dflash_device": "Vulkan0",
+    "mmproj_path": ""
+  },
+  "paths": {
+    "base_dir": "",
+    "runtime_dir": "",
+    "model_dir": "",
+    "server_exe": "",
+    "ffmpeg": "",
+    "ffprobe": ""
+  },
+  "ui": {
+    "theme": "dark",
+    "reduce_motion": false,
+    "auto_scroll": true,
+    "last_model": "",
+    "last_source_lang": "auto",
+    "last_target_lang": "zh-cn",
+    "context_mode": "none",
+    "max_workers": 3
+  },
+  "translation": {
+    "enabled": false,
+    "source_lang": "auto",
+    "target_lang": "en",
+    "provider": "mock"
+  },
+  "whisper": {
+    "cli_path": "",
+    "model_dir": "",
+    "last_model": "",
+    "language": "auto",
+    "threads": 8,
+    "chunk_long_audio": false
+  },
+  "llm": {
+    "mode": "local",
+    "active_profile_id": "",
+    "profiles": []
+  },
+  "models": {
+    "models": []
+  },
+  "whisper_models": {
+    "models": []
+  },
+  "pipeline": {
+    "language": "auto",
+    "target_lang": "zh-cn",
+    "replace_original": false
+  }
+}

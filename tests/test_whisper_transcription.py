@@ -594,3 +594,21 @@ class TestAnsiUnsafePaths:
 
     def test_ansi_safe_accepts_plain_ascii_paths(self):
         assert _is_ansi_safe("D:/media/clip.wav") is True
+
+
+@patch("whisper_transcription._run_process")
+def test_ffmpeg_adapter_uses_configured_tool_paths(mock_run, tmp_path):
+    source = tmp_path / "clip.mp4"
+    destination = tmp_path / "audio.wav"
+    destination.write_bytes(b"wav")
+    mock_run.side_effect = ["", "1.0"]
+
+    adapter = FfmpegMediaAdapter(
+        ffmpeg_path="/opt/tools/ffmpeg",
+        ffprobe_path="/opt/tools/ffprobe",
+    )
+    adapter.prepare_audio(source, destination, CancellationToken(), lambda event: None)
+    adapter.duration_seconds(source, CancellationToken(), lambda event: None)
+
+    assert mock_run.call_args_list[0].args[0][0] == "/opt/tools/ffmpeg"
+    assert mock_run.call_args_list[1].args[0][0] == "/opt/tools/ffprobe"

@@ -47,19 +47,25 @@ def test_both_translation_entries_expose_story_context_mode(desktop):
     assert str(pipeline_combo.cget('state')) == 'readonly'
 
 
-def test_debug_batches_logs_and_releases_timer_on_close(desktop):
+def test_debug_batches_logs_and_keeps_drawer_polling_on_close(desktop):
+    drawer = desktop.shell.drawer
+    drawer.clear()
+    desktop.root.after_cancel(drawer._poll_job)
+    while not drawer._queue.empty():
+        drawer._queue.get_nowait()
     desktop._open_debug_win()
     desktop._debug_win.withdraw()
-    desktop.root.after_cancel(desktop._debug_after)
     for i in range(1000):
         log_bus.emit("INFO", f"message {i}", "pipeline")
-    desktop._poll_debug_queue()
-    assert desktop._debug_queue.qsize() == 1000 - LOG_DRAIN_MAX
-    assert "[pipeline] message 199" in desktop._debug_text.get("1.0", tk.END)
-    assert desktop._debug_text.cget("state") == "disabled"
-    timer = desktop._debug_after
+    drawer._poll()
+    assert drawer._queue.qsize() == 1000 - LOG_DRAIN_MAX
+    text = drawer._detached_view._text
+    assert "message 199" in text.get("1.0", tk.END)
+    assert text.cget("state") == "disabled"
+    timer = drawer._poll_job
     desktop._close_debug_win()
-    assert timer not in desktop.root.tk.call("after", "info")
+    assert drawer.detached is None
+    assert timer in desktop.root.tk.call("after", "info")
 
 
 def test_destroyed_log_widget_unsubscribes(desktop):
@@ -74,7 +80,6 @@ def test_tab_change_routes_by_identity_not_index(desktop):
     with patch.object(desktop.subtitle_tab, 'refresh_model') as refresh:
         desktop.notebook.select(desktop.subtitle_tab)
         desktop.root.update_idletasks()
-        desktop._on_tab_changed(None)
         refresh.assert_called()
 
     # Switching elsewhere must not re-run the subtitle tab's refresh, even
@@ -82,5 +87,4 @@ def test_tab_change_routes_by_identity_not_index(desktop):
     with patch.object(desktop.subtitle_tab, 'refresh_model') as refresh:
         desktop.notebook.select(desktop.main_tab)
         desktop.root.update_idletasks()
-        desktop._on_tab_changed(None)
         refresh.assert_not_called()

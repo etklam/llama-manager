@@ -13,6 +13,7 @@ from pathlib import Path
 
 from base_registry import BaseModelRegistry
 from pipeline_runner import PipelineRunner
+from whisper_transcription import WhisperTranscriber
 from constants import (
     SUPPORTED_MEDIA, SUPPORTED_SUBTITLE, WHISPER_LANGUAGES, TARGET_LANGUAGES,
 )
@@ -30,7 +31,8 @@ from ui_tokens import SPACE
 class PipelineCard(ttk.Frame):
     def __init__(self, parent, config_manager, get_server_running,
                  get_port, get_current_model, get_whisper_models,
-                 on_log, on_debug_log=None):
+                 on_log, on_debug_log=None,
+                 transcriber: WhisperTranscriber | None = None):
         super().__init__(parent, style="Surface.TFrame")
         self._config = config_manager
         self._get_server_running = get_server_running
@@ -39,6 +41,7 @@ class PipelineCard(ttk.Frame):
         self._get_whisper_models = get_whisper_models
         self._on_log = on_log
         self._on_debug_log = on_debug_log or (lambda m: None)
+        self._transcriber = transcriber
 
         self._pipeline_runner = None
         self._pipe_files = []
@@ -311,6 +314,7 @@ class PipelineCard(ttk.Frame):
             on_progress=self._pipeline_step,
             on_done=self._pipeline_done,
             on_file_completed=self._pipeline_file_completed,
+            transcriber=self._transcriber,
         )
 
         self._pipeline_runner.local_server = getattr(self, 'local_server', None)

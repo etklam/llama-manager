@@ -260,6 +260,7 @@ class TestScanMissingDirectory:
         assert models == [], "Should return empty list for missing directory"
         assert added == 0, "Should have 0 added for missing directory"
         assert removed == 0, "Should have 0 removed for missing directory"
+        assert "does not exist" in registry.last_scan_error
 
 
 if __name__ == "__main__":

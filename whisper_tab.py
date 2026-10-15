@@ -2,6 +2,7 @@
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
+import os
 import threading
 from pathlib import Path
 
@@ -70,12 +71,15 @@ class WhisperTab(LogMixin, ttk.Frame):
     log_channel = CHANNEL_WHISPER
 
     def __init__(self, parent, config_manager, get_whisper_models,
-                 scan_whisper_models, on_srt_generated, transcriber=None):
+                 scan_whisper_models, on_srt_generated, transcriber=None,
+                 on_tools_changed=None, tool_manager=None):
         super().__init__(parent, style="Canvas.TFrame")
         self._config_manager = config_manager
         self._get_whisper_models = get_whisper_models
         self._scan_whisper_models = scan_whisper_models
         self._on_srt_generated = on_srt_generated
+        self._on_tools_changed = on_tools_changed
+        self._tool_manager = tool_manager
         self._runner = TranscriptionRunner(
             transcriber or WhisperTranscriber(), _WhisperTabPresenter(self))
         self._file_list: list = []
@@ -161,6 +165,33 @@ class WhisperTab(LogMixin, ttk.Frame):
         ttk.Button(cli_cell, text="瀏覽…", style="Ghost.TButton",
                    command=self._browse_cli).pack(side="left",
                                                   padx=(SPACE["snug"], 0))
+
+        ffmpeg_cell = grid.add("FFmpeg", hint="留空會使用 PATH；影音轉錄與長音訊分段都會使用此工具。")
+        self._ffmpeg_var = tk.StringVar()
+        ttk.Entry(ffmpeg_cell, textvariable=self._ffmpeg_var,
+                  style="Mono.TEntry").pack(side="left", fill="x", expand=True)
+        ttk.Button(ffmpeg_cell, text="瀏覽…", style="Ghost.TButton",
+                   command=lambda: self._browse_media_tool(
+                       "ffmpeg", self._ffmpeg_var)).pack(
+            side="left", padx=(SPACE["snug"], 0))
+        ttk.Button(ffmpeg_cell, text="檢查", style="Ghost.TButton",
+                   command=lambda: self._check_media_tool(
+                       "ffmpeg", self._ffmpeg_var)).pack(side="left")
+
+        ffprobe_cell = grid.add("ffprobe")
+        self._ffprobe_var = tk.StringVar()
+        ttk.Entry(ffprobe_cell, textvariable=self._ffprobe_var,
+                  style="Mono.TEntry").pack(side="left", fill="x", expand=True)
+        ttk.Button(ffprobe_cell, text="瀏覽…", style="Ghost.TButton",
+                   command=lambda: self._browse_media_tool(
+                       "ffprobe", self._ffprobe_var)).pack(
+            side="left", padx=(SPACE["snug"], 0))
+        ttk.Button(ffprobe_cell, text="檢查", style="Ghost.TButton",
+                   command=lambda: self._check_media_tool(
+                       "ffprobe", self._ffprobe_var)).pack(side="left")
+        self._media_tools_status = ttk.Label(
+            section.body, text="", style="Micro.TLabel")
+        self._media_tools_status.grid(row=3, column=0, sticky="w")
 
         dir_cell = grid.add("模型目錄")
         self._model_dir_var = tk.StringVar()
@@ -253,6 +284,8 @@ class WhisperTab(LogMixin, ttk.Frame):
             return
 
         self._cli_var.set(cm.get("whisper.cli_path", ""))
+        self._ffmpeg_var.set(cm.get("paths.ffmpeg", ""))
+        self._ffprobe_var.set(cm.get("paths.ffprobe", ""))
         self._model_dir_var.set(cm.get("whisper.model_dir", ""))
         self._threads_var.set(cm.get("whisper.threads", 8))
         self._threads_label.config(text=str(self._threads_var.get()))
@@ -265,12 +298,16 @@ class WhisperTab(LogMixin, ttk.Frame):
             return
 
         cm.set("whisper.cli_path", self._cli_var.get())
+        cm.set("paths.ffmpeg", self._ffmpeg_var.get().strip())
+        cm.set("paths.ffprobe", self._ffprobe_var.get().strip())
         cm.set("whisper.model_dir", self._model_dir_var.get())
         cm.set("whisper.last_model", self._model_var.get())
         cm.set("whisper.language", self._get_language_code())
         cm.set("whisper.threads", int(float(self._threads_var.get())))
         set_chunking_enabled(cm, bool(self._chunk_var.get()))
         set_skip_existing_enabled(cm, bool(self._skip_exist_var.get()))
+        if self._on_tools_changed:
+            self._on_tools_changed()
 
     def _on_setting_changed(self, event=None):
         self._save_settings()
@@ -279,9 +316,14 @@ class WhisperTab(LogMixin, ttk.Frame):
         return extract_combo_code(self._lang_var.get())
 
     def _browse_cli(self):
+        filetypes = (
+            [("Executable", "*.exe"), ("All files", "*.*")]
+            if os.name == "nt"
+            else [("Executable", "*"), ("All files", "*.*")]
+        )
         path = filedialog.askopenfilename(
             title="Select whisper-cli executable",
-            filetypes=[("Executable", "*.exe"), ("All files", "*.*")])
+            filetypes=filetypes)
         if path:
             self._cli_var.set(path)
             self._save_settings()
@@ -291,6 +333,32 @@ class WhisperTab(LogMixin, ttk.Frame):
         if path:
             self._model_dir_var.set(path)
             self._save_settings()
+
+    def _browse_media_tool(self, name, variable):
+        filetypes = (
+            [("Executable", "*.exe"), ("All files", "*.*")]
+            if os.name == "nt"
+            else [("Executable", "*"), ("All files", "*.*")]
+        )
+        path = filedialog.askopenfilename(
+            title=f"選擇 {name}", filetypes=filetypes)
+        if path:
+            variable.set(path)
+            self._save_settings()
+
+    def _check_media_tool(self, name, variable):
+        if self._tool_manager:
+            status = self._tool_manager.check(
+                name, variable.get().strip() or None, probe=True)
+            self._media_tools_status.config(text=status.message)
+            (messagebox.showinfo if status.available else messagebox.showwarning)(
+                "工具檢查", status.message)
+            return status.available
+        path = variable.get().strip()
+        available = bool(path) and Path(path).is_file()
+        message = "可用" if available else f"找不到 {name}：{path or 'PATH'}"
+        self._media_tools_status.config(text=message)
+        return available
 
     def _scan_models(self):
         self._save_settings()

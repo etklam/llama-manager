@@ -19,7 +19,7 @@ from utils.atomic_io import atomic_write_text
 DEFAULT_CONFIG = {
     'server': {
         'port': 8080,
-        'host': '0.0.0.0',
+        'host': '127.0.0.1',
         'gpu_layers': 99,
         'context_size': 16384,
         'batch_size': 512,
@@ -39,13 +39,15 @@ DEFAULT_CONFIG = {
     # Where the llama.cpp build and models live. These were literals in
     # llama_manager.__init__ ("D:\\AI\\llama\\llama.cpp"), which meant the one
     # setting the app cannot start without was the only setting not
-    # configurable. Empty means "not configured yet" and the Server surface
-    # shows first-run guidance instead of failing.
+    # configurable. Empty means no explicit path has been selected; path
+    # resolution and user guidance belong to the application.
     'paths': {
         'base_dir': '',
         'runtime_dir': '',
         'model_dir': '',
-        'server_exe': ''
+        'server_exe': '',
+        'ffmpeg': '',
+        'ffprobe': '',
     },
     'ui': {
         # 'dark' | 'light'. Dark by default: the runs this tool starts are long
@@ -99,16 +101,21 @@ class ConfigManager:
     - Thread-safe operations
     """
 
-    def __init__(self, config_path: str = 'config.json', default_config: Optional[dict] = None):
+    def __init__(self, config_path: str = 'config.json',
+                 default_config: Optional[dict] = None,
+                 legacy_paths: Optional[List[str]] = None):
         """
         Initialize ConfigManager.
 
         Args:
             config_path: Path to configuration file (default: 'config.json')
             default_config: Custom default config (optional, uses DEFAULT_CONFIG if None)
+            legacy_paths: Optional read-only config locations to import once when
+                ``config_path`` does not exist.
         """
         self.config_path = Path(config_path)
         self.default_config = default_config if default_config is not None else copy.deepcopy(DEFAULT_CONFIG)
+        self.legacy_paths = tuple(Path(path) for path in (legacy_paths or ()))
         self._config: Dict[str, Any] = {}
         self._lock = threading.RLock()
 
@@ -129,6 +136,25 @@ class ConfigManager:
         with self._lock:
             # Create parent directories if they don't exist
             self.config_path.parent.mkdir(parents=True, exist_ok=True)
+
+            # Import a pre-user-data config once.  The source is never written
+            # back, so bundled resources stay read-only and upgrades preserve
+            # the user's settings in the writable data directory.
+            if not self.config_path.exists():
+                for legacy_path in self.legacy_paths:
+                    if legacy_path == self.config_path or not legacy_path.is_file():
+                        continue
+                    try:
+                        atomic_write_text(
+                            self.config_path,
+                            legacy_path.read_text(encoding='utf-8'),
+                        )
+                    except OSError:
+                        # A read-only or incomplete legacy file should not
+                        # prevent first launch; defaults are still usable.
+                        pass
+                    if self.config_path.exists():
+                        break
 
             # If file doesn't exist, create it with defaults
             if not self.config_path.exists():

@@ -1,8 +1,12 @@
-# 漫畫 OCR → 本地 Vulkan LLM 翻譯
+# 漫畫 OCR → 本地 Vulkan LLM 翻譯（Beta）
+
+> Beta・不穩定功能：可能執行失敗或產生不準確的結果，請人工核對輸出。
 
 本功能提供原生 Tkinter 分頁，輸入 PNG／JPEG／WEBP，輸出原文、譯文及雙語文字。OCR 與翻譯依序使用同一個 llama-server executable，共用 `ServerController`，不需要兩個模型同時常駐。
 
 **GLM-OCR 是起始候選，不是已認證的漫畫辨識方案。** 本次沒有真實漫畫品質或完整 Vulkan OCR＋翻譯通過宣稱。也不包含 PDF／CBZ／CBR、氣泡偵測、消字、inpainting、嵌字或翻譯後圖片。
+
+本文件的 Vulkan 驗證專指漫畫流程使用的 llama.cpp OCR／翻譯 runtime。主線的 `whisper-cli`（whisper.cpp）也可使用 Vulkan build，但它的轉錄 backend 驗收與 FFmpeg／ffprobe 的影音預處理驗收分開計算。
 
 ## 安裝與模型配對
 
